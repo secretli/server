@@ -1,0 +1,16 @@
+apiVersion: traefik.containo.us/v1alpha1
+kind: IngressRoute
+metadata:
+  name: secretli-route
+  namespace: secretli
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host(`gphrase.de`) && PathPrefix(`{{ trimSuffix "/" .Values.forwardedPrefix }}`)
+      kind: Rule
+      services:
+        - name: secretli
+          port: 8080
+  tls:
+    secretName: gphrase.de-cert-secret

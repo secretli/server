@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secretli
+  labels:
+    app: secretli
+spec:
+  selector:
+    matchLabels:
+      app: secretli
+  replicas: {{ .Values.replicas }}
+  template:
+    metadata:
+      name: secretli
+      labels:
+        app: secretli
+    spec:
+      imagePullSecrets:
+        - name: dockerconfigjson-github-com
+      containers:
+        - name: secretli
+          image: "ghcr.io/secretli/server:{{ required "Set valid .Values.imageVersion entry!" .Values.imageVersion }}"
+          imagePullPolicy: Always
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          env:
+            - name: GIN_MODE
+              value: {{ .Values.environment }}
+            - name: FORWARDED_PREFIX
+              value: {{ .Values.forwardedPrefix }}
+            - name: PGHOST
+              value: {{ .Values.database.host }}
+            - name: PGDATABASE
+              value: {{ .Values.database.dbname }}
+            - name: PGUSER
+              value: {{ .Values.database.user }}
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: secretli-secret
+                  key: pgpassword
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.forwardedPrefix }}health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          securityContext:
+            runAsUser: 10001
+            runAsGroup: 10001
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL

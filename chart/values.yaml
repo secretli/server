@@ -1,0 +1,12 @@
+imageVersion: latest
+replicas: 1
+
+environment: "debug"
+forwardedPrefix: "/"
+
+resources: {}
+
+database:
+  host: localhost
+  dbname: secretli
+  user: postgres

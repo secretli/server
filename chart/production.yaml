@@ -1,0 +1,15 @@
+forwardedPrefix: "/s/"
+environment: "release"
+
+resources:
+  requests:
+    cpu: 5m
+    memory: 50Mi
+  limits:
+    cpu: 100m
+    memory: 50Mi
+
+database:
+  host: gphrase.de
+  dbname: secretli
+  user: pgmain
