@@ -64,6 +64,11 @@ func (s *Server) storeSecret() gin.HandlerFunc {
 			return
 		}
 
+		if len(r.EncryptedData) > 10000 {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+
 		expiresAt := time.Now()
 
 		switch r.Expiration {
