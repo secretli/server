@@ -39,6 +39,7 @@ func (s *Server) InitRoutes() {
 	{
 		api.POST("secret", s.storeSecret())
 		api.POST("secret/:id", s.retrieveSecret())
+		api.DELETE("secret/:id", s.deleteSecret())
 	}
 }
 
@@ -56,6 +57,7 @@ func (s *Server) storeSecret() gin.HandlerFunc {
 		EncryptedData  string `json:"encrypted_data"`
 		Expiration     string `json:"expiration"`
 		BurnAfterRead  bool   `json:"burn_after_read"`
+		DeletionToken  string `json:"deletion_token"`
 	}
 
 	return func(c *gin.Context) {
@@ -99,6 +101,7 @@ func (s *Server) storeSecret() gin.HandlerFunc {
 			ExpiresAt:      expiresAt,
 			BurnAfterRead:  r.BurnAfterRead,
 			AlreadyRead:    false,
+			DeletionToken:  r.DeletionToken,
 		}
 
 		ctx := c.Request.Context()
@@ -159,5 +162,43 @@ func (s *Server) retrieveSecret() gin.HandlerFunc {
 			Nonce:         secret.Nonce,
 			EncryptedData: secret.EncryptedData,
 		})
+	}
+}
+
+func (s *Server) deleteSecret() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id := c.Param("id")
+		retrievalToken := c.GetHeader("X-Retrieval-Token")
+		deletionToken := c.GetHeader("X-Deletion-Token")
+
+		ctx := c.Request.Context()
+		secret, err := s.repo.Get(ctx, id)
+		if err != nil {
+			if errors.Is(err, internal.ErrUnknownSecret) {
+				c.AbortWithStatus(http.StatusNotFound)
+				return
+			}
+
+			c.AbortWithStatus(http.StatusInternalServerError)
+			return
+		}
+
+		if secret.DeletionToken == "" {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+
+		if secret.RetrievalToken != retrievalToken || secret.DeletionToken != deletionToken {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+
+		err = s.repo.Delete(ctx, id)
+		if err != nil {
+			c.AbortWithStatus(http.StatusInternalServerError)
+			return
+		}
+
+		c.Status(http.StatusOK)
 	}
 }

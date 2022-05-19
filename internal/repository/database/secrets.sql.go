@@ -7,11 +7,21 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"time"
 )
 
+const deleteSecret = `-- name: DeleteSecret :exec
+DELETE FROM secrets WHERE public_id = $1
+`
+
+func (q *Queries) DeleteSecret(ctx context.Context, publicID string) error {
+	_, err := q.db.Exec(ctx, deleteSecret, publicID)
+	return err
+}
+
 const getSecret = `-- name: GetSecret :one
-SELECT public_id, retrieval_token, nonce, encrypted_data, expires_at, burn_after_read, already_read FROM secrets WHERE public_id = $1
+SELECT public_id, retrieval_token, nonce, encrypted_data, expires_at, burn_after_read, already_read, deletion_token FROM secrets WHERE public_id = $1
 `
 
 func (q *Queries) GetSecret(ctx context.Context, publicID string) (Secret, error) {
@@ -25,6 +35,7 @@ func (q *Queries) GetSecret(ctx context.Context, publicID string) (Secret, error
 		&i.ExpiresAt,
 		&i.BurnAfterRead,
 		&i.AlreadyRead,
+		&i.DeletionToken,
 	)
 	return i, err
 }
@@ -42,8 +53,8 @@ func (q *Queries) MarkAsRead(ctx context.Context, publicID string) error {
 }
 
 const storeSecret = `-- name: StoreSecret :exec
-INSERT INTO secrets (public_id, retrieval_token, nonce, encrypted_data, expires_at, burn_after_read, already_read)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO secrets (public_id, retrieval_token, nonce, encrypted_data, expires_at, burn_after_read, already_read, deletion_token)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 `
 
 type StoreSecretParams struct {
@@ -54,6 +65,7 @@ type StoreSecretParams struct {
 	ExpiresAt      time.Time
 	BurnAfterRead  bool
 	AlreadyRead    bool
+	DeletionToken  sql.NullString
 }
 
 func (q *Queries) StoreSecret(ctx context.Context, arg StoreSecretParams) error {
@@ -65,6 +77,7 @@ func (q *Queries) StoreSecret(ctx context.Context, arg StoreSecretParams) error 
 		arg.ExpiresAt,
 		arg.BurnAfterRead,
 		arg.AlreadyRead,
+		arg.DeletionToken,
 	)
 	return err
 }
