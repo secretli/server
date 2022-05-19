@@ -13,3 +13,9 @@ AND already_read = false;
 
 -- name: DeleteSecret :exec
 DELETE FROM secrets WHERE public_id = $1;
+
+-- name: Cleanup :exec
+DELETE FROM secrets
+WHERE
+    expires_at < $1 or
+    (burn_after_read and already_read);

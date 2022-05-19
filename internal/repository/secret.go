@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v4/pgxpool"
 	"github.com/secretli/server/internal"
 	"github.com/secretli/server/internal/repository/database"
+	"time"
 )
 
 type DBSecretRepository struct {
@@ -62,4 +63,8 @@ func (r *DBSecretRepository) MarkAsRead(ctx context.Context, publicID string) er
 
 func (r *DBSecretRepository) Delete(ctx context.Context, publicID string) error {
 	return r.queries.DeleteSecret(ctx, publicID)
+}
+
+func (r *DBSecretRepository) Cleanup(ctx context.Context, now time.Time) error {
+	return r.queries.Cleanup(ctx, now)
 }
