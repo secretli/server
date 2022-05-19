@@ -72,8 +72,19 @@ func (s *Server) storeSecret() gin.HandlerFunc {
 		expiresAt := time.Now()
 
 		switch r.Expiration {
-		case "5min":
-			expiresAt = expiresAt.Add(5 * time.Minute)
+		case "5m", "10m", "15m", "1h", "4h", "12h":
+			duration, err := time.ParseDuration(r.Expiration)
+			if err != nil {
+				c.AbortWithStatus(http.StatusBadRequest)
+				return
+			}
+			expiresAt = expiresAt.Add(duration)
+		case "1d":
+			expiresAt = expiresAt.Add(1 * 24 * time.Hour)
+		case "3d":
+			expiresAt = expiresAt.Add(3 * 24 * time.Hour)
+		case "7d":
+			expiresAt = expiresAt.Add(7 * 24 * time.Hour)
 		default:
 			c.AbortWithStatus(http.StatusBadRequest)
 			return
