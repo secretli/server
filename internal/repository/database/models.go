@@ -14,4 +14,6 @@ type Secret struct {
 	Nonce          string
 	EncryptedData  string
 	ExpiresAt      time.Time
+	BurnAfterRead  bool
+	AlreadyRead    bool
 }

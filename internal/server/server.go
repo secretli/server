@@ -55,6 +55,7 @@ func (s *Server) storeSecret() gin.HandlerFunc {
 		Nonce          string `json:"nonce"`
 		EncryptedData  string `json:"encrypted_data"`
 		Expiration     string `json:"expiration"`
+		BurnAfterRead  bool   `json:"burn_after_read"`
 	}
 
 	return func(c *gin.Context) {
@@ -96,6 +97,8 @@ func (s *Server) storeSecret() gin.HandlerFunc {
 			Nonce:          r.Nonce,
 			EncryptedData:  r.EncryptedData,
 			ExpiresAt:      expiresAt,
+			BurnAfterRead:  r.BurnAfterRead,
+			AlreadyRead:    false,
 		}
 
 		ctx := c.Request.Context()
@@ -138,6 +141,17 @@ func (s *Server) retrieveSecret() gin.HandlerFunc {
 
 		if secret.RetrievalToken != retrievalToken {
 			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+
+		if secret.BurnAfterRead && secret.AlreadyRead {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
+
+		err = s.repo.MarkAsRead(ctx, id)
+		if err != nil {
+			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
 

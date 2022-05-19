@@ -10,11 +10,15 @@ import (
 )
 
 type DBSecretRepository struct {
+	pool    *pgxpool.Pool
 	queries *database.Queries
 }
 
 func NewDBSecretRepository(pool *pgxpool.Pool) *DBSecretRepository {
-	return &DBSecretRepository{queries: database.New(pool)}
+	return &DBSecretRepository{
+		pool:    pool,
+		queries: database.New(pool),
+	}
 }
 
 func (r *DBSecretRepository) Store(ctx context.Context, secret internal.Secret) error {
@@ -24,6 +28,8 @@ func (r *DBSecretRepository) Store(ctx context.Context, secret internal.Secret) 
 		Nonce:          secret.Nonce,
 		EncryptedData:  secret.EncryptedData,
 		ExpiresAt:      secret.ExpiresAt,
+		BurnAfterRead:  secret.BurnAfterRead,
+		AlreadyRead:    secret.AlreadyRead,
 	})
 }
 
@@ -42,5 +48,11 @@ func (r *DBSecretRepository) Get(ctx context.Context, publicID string) (internal
 		Nonce:          dto.Nonce,
 		EncryptedData:  dto.EncryptedData,
 		ExpiresAt:      dto.ExpiresAt,
+		BurnAfterRead:  dto.BurnAfterRead,
+		AlreadyRead:    dto.AlreadyRead,
 	}, nil
+}
+
+func (r *DBSecretRepository) MarkAsRead(ctx context.Context, publicID string) error {
+	return r.queries.MarkAsRead(ctx, publicID)
 }
