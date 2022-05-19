@@ -11,6 +11,18 @@ import (
 	"time"
 )
 
+const cleanup = `-- name: Cleanup :exec
+DELETE FROM secrets
+WHERE
+    expires_at < $1 or
+    (burn_after_read and already_read)
+`
+
+func (q *Queries) Cleanup(ctx context.Context, expiresAt time.Time) error {
+	_, err := q.db.Exec(ctx, cleanup, expiresAt)
+	return err
+}
+
 const deleteSecret = `-- name: DeleteSecret :exec
 DELETE FROM secrets WHERE public_id = $1
 `

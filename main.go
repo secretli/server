@@ -8,6 +8,7 @@ import (
 	"github.com/secretli/server/internal/repository"
 	"github.com/secretli/server/internal/server"
 	"log"
+	"time"
 )
 
 func main() {
@@ -28,6 +29,8 @@ func main() {
 	svr.Use(gin.Logger(), gin.Recovery())
 	svr.InitRoutes()
 
+	go startHourlyCleanup(repo)
+
 	if err := svr.Run(); err != nil {
 		log.Fatalf("error starting server: %v", err)
 	}
@@ -39,4 +42,13 @@ func openPGConnectionPool() (*pgxpool.Pool, error) {
 		return nil, err
 	}
 	return pgxpool.ConnectConfig(context.Background(), c)
+}
+
+func startHourlyCleanup(repo *repository.DBSecretRepository) {
+	ticker := time.NewTicker(time.Hour)
+	for range ticker.C {
+		if err := repo.Cleanup(context.Background(), time.Now()); err != nil {
+			log.Printf("error during database cleanup: %s\n", err)
+		}
+	}
 }
