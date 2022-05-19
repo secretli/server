@@ -13,6 +13,7 @@ var (
 type Secret struct {
 	PublicID       string    `json:"public_id"`
 	RetrievalToken string    `json:"retrieval_token"`
+	DeletionToken  string    `json:"deletion_token"`
 	Nonce          string    `json:"nonce"`
 	EncryptedData  string    `json:"encrypted_data"`
 	ExpiresAt      time.Time `json:"expires_at"`
@@ -24,4 +25,5 @@ type SecretRepository interface {
 	Store(ctx context.Context, secret Secret) error
 	Get(ctx context.Context, publicID string) (Secret, error)
 	MarkAsRead(ctx context.Context, publicID string) error
+	Delete(ctx context.Context, publicID string) error
 }

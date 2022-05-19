@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/pgxpool"
@@ -30,6 +31,7 @@ func (r *DBSecretRepository) Store(ctx context.Context, secret internal.Secret) 
 		ExpiresAt:      secret.ExpiresAt,
 		BurnAfterRead:  secret.BurnAfterRead,
 		AlreadyRead:    secret.AlreadyRead,
+		DeletionToken:  sql.NullString{String: secret.DeletionToken, Valid: true},
 	})
 }
 
@@ -50,9 +52,14 @@ func (r *DBSecretRepository) Get(ctx context.Context, publicID string) (internal
 		ExpiresAt:      dto.ExpiresAt,
 		BurnAfterRead:  dto.BurnAfterRead,
 		AlreadyRead:    dto.AlreadyRead,
+		DeletionToken:  dto.DeletionToken.String,
 	}, nil
 }
 
 func (r *DBSecretRepository) MarkAsRead(ctx context.Context, publicID string) error {
 	return r.queries.MarkAsRead(ctx, publicID)
+}
+
+func (r *DBSecretRepository) Delete(ctx context.Context, publicID string) error {
+	return r.queries.DeleteSecret(ctx, publicID)
 }

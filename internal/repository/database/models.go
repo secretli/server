@@ -5,6 +5,7 @@
 package database
 
 import (
+	"database/sql"
 	"time"
 )
 
@@ -16,4 +17,5 @@ type Secret struct {
 	ExpiresAt      time.Time
 	BurnAfterRead  bool
 	AlreadyRead    bool
+	DeletionToken  sql.NullString
 }
