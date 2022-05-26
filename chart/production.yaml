@@ -1,4 +1,4 @@
-forwardedPrefix: "/s/"
+forwardedPrefix: "/s/api/"
 environment: "release"
 
 resources:

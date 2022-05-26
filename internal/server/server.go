@@ -33,13 +33,11 @@ func NewServer(config config.Configuration, repo internal.SecretRepository) *Ser
 
 func (s *Server) InitRoutes() {
 	base := s.Group(s.config.ForwardedPrefix)
-	base.GET("/health", s.handleHealth())
-
-	api := base.Group("api")
 	{
-		api.POST("secret", s.storeSecret())
-		api.POST("secret/:id", s.retrieveSecret())
-		api.DELETE("secret/:id", s.deleteSecret())
+		base.GET("health", s.handleHealth())
+		base.POST("secret", s.storeSecret())
+		base.POST("secret/:id", s.retrieveSecret())
+		base.DELETE("secret/:id", s.deleteSecret())
 	}
 }
 
