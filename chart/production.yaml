@@ -10,6 +10,6 @@ resources:
     memory: 50Mi
 
 database:
-  host: gphrase.de
+  host: patrickscheid.de
   dbname: secretli
   user: pgmain
