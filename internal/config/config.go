@@ -25,7 +25,7 @@ func GatherConfig() (Configuration, error) {
 	}
 
 	if !strings.HasPrefix(config.ForwardedPrefix, "/") {
-		return Configuration{}, errors.New("forwarded_prefix must start with /")
+		return config, errors.New("forwarded_prefix must start with /")
 	}
 
 	if !strings.HasSuffix(config.ForwardedPrefix, "/") {

@@ -38,10 +38,10 @@ func (r *DBSecretRepository) Store(ctx context.Context, secret internal.Secret) 
 
 func (r *DBSecretRepository) Get(ctx context.Context, publicID string) (internal.Secret, error) {
 	dto, err := r.queries.GetSecret(ctx, publicID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = internal.ErrUnknownSecret
+	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			err = internal.ErrUnknownSecret
-		}
 		return internal.Secret{}, err
 	}
 

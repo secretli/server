@@ -9,6 +9,13 @@ import (
 	"time"
 )
 
+const (
+	Day = 24 * time.Hour
+
+	HeaderRetrievalToken = "X-Retrieval-Token"
+	HeaderDeletionToken  = "X-Deletion-Token"
+)
+
 type Server struct {
 	*gin.Engine
 
@@ -70,23 +77,8 @@ func (s *Server) storeSecret() gin.HandlerFunc {
 			return
 		}
 
-		expiresAt := time.Now()
-
-		switch r.Expiration {
-		case "5m", "10m", "15m", "1h", "4h", "12h":
-			duration, err := time.ParseDuration(r.Expiration)
-			if err != nil {
-				c.AbortWithStatus(http.StatusBadRequest)
-				return
-			}
-			expiresAt = expiresAt.Add(duration)
-		case "1d":
-			expiresAt = expiresAt.Add(1 * 24 * time.Hour)
-		case "3d":
-			expiresAt = expiresAt.Add(3 * 24 * time.Hour)
-		case "7d":
-			expiresAt = expiresAt.Add(7 * 24 * time.Hour)
-		default:
+		expiration, err := processExpirationDuration(r.Expiration)
+		if err != nil {
 			c.AbortWithStatus(http.StatusBadRequest)
 			return
 		}
@@ -96,15 +88,14 @@ func (s *Server) storeSecret() gin.HandlerFunc {
 			RetrievalToken: r.RetrievalToken,
 			Nonce:          r.Nonce,
 			EncryptedData:  r.EncryptedData,
-			ExpiresAt:      expiresAt,
+			ExpiresAt:      time.Now().Add(expiration),
 			BurnAfterRead:  r.BurnAfterRead,
 			AlreadyRead:    false,
 			DeletionToken:  r.DeletionToken,
 		}
 
 		ctx := c.Request.Context()
-		err := s.repo.Store(ctx, secret)
-		if err != nil {
+		if err := s.repo.Store(ctx, secret); err != nil {
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
@@ -121,16 +112,15 @@ func (s *Server) retrieveSecret() gin.HandlerFunc {
 
 	return func(c *gin.Context) {
 		id := c.Param("id")
-		retrievalToken := c.GetHeader("X-Retrieval-Token")
+		retrievalToken := c.GetHeader(HeaderRetrievalToken)
 
 		ctx := c.Request.Context()
 		secret, err := s.repo.Get(ctx, id)
+		if errors.Is(err, internal.ErrUnknownSecret) {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
 		if err != nil {
-			if errors.Is(err, internal.ErrUnknownSecret) {
-				c.AbortWithStatus(http.StatusNotFound)
-				return
-			}
-
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
@@ -150,8 +140,7 @@ func (s *Server) retrieveSecret() gin.HandlerFunc {
 			return
 		}
 
-		err = s.repo.MarkAsRead(ctx, id)
-		if err != nil {
+		if err := s.repo.MarkAsRead(ctx, id); err != nil {
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
@@ -166,17 +155,13 @@ func (s *Server) retrieveSecret() gin.HandlerFunc {
 func (s *Server) deleteSecret() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id := c.Param("id")
-		retrievalToken := c.GetHeader("X-Retrieval-Token")
-		deletionToken := c.GetHeader("X-Deletion-Token")
-
 		ctx := c.Request.Context()
 		secret, err := s.repo.Get(ctx, id)
+		if errors.Is(err, internal.ErrUnknownSecret) {
+			c.AbortWithStatus(http.StatusNotFound)
+			return
+		}
 		if err != nil {
-			if errors.Is(err, internal.ErrUnknownSecret) {
-				c.AbortWithStatus(http.StatusNotFound)
-				return
-			}
-
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
@@ -186,7 +171,9 @@ func (s *Server) deleteSecret() gin.HandlerFunc {
 			return
 		}
 
-		if secret.RetrievalToken != retrievalToken || secret.DeletionToken != deletionToken {
+		rt := c.GetHeader(HeaderRetrievalToken)
+		dt := c.GetHeader(HeaderDeletionToken)
+		if secret.RetrievalToken != rt || secret.DeletionToken != dt {
 			c.AbortWithStatus(http.StatusForbidden)
 			return
 		}
@@ -199,4 +186,33 @@ func (s *Server) deleteSecret() gin.HandlerFunc {
 
 		c.Status(http.StatusOK)
 	}
+}
+
+func processExpirationDuration(expiration string) (time.Duration, error) {
+	var duration time.Duration
+
+	switch expiration {
+	case "5m":
+		duration = 5 * time.Minute
+	case "10m":
+		duration = 10 * time.Minute
+	case "15m":
+		duration = 15 * time.Minute
+	case "1h":
+		duration = 1 * time.Hour
+	case "4h":
+		duration = 4 * time.Hour
+	case "12h":
+		duration = 12 * time.Hour
+	case "1d":
+		duration = 1 * Day
+	case "3d":
+		duration = 3 * Day
+	case "7d":
+		duration = 7 * Day
+	default:
+		return 0, errors.New("invalid expiration")
+	}
+
+	return duration, nil
 }
