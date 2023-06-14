@@ -2,43 +2,41 @@ package repository
 
 import (
 	"context"
-	"database/sql"
-	"errors"
-	"github.com/jackc/pgx/v4"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/secretli/server/ent"
+	"github.com/secretli/server/ent/secret"
 	"github.com/secretli/server/internal"
-	"github.com/secretli/server/internal/repository/database"
 	"time"
 )
 
 type DBSecretRepository struct {
-	pool    *pgxpool.Pool
-	queries *database.Queries
+	client *ent.Client
 }
 
-func NewDBSecretRepository(pool *pgxpool.Pool) *DBSecretRepository {
-	return &DBSecretRepository{
-		pool:    pool,
-		queries: database.New(pool),
-	}
+func NewDBSecretRepository(client *ent.Client) *DBSecretRepository {
+	return &DBSecretRepository{client: client}
 }
 
 func (r *DBSecretRepository) Store(ctx context.Context, secret internal.Secret) error {
-	return r.queries.StoreSecret(ctx, database.StoreSecretParams{
-		PublicID:       secret.PublicID,
-		RetrievalToken: secret.RetrievalToken,
-		Nonce:          secret.Nonce,
-		EncryptedData:  secret.EncryptedData,
-		ExpiresAt:      secret.ExpiresAt,
-		BurnAfterRead:  secret.BurnAfterRead,
-		AlreadyRead:    secret.AlreadyRead,
-		DeletionToken:  sql.NullString{String: secret.DeletionToken, Valid: true},
-	})
+	return r.client.Secret.
+		Create().
+		SetPublicID(secret.PublicID).
+		SetRetrievalToken(secret.RetrievalToken).
+		SetDeletionToken(secret.DeletionToken).
+		SetNonce(secret.Nonce).
+		SetEncryptedData(secret.EncryptedData).
+		SetExpiresAt(secret.ExpiresAt).
+		SetBurnAfterRead(secret.BurnAfterRead).
+		SetAlreadyRead(secret.AlreadyRead).
+		Exec(ctx)
 }
 
 func (r *DBSecretRepository) Get(ctx context.Context, publicID string) (internal.Secret, error) {
-	dto, err := r.queries.GetSecret(ctx, publicID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	result, err := r.client.Secret.
+		Query().
+		Where(secret.PublicID(publicID)).
+		Only(ctx)
+
+	if ent.IsNotFound(err) {
 		err = internal.ErrUnknownSecret
 	}
 	if err != nil {
@@ -46,25 +44,46 @@ func (r *DBSecretRepository) Get(ctx context.Context, publicID string) (internal
 	}
 
 	return internal.Secret{
-		PublicID:       dto.PublicID,
-		RetrievalToken: dto.RetrievalToken,
-		Nonce:          dto.Nonce,
-		EncryptedData:  dto.EncryptedData,
-		ExpiresAt:      dto.ExpiresAt,
-		BurnAfterRead:  dto.BurnAfterRead,
-		AlreadyRead:    dto.AlreadyRead,
-		DeletionToken:  dto.DeletionToken.String,
+		PublicID:       result.PublicID,
+		RetrievalToken: result.RetrievalToken,
+		DeletionToken:  result.DeletionToken,
+		Nonce:          result.Nonce,
+		EncryptedData:  result.EncryptedData,
+		ExpiresAt:      result.ExpiresAt,
+		BurnAfterRead:  result.BurnAfterRead,
+		AlreadyRead:    result.AlreadyRead,
 	}, nil
 }
 
 func (r *DBSecretRepository) MarkAsRead(ctx context.Context, publicID string) error {
-	return r.queries.MarkAsRead(ctx, publicID)
+	return r.client.Secret.
+		Update().
+		Where(secret.PublicID(publicID), secret.AlreadyRead(false)).
+		Exec(ctx)
 }
 
 func (r *DBSecretRepository) Delete(ctx context.Context, publicID string) error {
-	return r.queries.DeleteSecret(ctx, publicID)
+	_, err := r.client.Secret.
+		Delete().
+		Where(secret.PublicID(publicID)).
+		Exec(ctx)
+
+	return err
 }
 
 func (r *DBSecretRepository) Cleanup(ctx context.Context, now time.Time) error {
-	return r.queries.Cleanup(ctx, now)
+	filter := secret.Or(
+		secret.ExpiresAtLT(now),
+		secret.And(
+			secret.AlreadyRead(true),
+			secret.BurnAfterRead(true),
+		),
+	)
+
+	_, err := r.client.Secret.
+		Delete().
+		Where(filter).
+		Exec(ctx)
+
+	return err
 }

@@ -2,8 +2,13 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
 	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v4/pgxpool"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/secretli/server/ent"
 	"github.com/secretli/server/internal/config"
 	"github.com/secretli/server/internal/repository"
 	"github.com/secretli/server/internal/server"
@@ -17,13 +22,18 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	pool, err := openPGConnectionPool()
+	client, err := provideEntClient()
 	if err != nil {
 		log.Fatalln(err)
 	}
-	defer pool.Close()
+	defer client.Close()
 
-	repo := repository.NewDBSecretRepository(pool)
+	ctx := context.Background()
+	if err := client.Schema.Create(ctx); err != nil {
+		log.Fatalf("failed creating schema resources: %v", err)
+	}
+
+	repo := repository.NewDBSecretRepository(client)
 
 	svr := server.NewServer(conf, repo)
 	svr.Use(gin.Logger(), gin.Recovery())
@@ -36,12 +46,21 @@ func main() {
 	}
 }
 
-func openPGConnectionPool() (*pgxpool.Pool, error) {
-	c, err := pgxpool.ParseConfig("")
+func provideEntClient() (*ent.Client, error) {
+	connectionConfig, err := pgx.ParseConfig("")
 	if err != nil {
 		return nil, err
 	}
-	return pgxpool.ConnectConfig(context.Background(), c)
+
+	connectionString := stdlib.RegisterConnConfig(connectionConfig)
+	db, err := sql.Open("pgx", connectionString)
+	if err != nil {
+		return nil, err
+	}
+
+	drv := entsql.OpenDB(dialect.Postgres, db)
+	client := ent.NewClient(ent.Driver(drv))
+	return client, nil
 }
 
 func startHourlyCleanup(repo *repository.DBSecretRepository) {
