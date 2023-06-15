@@ -5,48 +5,44 @@ import (
 	"database/sql"
 	"entgo.io/ent/dialect"
 	entsql "entgo.io/ent/dialect/sql"
+	"errors"
+	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/secretli/server/ent"
 	"github.com/secretli/server/internal/config"
-	"github.com/secretli/server/internal/repository"
+	"github.com/secretli/server/internal/secrets"
 	"github.com/secretli/server/internal/server"
+	"k8s.io/utils/clock"
 	"log"
-	"time"
 )
 
 func main() {
-	conf, err := config.GatherConfig()
-	if err != nil {
-		log.Fatalln(err)
-	}
+	conf, err1 := config.GatherConfig()
+	client, err2 := runMigrationAndProvideEntClient()
 
-	client, err := provideEntClient()
-	if err != nil {
+	if err := errors.Join(err1, err2); err != nil {
 		log.Fatalln(err)
 	}
 	defer client.Close()
 
-	ctx := context.Background()
-	if err := client.Schema.Create(ctx); err != nil {
-		log.Fatalf("failed creating schema resources: %v", err)
-	}
+	systemClock := clock.RealClock{}
+	repo := secrets.NewRepository(systemClock, client)
+	service := secrets.NewService(systemClock, repo)
 
-	repo := repository.NewDBSecretRepository(client)
-
-	svr := server.NewServer(conf, repo)
+	svr := server.NewServer(conf, service)
 	svr.Use(gin.Logger(), gin.Recovery())
 	svr.InitRoutes()
 
-	go startHourlyCleanup(repo)
+	go repo.StartCleanupJob(conf.CleanupInterval)
 
 	if err := svr.Run(); err != nil {
 		log.Fatalf("error starting server: %v", err)
 	}
 }
 
-func provideEntClient() (*ent.Client, error) {
+func runMigrationAndProvideEntClient() (*ent.Client, error) {
 	connectionConfig, err := pgx.ParseConfig("")
 	if err != nil {
 		return nil, err
@@ -60,14 +56,11 @@ func provideEntClient() (*ent.Client, error) {
 
 	drv := entsql.OpenDB(dialect.Postgres, db)
 	client := ent.NewClient(ent.Driver(drv))
-	return client, nil
-}
 
-func startHourlyCleanup(repo *repository.DBSecretRepository) {
-	ticker := time.NewTicker(time.Hour)
-	for range ticker.C {
-		if err := repo.Cleanup(context.Background(), time.Now()); err != nil {
-			log.Printf("error during database cleanup: %s\n", err)
-		}
+	ctx := context.Background()
+	if err = client.Schema.Create(ctx); err != nil {
+		return nil, fmt.Errorf("failed migrationg schema: %w", err)
 	}
+
+	return client, nil
 }

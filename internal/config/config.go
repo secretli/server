@@ -3,18 +3,21 @@ package config
 import (
 	"errors"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 )
 
 type Configuration struct {
-	ForwardedPrefix string `mapstructure:"forwarded_prefix"`
-	SessionSecret   string `mapstructure:"session_secret"`
+	ForwardedPrefix string        `mapstructure:"forwarded_prefix"`
+	SessionSecret   string        `mapstructure:"session_secret"`
+	CleanupInterval time.Duration `mapstructure:"cleanup_interval"`
 }
 
 func GatherConfig() (Configuration, error) {
-	// forwarded prefix
+	// declare default values
 	viper.SetDefault("forwarded_prefix", "/")
+	viper.SetDefault("cleanup_interval", time.Hour)
 
 	// environment variable bindings
 	viper.AutomaticEnv()

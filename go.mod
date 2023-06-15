@@ -7,6 +7,7 @@ require (
 	github.com/gin-gonic/gin v1.9.0
 	github.com/jackc/pgx/v5 v5.3.1
 	github.com/spf13/viper v1.15.0
+	k8s.io/utils v0.0.0-20230505201702-9f6742963106
 )
 
 require (

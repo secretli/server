@@ -1,22 +1,25 @@
-package repository
+package secrets
 
 import (
 	"context"
 	"github.com/secretli/server/ent"
 	"github.com/secretli/server/ent/secret"
 	"github.com/secretli/server/internal"
+	"k8s.io/utils/clock"
+	"log"
 	"time"
 )
 
-type DBSecretRepository struct {
+type Repository struct {
+	clock  clock.Clock
 	client *ent.Client
 }
 
-func NewDBSecretRepository(client *ent.Client) *DBSecretRepository {
-	return &DBSecretRepository{client: client}
+func NewRepository(clock clock.Clock, client *ent.Client) *Repository {
+	return &Repository{clock: clock, client: client}
 }
 
-func (r *DBSecretRepository) Store(ctx context.Context, secret internal.Secret) error {
+func (r *Repository) Store(ctx context.Context, secret internal.Secret) error {
 	return r.client.Secret.
 		Create().
 		SetPublicID(secret.PublicID).
@@ -30,7 +33,7 @@ func (r *DBSecretRepository) Store(ctx context.Context, secret internal.Secret) 
 		Exec(ctx)
 }
 
-func (r *DBSecretRepository) Get(ctx context.Context, publicID string) (internal.Secret, error) {
+func (r *Repository) Get(ctx context.Context, publicID string) (internal.Secret, error) {
 	result, err := r.client.Secret.
 		Query().
 		Where(secret.PublicID(publicID)).
@@ -55,14 +58,14 @@ func (r *DBSecretRepository) Get(ctx context.Context, publicID string) (internal
 	}, nil
 }
 
-func (r *DBSecretRepository) MarkAsRead(ctx context.Context, publicID string) error {
+func (r *Repository) MarkAsRead(ctx context.Context, publicID string) error {
 	return r.client.Secret.
 		Update().
 		Where(secret.PublicID(publicID), secret.AlreadyRead(false)).
 		Exec(ctx)
 }
 
-func (r *DBSecretRepository) Delete(ctx context.Context, publicID string) error {
+func (r *Repository) Delete(ctx context.Context, publicID string) error {
 	_, err := r.client.Secret.
 		Delete().
 		Where(secret.PublicID(publicID)).
@@ -71,7 +74,7 @@ func (r *DBSecretRepository) Delete(ctx context.Context, publicID string) error 
 	return err
 }
 
-func (r *DBSecretRepository) Cleanup(ctx context.Context, now time.Time) error {
+func (r *Repository) Cleanup(ctx context.Context, now time.Time) error {
 	filter := secret.Or(
 		secret.ExpiresAtLT(now),
 		secret.And(
@@ -86,4 +89,14 @@ func (r *DBSecretRepository) Cleanup(ctx context.Context, now time.Time) error {
 		Exec(ctx)
 
 	return err
+}
+
+func (r *Repository) StartCleanupJob(interval time.Duration) {
+	ticker := r.clock.Tick(interval)
+
+	for range ticker {
+		if err := r.Cleanup(context.Background(), r.clock.Now()); err != nil {
+			log.Printf("error during database cleanup: %s\n", err)
+		}
+	}
 }

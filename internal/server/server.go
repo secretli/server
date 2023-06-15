@@ -6,31 +6,24 @@ import (
 	"github.com/secretli/server/internal"
 	"github.com/secretli/server/internal/config"
 	"net/http"
-	"time"
 )
 
 const (
-	Day = 24 * time.Hour
-
 	HeaderRetrievalToken = "X-Retrieval-Token"
 	HeaderDeletionToken  = "X-Deletion-Token"
 )
 
 type Server struct {
 	*gin.Engine
-
-	// shared components
-	config config.Configuration
-
-	// services & more
-	repo internal.SecretRepository
+	config  config.Configuration
+	secrets internal.SecretService
 }
 
-func NewServer(config config.Configuration, repo internal.SecretRepository) *Server {
+func NewServer(config config.Configuration, secretService internal.SecretService) *Server {
 	svr := &Server{
-		Engine: gin.New(),
-		config: config,
-		repo:   repo,
+		Engine:  gin.New(),
+		config:  config,
+		secrets: secretService,
 	}
 
 	_ = svr.SetTrustedProxies(nil)
@@ -55,47 +48,25 @@ func (s *Server) handleHealth() gin.HandlerFunc {
 }
 
 func (s *Server) storeSecret() gin.HandlerFunc {
-	type request struct {
-		PublicID       string `json:"public_id"`
-		RetrievalToken string `json:"retrieval_token"`
-		Nonce          string `json:"nonce"`
-		EncryptedData  string `json:"encrypted_data"`
-		Expiration     string `json:"expiration"`
-		BurnAfterRead  bool   `json:"burn_after_read"`
-		DeletionToken  string `json:"deletion_token"`
-	}
-
 	return func(c *gin.Context) {
-		var r request
-		if err := c.BindJSON(&r); err != nil {
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
-		}
-
-		if len(r.EncryptedData) > 10000 {
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
-		}
-
-		expiration, err := processExpirationDuration(r.Expiration)
-		if err != nil {
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
-		}
-
-		secret := internal.Secret{
-			PublicID:       r.PublicID,
-			RetrievalToken: r.RetrievalToken,
-			Nonce:          r.Nonce,
-			EncryptedData:  r.EncryptedData,
-			ExpiresAt:      time.Now().Add(expiration),
-			BurnAfterRead:  r.BurnAfterRead,
-			AlreadyRead:    false,
-			DeletionToken:  r.DeletionToken,
-		}
-
 		ctx := c.Request.Context()
-		if err := s.repo.Store(ctx, secret); err != nil {
+
+		var request internal.StoreSecretParameters
+		if err := c.BindJSON(&request); err != nil {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+
+		err := s.secrets.Store(ctx, request)
+		if errors.Is(err, internal.ErrInvalidExpiration) {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+		if errors.Is(err, internal.ErrInvalidEncryptedData) {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+		if err != nil {
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
@@ -111,36 +82,26 @@ func (s *Server) retrieveSecret() gin.HandlerFunc {
 	}
 
 	return func(c *gin.Context) {
+		ctx := c.Request.Context()
+
 		id := c.Param("id")
 		retrievalToken := c.GetHeader(HeaderRetrievalToken)
 
-		ctx := c.Request.Context()
-		secret, err := s.repo.Get(ctx, id)
+		params := internal.RetrieveSecretParameters{SecretID: id, RetrievalToken: retrievalToken}
+		secret, err := s.secrets.Retrieve(ctx, params)
 		if errors.Is(err, internal.ErrUnknownSecret) {
 			c.AbortWithStatus(http.StatusNotFound)
 			return
 		}
-		if err != nil {
-			c.AbortWithStatus(http.StatusInternalServerError)
-			return
-		}
-
-		if secret.ExpiresAt.Before(time.Now()) {
+		if errors.Is(err, internal.ErrInaccessibleSecret) {
 			c.AbortWithStatus(http.StatusNotFound)
 			return
 		}
-
-		if secret.RetrievalToken != retrievalToken {
+		if errors.Is(err, internal.ErrAuthorizationFailed) {
 			c.AbortWithStatus(http.StatusForbidden)
 			return
 		}
-
-		if secret.BurnAfterRead && secret.AlreadyRead {
-			c.AbortWithStatus(http.StatusNotFound)
-			return
-		}
-
-		if err := s.repo.MarkAsRead(ctx, id); err != nil {
+		if err != nil {
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
@@ -154,31 +115,23 @@ func (s *Server) retrieveSecret() gin.HandlerFunc {
 
 func (s *Server) deleteSecret() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		id := c.Param("id")
 		ctx := c.Request.Context()
-		secret, err := s.repo.Get(ctx, id)
+
+		params := internal.DeleteSecretParameters{
+			SecretID:       c.Param("id"),
+			RetrievalToken: c.GetHeader(HeaderRetrievalToken),
+			DeletionToken:  c.GetHeader(HeaderDeletionToken),
+		}
+
+		err := s.secrets.Delete(ctx, params)
 		if errors.Is(err, internal.ErrUnknownSecret) {
 			c.AbortWithStatus(http.StatusNotFound)
 			return
 		}
-		if err != nil {
-			c.AbortWithStatus(http.StatusInternalServerError)
-			return
-		}
-
-		if secret.DeletionToken == "" {
+		if errors.Is(err, internal.ErrAuthorizationFailed) {
 			c.AbortWithStatus(http.StatusForbidden)
 			return
 		}
-
-		rt := c.GetHeader(HeaderRetrievalToken)
-		dt := c.GetHeader(HeaderDeletionToken)
-		if secret.RetrievalToken != rt || secret.DeletionToken != dt {
-			c.AbortWithStatus(http.StatusForbidden)
-			return
-		}
-
-		err = s.repo.Delete(ctx, id)
 		if err != nil {
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
@@ -186,33 +139,4 @@ func (s *Server) deleteSecret() gin.HandlerFunc {
 
 		c.Status(http.StatusOK)
 	}
-}
-
-func processExpirationDuration(expiration string) (time.Duration, error) {
-	var duration time.Duration
-
-	switch expiration {
-	case "5m":
-		duration = 5 * time.Minute
-	case "10m":
-		duration = 10 * time.Minute
-	case "15m":
-		duration = 15 * time.Minute
-	case "1h":
-		duration = 1 * time.Hour
-	case "4h":
-		duration = 4 * time.Hour
-	case "12h":
-		duration = 12 * time.Hour
-	case "1d":
-		duration = 1 * Day
-	case "3d":
-		duration = 3 * Day
-	case "7d":
-		duration = 7 * Day
-	default:
-		return 0, errors.New("invalid expiration")
-	}
-
-	return duration, nil
 }
