@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"github.com/gin-gonic/gin"
 	"github.com/secretli/server/internal"
 	"github.com/secretli/server/internal/config"
@@ -53,21 +52,13 @@ func (s *Server) storeSecret() gin.HandlerFunc {
 
 		var request internal.StoreSecretParameters
 		if err := c.BindJSON(&request); err != nil {
-			c.AbortWithStatus(http.StatusBadRequest)
+			c.Status(http.StatusBadRequest)
 			return
 		}
 
 		err := s.secrets.Store(ctx, request)
-		if errors.Is(err, internal.ErrInvalidExpiration) {
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
-		}
-		if errors.Is(err, internal.ErrInvalidEncryptedData) {
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
-		}
 		if err != nil {
-			c.AbortWithStatus(http.StatusInternalServerError)
+			_ = c.Error(err)
 			return
 		}
 
@@ -83,26 +74,13 @@ func (s *Server) retrieveSecret() gin.HandlerFunc {
 
 	return func(c *gin.Context) {
 		ctx := c.Request.Context()
-
 		id := c.Param("id")
-		retrievalToken := c.GetHeader(HeaderRetrievalToken)
+		token := c.GetHeader(HeaderRetrievalToken)
 
-		params := internal.RetrieveSecretParameters{SecretID: id, RetrievalToken: retrievalToken}
+		params := internal.RetrieveSecretParameters{SecretID: id, RetrievalToken: token}
 		secret, err := s.secrets.Retrieve(ctx, params)
-		if errors.Is(err, internal.ErrUnknownSecret) {
-			c.AbortWithStatus(http.StatusNotFound)
-			return
-		}
-		if errors.Is(err, internal.ErrInaccessibleSecret) {
-			c.AbortWithStatus(http.StatusNotFound)
-			return
-		}
-		if errors.Is(err, internal.ErrAuthorizationFailed) {
-			c.AbortWithStatus(http.StatusForbidden)
-			return
-		}
 		if err != nil {
-			c.AbortWithStatus(http.StatusInternalServerError)
+			_ = c.Error(err)
 			return
 		}
 
@@ -124,16 +102,8 @@ func (s *Server) deleteSecret() gin.HandlerFunc {
 		}
 
 		err := s.secrets.Delete(ctx, params)
-		if errors.Is(err, internal.ErrUnknownSecret) {
-			c.AbortWithStatus(http.StatusNotFound)
-			return
-		}
-		if errors.Is(err, internal.ErrAuthorizationFailed) {
-			c.AbortWithStatus(http.StatusForbidden)
-			return
-		}
 		if err != nil {
-			c.AbortWithStatus(http.StatusInternalServerError)
+			_ = c.Error(err)
 			return
 		}
 

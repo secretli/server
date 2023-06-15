@@ -32,7 +32,7 @@ func main() {
 	service := secrets.NewService(systemClock, repo)
 
 	svr := server.NewServer(conf, service)
-	svr.Use(gin.Logger(), gin.Recovery())
+	svr.Use(gin.Logger(), gin.Recovery(), server.ErrorHandler())
 	svr.InitRoutes()
 
 	go repo.StartCleanupJob(conf.CleanupInterval)
