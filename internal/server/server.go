@@ -48,17 +48,16 @@ func (s *Server) handleHealth() gin.HandlerFunc {
 
 func (s *Server) storeSecret() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		ctx := c.Request.Context()
-
 		var request internal.StoreSecretParameters
 		if err := c.BindJSON(&request); err != nil {
-			c.Status(http.StatusBadRequest)
+			_ = c.Error(internal.ErrInvalidJSON).SetType(gin.ErrorTypePublic)
 			return
 		}
 
+		ctx := c.Request.Context()
 		err := s.secrets.Store(ctx, request)
 		if err != nil {
-			_ = c.Error(err)
+			_ = c.Error(err).SetType(gin.ErrorTypePublic)
 			return
 		}
 
@@ -80,7 +79,7 @@ func (s *Server) retrieveSecret() gin.HandlerFunc {
 		params := internal.RetrieveSecretParameters{SecretID: id, RetrievalToken: token}
 		secret, err := s.secrets.Retrieve(ctx, params)
 		if err != nil {
-			_ = c.Error(err)
+			_ = c.Error(err).SetType(gin.ErrorTypePublic)
 			return
 		}
 
@@ -103,7 +102,7 @@ func (s *Server) deleteSecret() gin.HandlerFunc {
 
 		err := s.secrets.Delete(ctx, params)
 		if err != nil {
-			_ = c.Error(err)
+			_ = c.Error(err).SetType(gin.ErrorTypePublic)
 			return
 		}
 

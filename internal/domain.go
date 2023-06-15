@@ -9,6 +9,7 @@ import (
 var (
 	ErrUnknownSecret        = errors.New("unknown secret")
 	ErrInaccessibleSecret   = errors.New("inaccessible secret")
+	ErrInvalidJSON          = errors.New("invalid json")
 	ErrInvalidExpiration    = errors.New("invalid expiration")
 	ErrInvalidEncryptedData = errors.New("invalid encrypted data")
 	ErrAuthorizationFailed  = errors.New("authorization failed")
