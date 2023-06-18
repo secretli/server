@@ -79,8 +79,8 @@ func (sq *SecretQuery) FirstX(ctx context.Context) *Secret {
 	return node
 }
 
-// FirstID returns the first Secret SecretID from the query.
-// Returns a *NotFoundError when no Secret SecretID was found.
+// FirstID returns the first Secret ID from the query.
+// Returns a *NotFoundError when no Secret ID was found.
 func (sq *SecretQuery) FirstID(ctx context.Context) (id int, err error) {
 	var ids []int
 	if ids, err = sq.Limit(1).IDs(setContextOp(ctx, sq.ctx, "FirstID")); err != nil {
@@ -129,8 +129,8 @@ func (sq *SecretQuery) OnlyX(ctx context.Context) *Secret {
 	return node
 }
 
-// OnlyID is like Only, but returns the only Secret SecretID in the query.
-// Returns a *NotSingularError when more than one Secret SecretID is found.
+// OnlyID is like Only, but returns the only Secret ID in the query.
+// Returns a *NotSingularError when more than one Secret ID is found.
 // Returns a *NotFoundError when no entities are found.
 func (sq *SecretQuery) OnlyID(ctx context.Context) (id int, err error) {
 	var ids []int

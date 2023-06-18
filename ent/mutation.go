@@ -66,7 +66,7 @@ func newSecretMutation(c config, op Op, opts ...secretOption) *SecretMutation {
 	return m
 }
 
-// withSecretID sets the SecretID field of the mutation.
+// withSecretID sets the ID field of the mutation.
 func withSecretID(id int) secretOption {
 	return func(m *SecretMutation) {
 		var (
@@ -167,7 +167,7 @@ func (m *SecretMutation) OldPublicID(ctx context.Context) (v string, err error) 
 		return v, errors.New("OldPublicID is only allowed on UpdateOne operations")
 	}
 	if m.id == nil || m.oldValue == nil {
-		return v, errors.New("OldPublicID requires an SecretID field in the mutation")
+		return v, errors.New("OldPublicID requires an ID field in the mutation")
 	}
 	oldValue, err := m.oldValue(ctx)
 	if err != nil {
@@ -203,7 +203,7 @@ func (m *SecretMutation) OldRetrievalToken(ctx context.Context) (v string, err e
 		return v, errors.New("OldRetrievalToken is only allowed on UpdateOne operations")
 	}
 	if m.id == nil || m.oldValue == nil {
-		return v, errors.New("OldRetrievalToken requires an SecretID field in the mutation")
+		return v, errors.New("OldRetrievalToken requires an ID field in the mutation")
 	}
 	oldValue, err := m.oldValue(ctx)
 	if err != nil {
@@ -239,7 +239,7 @@ func (m *SecretMutation) OldDeletionToken(ctx context.Context) (v string, err er
 		return v, errors.New("OldDeletionToken is only allowed on UpdateOne operations")
 	}
 	if m.id == nil || m.oldValue == nil {
-		return v, errors.New("OldDeletionToken requires an SecretID field in the mutation")
+		return v, errors.New("OldDeletionToken requires an ID field in the mutation")
 	}
 	oldValue, err := m.oldValue(ctx)
 	if err != nil {
@@ -275,7 +275,7 @@ func (m *SecretMutation) OldNonce(ctx context.Context) (v string, err error) {
 		return v, errors.New("OldNonce is only allowed on UpdateOne operations")
 	}
 	if m.id == nil || m.oldValue == nil {
-		return v, errors.New("OldNonce requires an SecretID field in the mutation")
+		return v, errors.New("OldNonce requires an ID field in the mutation")
 	}
 	oldValue, err := m.oldValue(ctx)
 	if err != nil {
@@ -311,7 +311,7 @@ func (m *SecretMutation) OldEncryptedData(ctx context.Context) (v string, err er
 		return v, errors.New("OldEncryptedData is only allowed on UpdateOne operations")
 	}
 	if m.id == nil || m.oldValue == nil {
-		return v, errors.New("OldEncryptedData requires an SecretID field in the mutation")
+		return v, errors.New("OldEncryptedData requires an ID field in the mutation")
 	}
 	oldValue, err := m.oldValue(ctx)
 	if err != nil {
@@ -347,7 +347,7 @@ func (m *SecretMutation) OldExpiresAt(ctx context.Context) (v time.Time, err err
 		return v, errors.New("OldExpiresAt is only allowed on UpdateOne operations")
 	}
 	if m.id == nil || m.oldValue == nil {
-		return v, errors.New("OldExpiresAt requires an SecretID field in the mutation")
+		return v, errors.New("OldExpiresAt requires an ID field in the mutation")
 	}
 	oldValue, err := m.oldValue(ctx)
 	if err != nil {
@@ -383,7 +383,7 @@ func (m *SecretMutation) OldBurnAfterRead(ctx context.Context) (v bool, err erro
 		return v, errors.New("OldBurnAfterRead is only allowed on UpdateOne operations")
 	}
 	if m.id == nil || m.oldValue == nil {
-		return v, errors.New("OldBurnAfterRead requires an SecretID field in the mutation")
+		return v, errors.New("OldBurnAfterRead requires an ID field in the mutation")
 	}
 	oldValue, err := m.oldValue(ctx)
 	if err != nil {
@@ -419,7 +419,7 @@ func (m *SecretMutation) OldAlreadyRead(ctx context.Context) (v bool, err error)
 		return v, errors.New("OldAlreadyRead is only allowed on UpdateOne operations")
 	}
 	if m.id == nil || m.oldValue == nil {
-		return v, errors.New("OldAlreadyRead requires an SecretID field in the mutation")
+		return v, errors.New("OldAlreadyRead requires an ID field in the mutation")
 	}
 	oldValue, err := m.oldValue(ctx)
 	if err != nil {

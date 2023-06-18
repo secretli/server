@@ -5,18 +5,16 @@ import (
 	"github.com/secretli/server/ent"
 	"github.com/secretli/server/ent/secret"
 	"github.com/secretli/server/internal"
-	"k8s.io/utils/clock"
 	"log"
 	"time"
 )
 
 type Repository struct {
-	clock  clock.Clock
 	client *ent.Client
 }
 
-func NewRepository(clock clock.Clock, client *ent.Client) *Repository {
-	return &Repository{clock: clock, client: client}
+func NewRepository(client *ent.Client) *Repository {
+	return &Repository{client: client}
 }
 
 func (r *Repository) Store(ctx context.Context, secret internal.Secret) error {
@@ -62,6 +60,7 @@ func (r *Repository) MarkAsRead(ctx context.Context, publicID string) error {
 	return r.client.Secret.
 		Update().
 		Where(secret.PublicID(publicID), secret.AlreadyRead(false)).
+		SetAlreadyRead(true).
 		Exec(ctx)
 }
 
@@ -92,10 +91,10 @@ func (r *Repository) Cleanup(ctx context.Context, now time.Time) error {
 }
 
 func (r *Repository) StartCleanupJob(interval time.Duration) {
-	ticker := r.clock.Tick(interval)
+	ticker := internal.Clock.Tick(interval)
 
 	for range ticker {
-		if err := r.Cleanup(context.Background(), r.clock.Now()); err != nil {
+		if err := r.Cleanup(context.Background(), internal.Clock.Now()); err != nil {
 			log.Printf("error during database cleanup: %s\n", err)
 		}
 	}

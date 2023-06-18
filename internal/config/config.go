@@ -10,7 +10,6 @@ import (
 
 type Configuration struct {
 	ForwardedPrefix string        `mapstructure:"forwarded_prefix"`
-	SessionSecret   string        `mapstructure:"session_secret"`
 	CleanupInterval time.Duration `mapstructure:"cleanup_interval"`
 }
 

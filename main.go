@@ -14,7 +14,6 @@ import (
 	"github.com/secretli/server/internal/config"
 	"github.com/secretli/server/internal/secrets"
 	"github.com/secretli/server/internal/server"
-	"k8s.io/utils/clock"
 	"log"
 )
 
@@ -27,9 +26,8 @@ func main() {
 	}
 	defer client.Close()
 
-	systemClock := clock.RealClock{}
-	repo := secrets.NewRepository(systemClock, client)
-	service := secrets.NewService(systemClock, repo)
+	repo := secrets.NewRepository(client)
+	service := secrets.NewService(repo)
 
 	svr := server.NewServer(conf, service)
 	svr.Use(gin.Logger(), gin.Recovery(), server.ErrorHandler())
