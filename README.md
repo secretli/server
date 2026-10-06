@@ -30,7 +30,7 @@ The server cannot read what it stores. Keys are derived and used only by the cli
 | `GET /api/v1/health/live`, `/api/v1/health/ready` | liveness and readiness |
 | `GET /metrics` | Prometheus metrics, optionally behind a bearer token |
 
-Every endpoint is rate limited per client address.
+The secret, upload and transfer endpoints are rate limited per client address; health, version and metrics are not.
 
 ## Running it
 
