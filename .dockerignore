@@ -1,0 +1,12 @@
+.git
+.github
+bin
+tmp
+scripts
+*.md
+.air.toml
+.dockerignore
+.env
+.env.example
+docker
+Dockerfile

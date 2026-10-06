@@ -1,0 +1,156 @@
+package cmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/secretli/server/internal/adapter/httpserver"
+	"github.com/secretli/server/internal/adapter/metrics"
+	"github.com/secretli/server/internal/adapter/postgres"
+	"github.com/secretli/server/internal/adapter/s3"
+	"github.com/secretli/server/internal/cleanup"
+	"github.com/secretli/server/internal/platform/config"
+	"github.com/secretli/server/internal/platform/correlation"
+)
+
+const (
+	databaseConnectTimeout = 30 * time.Second
+	databaseConnectRetry   = time.Second
+)
+
+func Run() error {
+	// Set up correlated logger: injects request_id into every log record.
+	baseHandler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})
+	slog.SetDefault(slog.New(correlation.NewHandler(baseHandler)))
+
+	slog.Info("secretli starting", "version", Version)
+
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("loading config: %w", err)
+	}
+
+	pool, err := setupDatabase(cfg)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+
+	secretRepo := postgres.NewSecretRepo(pool)
+
+	fileStore, err := s3.NewClient(cfg.S3)
+	if err != nil {
+		return fmt.Errorf("create S3 client: %w", err)
+	}
+
+	// Wakes transfer long-polls on this replica when another one writes.
+	transferEvents := postgres.NewTransferEvents(pool)
+
+	reg := metrics.NewRegistry()
+	app, err := httpserver.New(cfg, Version, pool, secretRepo, fileStore, transferEvents, reg)
+	if err != nil {
+		return fmt.Errorf("create HTTP server: %w", err)
+	}
+
+	worker := cleanup.NewWorker(
+		cfg.CleanupInterval,
+		secretRepo,
+		fileStore,
+		app.SecretMetrics,
+	)
+
+	return runGracefulShutdown(app, worker, transferEvents)
+}
+
+func setupDatabase(cfg config.Config) (*pgxpool.Pool, error) {
+	ctx := context.Background()
+
+	pool, err := connectDatabase(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+
+	slog.Info("running database migrations")
+	if err := postgres.RunMigrations(ctx, pool); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("migrations failed: %w", err)
+	}
+	slog.Info("migrations complete")
+
+	return pool, nil
+}
+
+func connectDatabase(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
+	ctx, cancel := context.WithTimeout(ctx, databaseConnectTimeout)
+	defer cancel()
+
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		pool, err := postgres.NewPool(ctx, databaseURL)
+		if err == nil {
+			return pool, nil
+		}
+		lastErr = err
+
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("database connection failed: %w", lastErr)
+		}
+
+		slog.Warn("database connection failed; retrying", "attempt", attempt, "error", err)
+
+		timer := time.NewTimer(databaseConnectRetry)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("database connection failed: %w", lastErr)
+		case <-timer.C:
+		}
+	}
+}
+
+func runGracefulShutdown(app *httpserver.App, worker *cleanup.Worker, transferEvents *postgres.TransferEvents) error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	g, ctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		slog.Info("server starting")
+		if err := app.Start(); !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		<-ctx.Done()
+		slog.Info("shutting down server")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		return app.Shutdown(shutdownCtx)
+	})
+
+	g.Go(func() error {
+		worker.Run(ctx)
+		return nil
+	})
+
+	g.Go(func() error {
+		transferEvents.Run(ctx)
+		return nil
+	})
+
+	err := g.Wait()
+	slog.Info("server stopped")
+	return err
+}

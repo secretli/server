@@ -1,0 +1,87 @@
+-- name: CreateSecret :exec
+INSERT INTO secrets (
+    public_id,
+    metadata_token_hash,
+    blob_token_hash,
+    deletion_token_hash,
+    encrypted_meta,
+    blob_size,
+    burn_after_read,
+    expires_at,
+    created_at,
+    storage_key
+)
+VALUES (
+    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+);
+
+-- name: GetSecretByPublicID :one
+SELECT
+    public_id,
+    metadata_token_hash,
+    blob_token_hash,
+    deletion_token_hash,
+    encrypted_meta,
+    blob_size,
+    burn_after_read,
+    expires_at,
+    created_at,
+    retrieved_at,
+    storage_key
+FROM secrets
+WHERE public_id = sqlc.arg(public_id)
+  AND expires_at > sqlc.arg(now_at);
+
+-- name: GetSecretIgnoringExpiry :one
+-- The row whatever its state, to tell what became of an expired secret the
+-- cleanup has not reached yet.
+SELECT *
+FROM secrets
+WHERE public_id = $1;
+
+-- name: ClaimBurnAfterRead :execrows
+UPDATE secrets
+SET retrieved_at = sqlc.arg(now_at)
+WHERE public_id = sqlc.arg(public_id)
+  AND blob_token_hash = sqlc.arg(blob_token_hash)
+  AND burn_after_read = true
+  AND retrieved_at IS NULL
+  AND expires_at > sqlc.arg(now_at);
+
+-- name: MarkSecretOpened :exec
+-- The first time a recipient opens a reusable secret.
+UPDATE secrets
+SET retrieved_at = sqlc.arg(now_at)
+WHERE public_id = sqlc.arg(public_id)
+  AND retrieved_at IS NULL;
+
+-- name: DeleteSecret :one
+DELETE FROM secrets
+WHERE public_id = $1
+RETURNING *;
+
+-- name: SelectSecretsForCleanup :many
+-- Expired secrets and consumed burn-after-read secrets whose retrieval
+-- sessions have all ended, oldest first, one batch at a time. Postgres plans
+-- the OR as a BitmapOr over idx_secrets_expires_at and the partial
+-- consumed-burn index, so the cost follows the rows due, not the table size.
+SELECT s.public_id, s.storage_key
+FROM secrets AS s
+WHERE s.expires_at < sqlc.arg(now_at)
+   OR (
+       s.burn_after_read = true
+       AND s.retrieved_at IS NOT NULL
+       AND NOT EXISTS (
+           SELECT 1
+           FROM retrieval_sessions AS rs
+           WHERE rs.public_id = s.public_id
+             AND rs.expires_at > sqlc.arg(now_at)
+       )
+   )
+ORDER BY s.expires_at
+LIMIT sqlc.arg(batch_size)
+FOR UPDATE OF s SKIP LOCKED;
+
+-- name: DeleteSecretsByPublicIDs :execrows
+DELETE FROM secrets
+WHERE public_id = ANY(sqlc.arg(public_ids)::text[]);
