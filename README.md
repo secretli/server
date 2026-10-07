@@ -66,8 +66,11 @@ Environment variables; see [`.env.example`](.env.example).
 | `ALLOWED_ORIGINS` | CORS origins, only needed when the web app is served from another origin | — |
 | `METRICS_TOKEN` | bearer token required for `/metrics` | — |
 | `TRUSTED_PROXIES` | IPs or CIDRs of reverse proxies whose `X-Forwarded-For` is trusted for rate limiting | — |
+| `RATE_LIMIT_MULTIPLIER` | raises every rate limit by this whole factor, for test environments only | `1` |
 
 Behind a reverse proxy, set `TRUSTED_PROXIES` to the proxy's address so rate limits key on the real client; otherwise forwarded headers are ignored.
+
+Rate limits apply per client address, and an end-to-end suite sends far more requests from one address than a visitor would. Test environments set `RATE_LIMIT_MULTIPLIER` (for example to `100`) instead of waiting out the limits. It is read once at startup and never from a request, anything but a whole number of at least 1 stops the server from starting, and a server with raised limits logs a warning. Production leaves it unset.
 
 ## Development
 

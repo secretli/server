@@ -204,6 +204,12 @@ func parseTrustedProxies(value string) ([]*net.IPNet, error) {
 	return ranges, nil
 }
 
+// limited allows limit requests per window from each client, raised by
+// RATE_LIMIT_MULTIPLIER in test environments. An unset multiplier is 1.
+func (a *App) limited(limit int, window time.Duration) echo.MiddlewareFunc {
+	return rateLimiter(limit*max(a.cfg.RateLimitMultiplier, 1), window)
+}
+
 func rateLimiter(limit int, window time.Duration) echo.MiddlewareFunc {
 	return middleware.RateLimiterWithConfig(middleware.RateLimiterConfig{
 		Store: middleware.NewRateLimiterMemoryStoreWithConfig(

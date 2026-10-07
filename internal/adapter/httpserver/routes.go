@@ -52,20 +52,20 @@ func (a *App) registerRoutes() *metrics.SecretMetrics {
 
 	// Retrieve (30/min)
 	retrieveGroup := secrets.Group("")
-	retrieveGroup.Use(rateLimiter(30, time.Minute))
+	retrieveGroup.Use(a.limited(30, time.Minute))
 	retrieveGroup.Use(middleware.BodyLimit(smallRequestBodyLimit))
 	retrieveGroup.POST("/:publicID/retrieval-session", sh.StartRetrievalSession)
 	retrieveGroup.GET("/:publicID/meta", sh.SecretMetadata)
 
 	// Range retrieval can require many chunk requests for one authorized session.
 	rangeGroup := secrets.Group("")
-	rangeGroup.Use(rateLimiter(600, time.Minute))
+	rangeGroup.Use(a.limited(600, time.Minute))
 	rangeGroup.Use(middleware.BodyLimit(smallRequestBodyLimit))
 	rangeGroup.GET("/:publicID/blob", sh.RetrieveSecretRange)
 
 	// Delete (30/min)
 	deleteGroup := secrets.Group("")
-	deleteGroup.Use(rateLimiter(30, time.Minute))
+	deleteGroup.Use(a.limited(30, time.Minute))
 	deleteGroup.Use(middleware.BodyLimit(smallRequestBodyLimit))
 	deleteGroup.DELETE("/:publicID", sh.DeleteSecret)
 
@@ -75,19 +75,19 @@ func (a *App) registerRoutes() *metrics.SecretMetrics {
 	transfers := e.Group("/api/v1/transfers")
 
 	transferCreateGroup := transfers.Group("")
-	transferCreateGroup.Use(rateLimiter(10, time.Minute))
+	transferCreateGroup.Use(a.limited(10, time.Minute))
 	transferCreateGroup.Use(middleware.BodyLimit(smallRequestBodyLimit))
 	transferCreateGroup.POST("", th.CreateTransfer)
 
 	transferClaimGroup := transfers.Group("")
-	transferClaimGroup.Use(rateLimiter(10, time.Minute))
+	transferClaimGroup.Use(a.limited(10, time.Minute))
 	transferClaimGroup.Use(middleware.BodyLimit(smallRequestBodyLimit))
 	transferClaimGroup.POST("/claim", th.ClaimTransfer)
 
 	// The legs: each written once with POST and waited for with a GET
 	// long-poll of up to 25 s.
 	transferLegGroup := transfers.Group("")
-	transferLegGroup.Use(rateLimiter(300, time.Minute))
+	transferLegGroup.Use(a.limited(300, time.Minute))
 	transferLegGroup.Use(middleware.BodyLimit(smallRequestBodyLimit))
 	transferLegGroup.POST("/:transferID/answer", th.PostAnswer)
 	transferLegGroup.GET("/:transferID/answer", th.AwaitAnswer)
@@ -95,7 +95,7 @@ func (a *App) registerRoutes() *metrics.SecretMetrics {
 	transferLegGroup.GET("/:transferID/delivery", th.AwaitDelivery)
 
 	transferCloseGroup := transfers.Group("")
-	transferCloseGroup.Use(rateLimiter(30, time.Minute))
+	transferCloseGroup.Use(a.limited(30, time.Minute))
 	transferCloseGroup.Use(middleware.BodyLimit(smallRequestBodyLimit))
 	transferCloseGroup.DELETE("/:transferID", th.CloseTransfer)
 
@@ -105,7 +105,7 @@ func (a *App) registerRoutes() *metrics.SecretMetrics {
 	// Starting a session is what creates a secret, so it carries the create
 	// budget.
 	uploadCreateGroup := uploads.Group("")
-	uploadCreateGroup.Use(rateLimiter(10, time.Minute))
+	uploadCreateGroup.Use(a.limited(10, time.Minute))
 	uploadCreateGroup.Use(middleware.BodyLimit(smallRequestBodyLimit))
 	uploadCreateGroup.POST("", uh.CreateUploadSession)
 
@@ -113,13 +113,13 @@ func (a *App) registerRoutes() *metrics.SecretMetrics {
 	// token and happen at least once per upload; charging them to the create
 	// budget would halve the number of shares a client can make.
 	uploadSessionGroup := uploads.Group("")
-	uploadSessionGroup.Use(rateLimiter(60, time.Minute))
+	uploadSessionGroup.Use(a.limited(60, time.Minute))
 	uploadSessionGroup.Use(middleware.BodyLimit(smallRequestBodyLimit))
 	uploadSessionGroup.POST("/:sessionID/complete", uh.CompleteUploadSession)
 	uploadSessionGroup.DELETE("/:sessionID", uh.AbortUploadSession)
 
 	uploadPartGroup := uploads.Group("")
-	uploadPartGroup.Use(rateLimiter(600, time.Minute))
+	uploadPartGroup.Use(a.limited(600, time.Minute))
 	uploadPartGroup.PUT("/:sessionID/parts/:partNumber", uh.UploadPart)
 
 	return secretMetrics
