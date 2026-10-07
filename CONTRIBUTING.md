@@ -25,10 +25,12 @@ make dev
 ```bash
 make test          # Full suite (needs Docker for the Postgres and S3 integration tests)
 make test-short    # Fast unit tests only
-make e2e           # End-to-end against a running server, driven by the secretli client
+make api-test      # The API over HTTP against a running server with raised rate limits
 make lint          # golangci-lint
 make vuln          # govulncheck
 ```
+
+CI also runs the whole of Secretli with your change, from [secretli/e2e](https://github.com/secretli/e2e): the web app and both clients against this server.
 
 ## Submitting Changes
 
