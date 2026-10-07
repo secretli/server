@@ -16,7 +16,7 @@ concurrency:
 
 env:
   # The client the end-to-end job drives the server with.
-  SECRETLI_CLI_VERSION: v0.2.0
+  SECRETLI_CLI_VERSION: v0.3.0
 
 jobs:
   lint:

@@ -6,14 +6,14 @@
 #   SECRETLI_SERVER  the server to test (default http://localhost:8080)
 #   SECRETLI_CLI     the secretli binary (default: secretli on PATH)
 #
-# The browser's own flows, and the short-code hand-off between devices, are
-# covered by the web app's end-to-end tests.
+# The browser's own flows, and the hand-off between the browser and the
+# client, are covered by the web app's end-to-end tests.
 set -euo pipefail
 
 SERVER="${SECRETLI_SERVER:-http://localhost:8080}"
 CLI="${SECRETLI_CLI:-secretli}"
 work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
+trap 'kill $(jobs -p) 2> /dev/null; rm -rf "$work"' EXIT
 
 pass() { printf 'ok    %s\n' "$1"; }
 fail() { printf 'FAIL  %s\n' "$1" >&2; exit 1; }
@@ -85,5 +85,44 @@ expect_exit 1 "the recipient's link cannot delete" -- "$CLI" delete "$link" --ye
 expect_exit 0 "the owner link deletes" -- "$CLI" delete "$owner" --yes
 expect_exit 4 "and the owner link says so" -- "$CLI" status "$owner" --json
 [ "$(jq -r .outcome "$work/out")" = deleted ] || fail "outcome should be deleted"
+
+# --- handing a link over with a code, through the relay ---
+# send_in_background LINK NAME: starts `send`, waits for the code it prints,
+# and leaves the code in $code and the process in $sender.
+send_in_background() {
+  "$CLI" send "$1" > "$work/$2.code" 2> "$work/$2.err" &
+  sender=$!
+  for _ in $(seq 1 100); do
+    [ -s "$work/$2.code" ] && break
+    sleep 0.1
+  done
+  code="$(head -n 1 "$work/$2.code")"
+  [ -n "$code" ] || fail "send printed no code: $(cat "$work/$2.err")"
+}
+
+text="e2e $(date +%s) handed over with a code"
+"$CLI" share --server "$SERVER" -e 5m -t "$text" -q > "$work/handover.link"
+send_in_background "$(cat "$work/handover.link")" handover
+pass "send prints a code"
+expect_exit 0 "receive opens what the code hands over" -- "$CLI" receive "$code" --server "$SERVER"
+[ "$(cat "$work/out")" = "$text" ] || fail "received text differs: $(cat "$work/out")"
+got=0
+wait "$sender" || got=$?
+[ "$got" = 0 ] || fail "send exited $got after handing over: $(cat "$work/handover.err")"
+pass "and send ends once the link is handed over"
+
+# A wrong code ends the transfer on both sides, and nothing is handed over.
+text="e2e $(date +%s) never handed over"
+"$CLI" share --server "$SERVER" -e 5m -t "$text" -q > "$work/mismatch.link"
+send_in_background "$(cat "$work/mismatch.link")" mismatch
+wrong="${code%%-*}-yoyo-zucchini"
+[ "$wrong" != "$code" ] || wrong="${code%%-*}-acid-rocket"
+expect_exit 3 "a wrong code is refused" -- "$CLI" receive "$wrong" --server "$SERVER"
+got=0
+wait "$sender" || got=$?
+[ "$got" = 3 ] || fail "send should exit 3 on a wrong code, exited $got"
+pass "and the sender hears it too"
+expect_exit 0 "the secret was not handed over and still opens" -- "$CLI" open "$(cat "$work/mismatch.link")"
+[ "$(cat "$work/out")" = "$text" ] || fail "opened text differs: $(cat "$work/out")"
 
 echo "all end-to-end checks passed against $SERVER"
