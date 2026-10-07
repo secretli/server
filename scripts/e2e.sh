@@ -45,7 +45,15 @@ pass "share a one-time text secret"
 expect_exit 0 "status before opening" -- "$CLI" status "$owner" --json
 [ "$(jq -r .state "$work/out")" = live ] || fail "status should say live"
 
-expect_exit 0 "open it" -- "$CLI" open "$link"
+# Opening uses it up, so the client asks first; where it cannot ask, as in
+# CI, it refuses without --yes and leaves the secret alone.
+if ( : < /dev/tty ) 2> /dev/null; then
+  pass "a one-time secret is not opened without --yes (skipped: a terminal would be asked)"
+else
+  expect_exit 1 "a one-time secret is not opened without --yes" -- "$CLI" open "$link"
+fi
+
+expect_exit 0 "open it" -- "$CLI" open "$link" --yes
 [ "$(cat "$work/out")" = "$text" ] || fail "opened text differs: $(cat "$work/out")"
 
 expect_exit 4 "the owner link says it was opened" -- "$CLI" status "$owner" --json
@@ -104,7 +112,7 @@ text="e2e $(date +%s) handed over with a code"
 "$CLI" share --server "$SERVER" -e 5m -t "$text" -q > "$work/handover.link"
 send_in_background "$(cat "$work/handover.link")" handover
 pass "send prints a code"
-expect_exit 0 "receive opens what the code hands over" -- "$CLI" receive "$code" --server "$SERVER"
+expect_exit 0 "receive opens what the code hands over" -- "$CLI" receive "$code" --server "$SERVER" --yes
 [ "$(cat "$work/out")" = "$text" ] || fail "received text differs: $(cat "$work/out")"
 got=0
 wait "$sender" || got=$?
@@ -117,12 +125,12 @@ text="e2e $(date +%s) never handed over"
 send_in_background "$(cat "$work/mismatch.link")" mismatch
 wrong="${code%%-*}-yoyo-zucchini"
 [ "$wrong" != "$code" ] || wrong="${code%%-*}-acid-rocket"
-expect_exit 3 "a wrong code is refused" -- "$CLI" receive "$wrong" --server "$SERVER"
+expect_exit 3 "a wrong code is refused" -- "$CLI" receive "$wrong" --server "$SERVER" --yes
 got=0
 wait "$sender" || got=$?
 [ "$got" = 3 ] || fail "send should exit 3 on a wrong code, exited $got"
 pass "and the sender hears it too"
-expect_exit 0 "the secret was not handed over and still opens" -- "$CLI" open "$(cat "$work/mismatch.link")"
+expect_exit 0 "the secret was not handed over and still opens" -- "$CLI" open "$(cat "$work/mismatch.link")" --yes
 [ "$(cat "$work/out")" = "$text" ] || fail "opened text differs: $(cat "$work/out")"
 
 echo "all end-to-end checks passed against $SERVER"
