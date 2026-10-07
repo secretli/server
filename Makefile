@@ -1,4 +1,4 @@
-.PHONY: dev build test test-short test-coverage e2e lint vuln clean
+.PHONY: dev build test test-short test-coverage e2e lint vuln clean api-test
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X github.com/secretli/server/cmd.Version=$(VERSION)
@@ -21,6 +21,11 @@ test-short:
 
 test-coverage:
 	go test -coverprofile=coverage.out ./... && go tool cover -func=coverage.out
+
+# The API over HTTP against a running server started with raised rate
+# limits (RATE_LIMIT_MULTIPLIER=100); SECRETLI_SERVER overrides the default.
+api-test:
+	SECRETLI_SERVER=$${SECRETLI_SERVER:-http://localhost:8080} go test -count=1 ./apitest
 
 # End-to-end against a running server, driven by the secretli command-line
 # client. SECRETLI_SERVER and SECRETLI_CLI override the defaults.

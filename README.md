@@ -77,12 +77,20 @@ Rate limits apply per client address, and an end-to-end suite sends far more req
 ```bash
 make test        # everything, including the Postgres and S3 integration tests (needs Docker)
 make test-short  # unit tests only
+make api-test    # the API, over HTTP, against a running server; see below
 make e2e         # end-to-end against a running server, see below
 make lint
 make vuln
 ```
 
-The end-to-end test drives a running server with the released command-line client: it shares, inspects, opens and deletes secrets, with and without a password, including a 40 MiB upload in several parts, and checks every answer and exit code. CI runs it against a fresh server at every change. The short-code relay and the browser's own flows are covered by the web app's end-to-end tests.
+The API test (`apitest/`) checks a running server through its HTTP API alone, with no client and no format library: uploads in one and several parts, the upload rules, metadata, retrieval and byte ranges, one-time and reusable secrets, tombstones for the token holder only, deletion, and the short-code relay. The server never decrypts anything, so random bytes stand in for ciphertext. It sends more requests than the rate limits allow from one address, so the server under test needs raised limits:
+
+```bash
+make build && RATE_LIMIT_MULTIPLIER=100 ./bin/secretli   # with DATABASE_URL and S3_* set
+SECRETLI_SERVER=http://localhost:8080 make api-test
+```
+
+The end-to-end test drives a running server with the released command-line client: it shares, inspects, opens and deletes secrets, with and without a password, including a 40 MiB upload in several parts, and checks every answer and exit code. CI runs both against a fresh server at every change. The browser's own flows are covered by the web app's end-to-end tests.
 
 ```bash
 go install github.com/secretli/cli/cmd/secretli@latest
