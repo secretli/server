@@ -1,4 +1,4 @@
-.PHONY: dev build test test-short test-coverage e2e lint vuln clean api-test
+.PHONY: dev build test test-short test-coverage lint vuln clean api-test
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X github.com/secretli/server/cmd.Version=$(VERSION)
@@ -27,10 +27,6 @@ test-coverage:
 api-test:
 	SECRETLI_SERVER=$${SECRETLI_SERVER:-http://localhost:8080} go test -count=1 ./apitest
 
-# End-to-end against a running server, driven by the secretli command-line
-# client. SECRETLI_SERVER and SECRETLI_CLI override the defaults.
-e2e:
-	./scripts/e2e.sh
 
 lint:
 	golangci-lint run ./...

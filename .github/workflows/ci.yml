@@ -14,10 +14,6 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  # The client the end-to-end job drives the server with.
-  SECRETLI_CLI_VERSION: v0.4.0
-
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -121,14 +117,6 @@ jobs:
           SECRETLI_SERVER: http://localhost:8080
         run: go test -count=1 -race -v ./apitest
 
-      - name: Install the command-line client
-        run: GOBIN="$RUNNER_TEMP/bin" go install "github.com/secretli/cli/cmd/secretli@${SECRETLI_CLI_VERSION}"
-
-      - name: End-to-end
-        env:
-          SECRETLI_SERVER: http://localhost:8080
-        run: SECRETLI_CLI="$RUNNER_TEMP/bin/secretli" ./scripts/e2e.sh
-
       - name: Server logs
         if: always()
         run: |
@@ -141,8 +129,16 @@ jobs:
           if [ -f secretli-e2e.pid ]; then kill "$(cat secretli-e2e.pid)" || true; fi
           docker compose -f docker/docker-compose.yml down -v
 
+  # The whole of Secretli with this change: the web app and both clients
+  # against this server, behind a gateway like production's, including the
+  # oldest client release the server supports. See secretli/e2e.
+  whole-setup:
+    uses: secretli/e2e/.github/workflows/whole-setup.yml@main
+    with:
+      server_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
   build-and-publish:
-    needs: [lint, test, e2e]
+    needs: [lint, test, e2e, whole-setup]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
