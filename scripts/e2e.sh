@@ -13,7 +13,7 @@ set -euo pipefail
 SERVER="${SECRETLI_SERVER:-http://localhost:8080}"
 CLI="${SECRETLI_CLI:-secretli}"
 work="$(mktemp -d)"
-trap 'kill $(jobs -p) 2> /dev/null; rm -rf "$work"' EXIT
+trap 'kill $(jobs -p) 2> /dev/null || true; rm -rf "$work"' EXIT
 
 pass() { printf 'ok    %s\n' "$1"; }
 fail() { printf 'FAIL  %s\n' "$1" >&2; exit 1; }
