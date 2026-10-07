@@ -3,6 +3,7 @@ package httpserver
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -61,6 +62,10 @@ func New(cfg config.Config, version string, pool *pgxpool.Pool, secretRepo domai
 		reg:            reg,
 	}
 
+	if cfg.RateLimitMultiplier > 1 {
+		slog.Warn("rate limits are raised for testing; production must not set RATE_LIMIT_MULTIPLIER",
+			"multiplier", cfg.RateLimitMultiplier)
+	}
 	a.SecretMetrics = a.registerRoutes()
 
 	return a, nil

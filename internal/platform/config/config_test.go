@@ -46,6 +46,36 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.TrustedProxies != "" {
 		t.Errorf("TrustedProxies = %q, want empty", cfg.TrustedProxies)
 	}
+	if cfg.RateLimitMultiplier != 1 {
+		t.Errorf("RateLimitMultiplier = %d, want 1", cfg.RateLimitMultiplier)
+	}
+}
+
+func TestLoadRateLimitMultiplier(t *testing.T) {
+	setRequiredEnv(t)
+	t.Setenv("RATE_LIMIT_MULTIPLIER", "100")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.RateLimitMultiplier != 100 {
+		t.Errorf("RateLimitMultiplier = %d, want 100", cfg.RateLimitMultiplier)
+	}
+}
+
+// A mistyped multiplier stops the server instead of starting it with limits
+// nobody intended.
+func TestLoadRejectsInvalidRateLimitMultiplier(t *testing.T) {
+	for _, value := range []string{"0", "-1", "1.5", "lots", ""} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("RATE_LIMIT_MULTIPLIER", value)
+			if _, err := Load(); err == nil {
+				t.Errorf("RATE_LIMIT_MULTIPLIER=%q: Load() succeeded, want an error", value)
+			}
+		})
+	}
 }
 
 func TestLoadFromEnv(t *testing.T) {

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -28,6 +29,11 @@ type Config struct {
 	// proxies whose X-Forwarded-For headers may be trusted for client IP
 	// resolution. When empty, forwarding headers are ignored entirely.
 	TrustedProxies string `env:"TRUSTED_PROXIES"`
+	// RateLimitMultiplier raises every rate limit by this factor, for test
+	// environments that send more requests from one address than a visitor
+	// would. It is read once at startup and never from a request; production
+	// leaves it at 1.
+	RateLimitMultiplier int `env:"RATE_LIMIT_MULTIPLIER" default:"1"`
 }
 
 func Load() (Config, error) {
@@ -35,6 +41,9 @@ func Load() (Config, error) {
 	var cfg Config
 	if err := env.Load(&cfg, &env.Options{NameSep: "_"}); err != nil {
 		return Config{}, err
+	}
+	if cfg.RateLimitMultiplier < 1 {
+		return Config{}, fmt.Errorf("RATE_LIMIT_MULTIPLIER must be a whole number of at least 1, got %d", cfg.RateLimitMultiplier)
 	}
 	return cfg, nil
 }

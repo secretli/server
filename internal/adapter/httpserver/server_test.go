@@ -102,6 +102,36 @@ func TestApp_SpoofedForwardedForDoesNotBypassRateLimit(t *testing.T) {
 	}
 }
 
+func TestApp_RateLimitMultiplierRaisesTheLimits(t *testing.T) {
+	createSessions := func(app *App, client string, n int) (created, limited int) {
+		for i := 0; i < n; i++ {
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/secrets/uploads", bytes.NewReader(createSessionBody(t, fmt.Sprintf("%s-%d", client, i))))
+			req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+			req.RemoteAddr = client + ":4321"
+			rec := httptest.NewRecorder()
+			app.echo.ServeHTTP(rec, req)
+			switch rec.Code {
+			case http.StatusCreated:
+				created++
+			case http.StatusTooManyRequests:
+				limited++
+			default:
+				t.Fatalf("status = %d", rec.Code)
+			}
+		}
+		return created, limited
+	}
+
+	// The real limit: 10 new secrets a minute.
+	if created, limited := createSessions(newTestApp(t, config.Config{MaxFileSize: 1 << 20, RateLimitMultiplier: 1}), "203.0.113.10", 11); created != 10 || limited != 1 {
+		t.Errorf("multiplier 1: %d created, %d limited; want 10 and 1", created, limited)
+	}
+	// Raised three times for a test environment.
+	if created, limited := createSessions(newTestApp(t, config.Config{MaxFileSize: 1 << 20, RateLimitMultiplier: 3}), "203.0.113.11", 31); created != 30 || limited != 1 {
+		t.Errorf("multiplier 3: %d created, %d limited; want 30 and 1", created, limited)
+	}
+}
+
 func TestApp_TrustedProxyKeysRateLimitOnForwardedClient(t *testing.T) {
 	app := newTestApp(t, config.Config{MaxFileSize: 1 << 20, TrustedProxies: "10.0.0.0/8"})
 
