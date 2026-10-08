@@ -89,11 +89,10 @@ jobs:
       - name: Start the server
         env:
           DATABASE_URL: postgres://secretli:secretli@localhost:5432/secretli?sslmode=disable
-          S3_ENDPOINT: localhost:8333
+          S3_ENDPOINT: http://localhost:8333
           S3_BUCKET: secretli
           S3_ACCESS_KEY: admin
           S3_SECRET_KEY: admin
-          S3_USE_SSL: "false"
           S3_REGION: us-east-1
           SERVER_PORT: "8080"
           # The API test sends more requests from one address than the

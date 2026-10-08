@@ -9,7 +9,8 @@ import (
 func setRequiredEnv(t *testing.T) {
 	t.Helper()
 	t.Setenv("DATABASE_URL", "postgres://test:test@localhost:5432/test")
-	t.Setenv("S3_ENDPOINT", "localhost:9000")
+	t.Setenv("S3_ENDPOINT", "http://localhost:9000")
+	t.Setenv("S3_BUCKET", "secretli")
 	t.Setenv("S3_ACCESS_KEY", "minioadmin")
 	t.Setenv("S3_SECRET_KEY", "minioadmin")
 }
@@ -24,12 +25,6 @@ func TestLoadDefaults(t *testing.T) {
 
 	if cfg.Port != "8080" {
 		t.Errorf("Port = %q, want %q", cfg.Port, "8080")
-	}
-	if cfg.S3.Bucket != "secretli" {
-		t.Errorf("S3Bucket = %q, want %q", cfg.S3.Bucket, "secretli")
-	}
-	if cfg.S3.UseSSL != true {
-		t.Errorf("S3UseSSL = %v, want true", cfg.S3.UseSSL)
 	}
 	if cfg.S3.Region != "us-east-1" {
 		t.Errorf("S3Region = %q, want %q", cfg.S3.Region, "us-east-1")
@@ -81,8 +76,8 @@ func TestLoadRejectsInvalidRateLimitMultiplier(t *testing.T) {
 func TestLoadFromEnv(t *testing.T) {
 	setRequiredEnv(t)
 	t.Setenv("SERVER_PORT", "9090")
+	t.Setenv("S3_ENDPOINT", "https://fsn1.your-objectstorage.com")
 	t.Setenv("S3_BUCKET", "my-bucket")
-	t.Setenv("S3_USE_SSL", "false")
 	t.Setenv("MAX_FILE_SIZE", "5242880")
 	t.Setenv("CLEANUP_INTERVAL", "5m")
 	t.Setenv("METRICS_TOKEN", "metrics-secret")
@@ -99,8 +94,8 @@ func TestLoadFromEnv(t *testing.T) {
 	if cfg.S3.Bucket != "my-bucket" {
 		t.Errorf("S3Bucket = %q, want %q", cfg.S3.Bucket, "my-bucket")
 	}
-	if cfg.S3.UseSSL != false {
-		t.Errorf("S3UseSSL = %v, want false", cfg.S3.UseSSL)
+	if cfg.S3.Endpoint != "https://fsn1.your-objectstorage.com" {
+		t.Errorf("S3Endpoint = %q, want %q", cfg.S3.Endpoint, "https://fsn1.your-objectstorage.com")
 	}
 	if cfg.MaxFileSize != 5242880 {
 		t.Errorf("MaxFileSize = %d, want %d", cfg.MaxFileSize, 5242880)
@@ -126,10 +121,35 @@ func TestLoadMissingRequiredReturnsError(t *testing.T) {
 
 func TestLoadInvalidEnvReturnsError(t *testing.T) {
 	setRequiredEnv(t)
-	t.Setenv("S3_USE_SSL", "notabool")
+	t.Setenv("MAX_FILE_SIZE", "lots")
 
 	_, err := Load()
 	if err == nil {
-		t.Error("Load() should return error for invalid bool value")
+		t.Error("Load() should return error for an invalid number")
+	}
+}
+
+// Whether the server speaks HTTP or HTTPS to S3 comes from the endpoint's
+// scheme alone, so an endpoint without one stops the server.
+func TestLoadRejectsEndpointWithoutScheme(t *testing.T) {
+	for _, value := range []string{"localhost:8333", "fsn1.your-objectstorage.com", "ftp://localhost:8333", "https://", ""} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("S3_ENDPOINT", value)
+			if _, err := Load(); err == nil {
+				t.Errorf("S3_ENDPOINT=%q: Load() succeeded, want an error", value)
+			}
+		})
+	}
+}
+
+// There is no default bucket: a bucket of that name could belong to anyone.
+func TestLoadRequiresBucket(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://test:test@localhost:5432/test")
+	t.Setenv("S3_ENDPOINT", "http://localhost:9000")
+	t.Setenv("S3_ACCESS_KEY", "minioadmin")
+	t.Setenv("S3_SECRET_KEY", "minioadmin")
+	if _, err := Load(); err == nil {
+		t.Error("Load() succeeded without S3_BUCKET, want an error")
 	}
 }
