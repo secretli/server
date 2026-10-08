@@ -47,7 +47,7 @@ func (a *App) registerRoutes() *metrics.SecretMetrics {
 	e.GET("/api/v1/version", VersionHandler(a.version))
 
 	// Secrets
-	sh := NewSecretHandler(a.secretRepo, a.fileStore, secretMetrics)
+	sh := NewSecretHandler(a.secretRepo, a.fileStore)
 	secrets := e.Group("/api/v1/secrets")
 
 	// Retrieve (30/min)

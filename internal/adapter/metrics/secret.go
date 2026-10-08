@@ -3,10 +3,9 @@ package metrics
 import "github.com/prometheus/client_golang/prometheus"
 
 type SecretMetrics struct {
-	SecretsCreated   prometheus.Counter
-	SecretsRetrieved prometheus.Counter
-	SecretsDeleted   *prometheus.CounterVec
-	CleanupErrors    prometheus.Counter
+	SecretsCreated prometheus.Counter
+	SecretsCleaned prometheus.Counter
+	CleanupErrors  prometheus.Counter
 }
 
 func NewSecretMetrics(reg *prometheus.Registry) *SecretMetrics {
@@ -18,20 +17,12 @@ func NewSecretMetrics(reg *prometheus.Registry) *SecretMetrics {
 				Help:      "Total number of secrets created.",
 			},
 		),
-		SecretsRetrieved: prometheus.NewCounter(
+		SecretsCleaned: prometheus.NewCounter(
 			prometheus.CounterOpts{
 				Namespace: namespace,
-				Name:      "secrets_retrieved_total",
-				Help:      "Total number of secrets successfully retrieved.",
+				Name:      "secrets_cleaned_total",
+				Help:      "Total number of secrets the cleanup removed. Every secret ends there exactly once, whether it expired, was opened once or was deleted.",
 			},
-		),
-		SecretsDeleted: prometheus.NewCounterVec(
-			prometheus.CounterOpts{
-				Namespace: namespace,
-				Name:      "secrets_deleted_total",
-				Help:      "Total number of secrets deleted, by method (api, burn, cleanup).",
-			},
-			[]string{"method"},
 		),
 		CleanupErrors: prometheus.NewCounter(
 			prometheus.CounterOpts{
@@ -41,6 +32,6 @@ func NewSecretMetrics(reg *prometheus.Registry) *SecretMetrics {
 			},
 		),
 	}
-	reg.MustRegister(m.SecretsCreated, m.SecretsRetrieved, m.SecretsDeleted, m.CleanupErrors)
+	reg.MustRegister(m.SecretsCreated, m.SecretsCleaned, m.CleanupErrors)
 	return m
 }

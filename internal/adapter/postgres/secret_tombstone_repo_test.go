@@ -162,8 +162,42 @@ func TestSecretRepo_DeletingLeavesATombstone(t *testing.T) {
 	if want := expiresAt.Add(domain.TombstoneRetention); !tomb.KeepUntil.Equal(want) {
 		t.Errorf("keep_until = %v, want %v", tomb.KeepUntil, want)
 	}
-	if _, err := repo.GetByPublicID(ctx, "tomb-deleted", time.Now()); !errors.Is(err, domain.ErrNotFound) {
+	if _, err := repo.GetByPublicID(ctx, "tomb-deleted", deleted); !errors.Is(err, domain.ErrNotFound) {
 		t.Errorf("secret still there after delete: %v", err)
+	}
+}
+
+func TestSecretRepo_CleanupRemovesADeletedSecretAndKeepsItsOutcome(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	ctx := context.Background()
+	secret := newTestSecret("deleted-then-cleaned", time.Now().Add(time.Hour))
+	mustCreate(t, repo, secret)
+	deleted := moment(time.Now())
+	if err := repo.Delete(ctx, secret.PublicID, deleted); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	// Deleting ends the secret without touching storage; the next cleanup
+	// cycle removes its object and row like an expired secret's.
+	var removedKeys []string
+	batch, err := repo.DeleteExpired(ctx, deleted.Add(time.Minute), testBatchSize, func(key string) error {
+		removedKeys = append(removedKeys, key)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if batch.Removed != 1 || len(removedKeys) != 1 || removedKeys[0] != secret.StorageKey {
+		t.Fatalf("batch = %+v, removed keys = %v; want the deleted secret's object %q", batch, removedKeys, secret.StorageKey)
+	}
+
+	tomb := mustTombstone(t, repo, secret.PublicID)
+	if tomb.Outcome != domain.TombstoneDeleted || !tomb.EndedAt.Equal(deleted) {
+		t.Errorf("tombstone = %+v, want deleted at %v, not expired", tomb, deleted)
+	}
+	if again, err := repo.DeleteExpired(ctx, deleted.Add(2*time.Minute), testBatchSize, func(string) error { return nil }); err != nil || again.Found != 0 {
+		t.Errorf("second cleanup = %+v, %v; want nothing left", again, err)
 	}
 }
 
@@ -257,6 +291,11 @@ func TestSecretRepo_DeleteExpiredTombstonesForgetsOldOnes(t *testing.T) {
 		if err := repo.Delete(ctx, id, time.Now()); err != nil {
 			t.Fatalf("delete %s: %v", id, err)
 		}
+	}
+	// The cleanup removes deleted secrets within a cycle, long before their
+	// tombstones are due.
+	if _, err := repo.DeleteExpired(ctx, time.Now().Add(time.Minute), testBatchSize, func(string) error { return nil }); err != nil {
+		t.Fatalf("cleanup: %v", err)
 	}
 	if _, err := pool.Exec(ctx, "UPDATE secret_tombstones SET keep_until = $2 WHERE public_id = $1", "forgotten", time.Now().Add(-time.Minute)); err != nil {
 		t.Fatalf("age tombstone: %v", err)

@@ -33,6 +33,7 @@ type mockSecretRepo struct {
 	expiredUploadErr error
 	abortCalls       int
 
+	finishedUploads       []domain.UploadSession
 	finishedBefore        time.Time
 	transfersEnded        time.Time
 	tombstonesForgottenAt time.Time
@@ -74,9 +75,17 @@ func (m *mockSecretRepo) AbortExpiredUploadSessions(_ context.Context, _ time.Ti
 	return domain.CleanupBatch{Found: len(batch), Removed: len(batch) - len(kept)}, nil
 }
 
-func (m *mockSecretRepo) DeleteFinishedUploadSessions(_ context.Context, finishedBefore time.Time) (int64, error) {
+func (m *mockSecretRepo) PurgeFinishedUploadSessions(_ context.Context, finishedBefore time.Time, limit int, beforePurge func(*domain.UploadSession) error) (domain.CleanupBatch, error) {
 	m.finishedBefore = finishedBefore
-	return 0, nil
+	batch := m.finishedUploads[:min(limit, len(m.finishedUploads))]
+	var kept []domain.UploadSession
+	for _, session := range batch {
+		if err := beforePurge(&session); err != nil {
+			kept = append(kept, session)
+		}
+	}
+	m.finishedUploads = append(kept, m.finishedUploads[len(batch):]...)
+	return domain.CleanupBatch{Found: len(batch), Removed: len(batch) - len(kept)}, nil
 }
 
 func (m *mockSecretRepo) DeleteEndedTransfers(_ context.Context, endedBefore time.Time) (int64, error) {
@@ -159,6 +168,44 @@ func TestRunCycle_PurgesFinishedUploadSessions(t *testing.T) {
 
 	if repo.finishedBefore.Before(before.Add(-finishedUploadRetention)) || repo.finishedBefore.After(after.Add(-finishedUploadRetention)) {
 		t.Errorf("finished sessions purged before %v, want %v before the cycle", repo.finishedBefore, finishedUploadRetention)
+	}
+}
+
+func TestRunCycle_PurgingAnAbortedSessionRemovesItsObject(t *testing.T) {
+	repo := &mockSecretRepo{finishedUploads: []domain.UploadSession{
+		{SessionID: "done", StorageKey: "blobs/done", State: domain.UploadSessionStateCompleted},
+		{SessionID: "aborted", StorageKey: "blobs/aborted", State: domain.UploadSessionStateAborted},
+	}}
+	store := &mockFileStore{}
+
+	w := NewWorker(time.Minute, repo, store, testMetrics())
+	w.runCycle(context.Background())
+
+	// The completed session's object is its secret's and stays.
+	if len(store.deletedKeys) != 1 || store.deletedKeys[0] != "blobs/aborted" {
+		t.Errorf("deleted keys = %v, want only the aborted session's object", store.deletedKeys)
+	}
+	if len(store.abortedUploads) != 0 {
+		t.Errorf("aborted uploads = %v, want none: an aborted session's upload has already ended", store.abortedUploads)
+	}
+	if len(repo.finishedUploads) != 0 {
+		t.Errorf("%d sessions left, want both purged", len(repo.finishedUploads))
+	}
+}
+
+func TestRunCycle_KeepsAnAbortedSessionWhoseObjectCannotBeDeleted(t *testing.T) {
+	repo := &mockSecretRepo{finishedUploads: []domain.UploadSession{
+		{SessionID: "aborted", StorageKey: "blobs/aborted", State: domain.UploadSessionStateAborted},
+	}}
+	store := &mockFileStore{deleteErr: errors.New("storage down")}
+
+	w := NewWorker(time.Minute, repo, store, testMetrics())
+	w.runCycle(context.Background())
+
+	// Forgetting the session would leave the object to nobody; it is tried
+	// again next cycle.
+	if len(repo.finishedUploads) != 1 {
+		t.Errorf("%d sessions left, want the aborted one kept", len(repo.finishedUploads))
 	}
 }
 
@@ -275,8 +322,8 @@ func TestRunCycle_KeepsCommittedBatchesAfterAnError(t *testing.T) {
 	if len(repo.expiredKeys) != batchSize {
 		t.Errorf("%d secrets left, want the first batch deleted before the error", len(repo.expiredKeys))
 	}
-	if got := counterValue(t, m.SecretsDeleted.WithLabelValues("cleanup")); got != batchSize {
-		t.Errorf("deleted metric = %v, want %d", got, batchSize)
+	if got := counterValue(t, m.SecretsCleaned); got != batchSize {
+		t.Errorf("cleaned metric = %v, want %d", got, batchSize)
 	}
 	if got := counterValue(t, m.CleanupErrors); got != 1 {
 		t.Errorf("cleanup errors = %v, want 1", got)

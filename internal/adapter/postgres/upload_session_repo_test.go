@@ -474,12 +474,19 @@ func TestUploadSessionRepo_DeleteFinished(t *testing.T) {
 		t.Fatalf("complete new: %v", err)
 	}
 
-	count, err := repo.DeleteFinishedUploadSessions(ctx, time.Now().Add(-time.Hour))
+	seen := map[string]string{}
+	batch, err := repo.PurgeFinishedUploadSessions(ctx, time.Now().Add(-time.Hour), testBatchSize, func(s *domain.UploadSession) error {
+		seen[s.SessionID] = s.State
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("delete finished: %v", err)
+		t.Fatalf("purge finished: %v", err)
 	}
-	if count != 2 {
-		t.Errorf("deleted = %d, want 2", count)
+	if batch != (domain.CleanupBatch{Found: 2, Removed: 2}) {
+		t.Errorf("batch = %+v, want both old sessions purged", batch)
+	}
+	if seen["us-old-done"] != domain.UploadSessionStateCompleted || seen["us-old-aborted"] != domain.UploadSessionStateAborted || len(seen) != 2 {
+		t.Errorf("callback saw %v, want the two old sessions with their states", seen)
 	}
 	for _, id := range []string{"us-old-done", "us-old-aborted"} {
 		if _, _, err := repo.GetUploadSession(ctx, id); !errors.Is(err, domain.ErrNotFound) {
@@ -492,6 +499,41 @@ func TestUploadSessionRepo_DeleteFinished(t *testing.T) {
 	// Purging the tombstone does not touch the secret it produced.
 	if _, err := repo.GetByPublicID(ctx, "us-old-done-public", time.Now()); err != nil {
 		t.Errorf("secret from purged session: %v", err)
+	}
+}
+
+func TestUploadSessionRepo_PurgeKeepsSessionsTheCallbackFailsFor(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	ctx := context.Background()
+	longAgo := time.Now().Add(-2 * time.Hour)
+	for _, id := range []string{"us-aborted-stuck", "us-aborted-ok"} {
+		if err := repo.CreateUploadSession(ctx, newTestUploadSession(id, id+"-public", time.Now().Add(time.Hour))); err != nil {
+			t.Fatalf("create %s: %v", id, err)
+		}
+		if err := repo.AbortUploadSession(ctx, id, longAgo); err != nil {
+			t.Fatalf("abort %s: %v", id, err)
+		}
+	}
+
+	batch, err := repo.PurgeFinishedUploadSessions(ctx, time.Now().Add(-time.Hour), testBatchSize, func(s *domain.UploadSession) error {
+		if s.SessionID == "us-aborted-stuck" {
+			return errors.New("storage rejected delete")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("purge finished: %v", err)
+	}
+
+	// The session whose object could not be removed stays, so the next cycle
+	// tries again instead of leaving the object to nobody.
+	if batch != (domain.CleanupBatch{Found: 2, Removed: 1}) {
+		t.Errorf("batch = %+v, want one of two purged", batch)
+	}
+	assertUploadSessionState(t, repo, "us-aborted-stuck", domain.UploadSessionStateAborted)
+	if _, _, err := repo.GetUploadSession(ctx, "us-aborted-ok"); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("us-aborted-ok: err = %v, want purged", err)
 	}
 }
 

@@ -16,7 +16,8 @@ const (
 	cycleTimeout = 10 * time.Minute
 	// finishedUploadRetention is how long a completed or aborted upload
 	// session's tombstone is kept, so a client retrying complete or abort
-	// still gets a consistent answer.
+	// still gets a consistent answer. Purging an aborted one removes its
+	// object first, in case the delete that followed the abort failed.
 	finishedUploadRetention = time.Hour
 	// endedTransferRetention keeps an ended transfer briefly, so the other
 	// side's next poll learns why it ended instead of finding nothing.
@@ -34,7 +35,7 @@ type Repo interface {
 	DeleteExpiredRetrievalSessions(ctx context.Context, now time.Time) (int64, error)
 	DeleteExpiredTombstones(ctx context.Context, now time.Time) (int64, error)
 	AbortExpiredUploadSessions(ctx context.Context, now time.Time, limit int, beforeAbort func(session *domain.UploadSession) error) (domain.CleanupBatch, error)
-	DeleteFinishedUploadSessions(ctx context.Context, finishedBefore time.Time) (int64, error)
+	PurgeFinishedUploadSessions(ctx context.Context, finishedBefore time.Time, limit int, beforePurge func(session *domain.UploadSession) error) (domain.CleanupBatch, error)
 	DeleteEndedTransfers(ctx context.Context, endedBefore time.Time) (int64, error)
 }
 
@@ -102,11 +103,25 @@ func (w *Worker) runCycle(ctx context.Context) {
 		w.metrics.CleanupErrors.Inc()
 	}
 
-	if count, err := w.secretRepo.DeleteFinishedUploadSessions(ctx, now.Add(-finishedUploadRetention)); err != nil {
+	purgeUpload := func(session *domain.UploadSession) error {
+		// A completed session's object belongs to its secret.
+		if session.State != domain.UploadSessionStateAborted {
+			return nil
+		}
+		// An aborted session's key can never belong to a secret, and every
+		// path that aborts one has already ended the multipart upload. What
+		// can be left is the object, if the delete after the abort failed.
+		return w.fileStore.Delete(ctx, session.StorageKey)
+	}
+	purged, err := drainBatches(ctx, func() (domain.CleanupBatch, error) {
+		return w.secretRepo.PurgeFinishedUploadSessions(ctx, now.Add(-finishedUploadRetention), batchSize, purgeUpload)
+	})
+	if purged > 0 {
+		slog.InfoContext(ctx, "cleanup: deleted finished upload sessions", "count", purged)
+	}
+	if err != nil {
 		slog.ErrorContext(ctx, "cleanup: finished upload session cleanup failed", "error", err)
 		w.metrics.CleanupErrors.Inc()
-	} else if count > 0 {
-		slog.InfoContext(ctx, "cleanup: deleted finished upload sessions", "count", count)
 	}
 
 	if count, err := w.secretRepo.DeleteEndedTransfers(ctx, now.Add(-endedTransferRetention)); err != nil {
@@ -124,7 +139,7 @@ func (w *Worker) runCycle(ctx context.Context) {
 	})
 	if deleted > 0 {
 		slog.InfoContext(ctx, "cleanup: deleted secrets", "count", deleted)
-		w.metrics.SecretsDeleted.WithLabelValues("cleanup").Add(float64(deleted))
+		w.metrics.SecretsCleaned.Add(float64(deleted))
 	}
 	if err != nil {
 		slog.ErrorContext(ctx, "cleanup: secret cleanup failed", "error", err)

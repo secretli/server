@@ -82,31 +82,6 @@ func (q *Queries) CreateSecret(ctx context.Context, arg CreateSecretParams) erro
 	return err
 }
 
-const deleteSecret = `-- name: DeleteSecret :one
-DELETE FROM secrets
-WHERE public_id = $1
-RETURNING public_id, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at, retrieved_at, storage_key
-`
-
-func (q *Queries) DeleteSecret(ctx context.Context, publicID string) (Secret, error) {
-	row := q.db.QueryRow(ctx, deleteSecret, publicID)
-	var i Secret
-	err := row.Scan(
-		&i.PublicID,
-		&i.MetadataTokenHash,
-		&i.BlobTokenHash,
-		&i.DeletionTokenHash,
-		&i.EncryptedMeta,
-		&i.BlobSize,
-		&i.BurnAfterRead,
-		&i.ExpiresAt,
-		&i.CreatedAt,
-		&i.RetrievedAt,
-		&i.StorageKey,
-	)
-	return i, err
-}
-
 const deleteSecretsByPublicIDs = `-- name: DeleteSecretsByPublicIDs :execrows
 DELETE FROM secrets
 WHERE public_id = ANY($1::text[])
@@ -118,6 +93,24 @@ func (q *Queries) DeleteSecretsByPublicIDs(ctx context.Context, publicIds []stri
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const expireSecret = `-- name: ExpireSecret :exec
+UPDATE secrets
+SET expires_at = $1
+WHERE public_id = $2
+`
+
+type ExpireSecretParams struct {
+	NowAt    pgtype.Timestamptz
+	PublicID string
+}
+
+// Ends a secret now: every read filters on expires_at, and the cleanup
+// removes its object and row as for any other expired secret.
+func (q *Queries) ExpireSecret(ctx context.Context, arg ExpireSecretParams) error {
+	_, err := q.db.Exec(ctx, expireSecret, arg.NowAt, arg.PublicID)
+	return err
 }
 
 const getSecretByPublicID = `-- name: GetSecretByPublicID :one

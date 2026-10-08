@@ -120,20 +120,6 @@ func (q *Queries) CreateUploadSession(ctx context.Context, arg CreateUploadSessi
 	return err
 }
 
-const deleteFinishedUploadSessions = `-- name: DeleteFinishedUploadSessions :execrows
-DELETE FROM upload_sessions
-WHERE state <> 'pending'
-  AND COALESCE(completed_at, aborted_at) < $1
-`
-
-func (q *Queries) DeleteFinishedUploadSessions(ctx context.Context, finishedBefore pgtype.Timestamptz) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteFinishedUploadSessions, finishedBefore)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
-}
-
 const deleteUploadPartsBySession = `-- name: DeleteUploadPartsBySession :exec
 DELETE FROM upload_parts
 WHERE session_id = $1
@@ -142,6 +128,19 @@ WHERE session_id = $1
 func (q *Queries) DeleteUploadPartsBySession(ctx context.Context, sessionID string) error {
 	_, err := q.db.Exec(ctx, deleteUploadPartsBySession, sessionID)
 	return err
+}
+
+const deleteUploadSessionsByIDs = `-- name: DeleteUploadSessionsByIDs :execrows
+DELETE FROM upload_sessions
+WHERE session_id = ANY($1::text[])
+`
+
+func (q *Queries) DeleteUploadSessionsByIDs(ctx context.Context, sessionIds []string) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteUploadSessionsByIDs, sessionIds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getUploadPartForUpdate = `-- name: GetUploadPartForUpdate :one
@@ -252,6 +251,61 @@ type ListExpiredUploadSessionsForUpdateParams struct {
 
 func (q *Queries) ListExpiredUploadSessionsForUpdate(ctx context.Context, arg ListExpiredUploadSessionsForUpdateParams) ([]UploadSession, error) {
 	rows, err := q.db.Query(ctx, listExpiredUploadSessionsForUpdate, arg.NowAt, arg.BatchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []UploadSession{}
+	for rows.Next() {
+		var i UploadSession
+		if err := rows.Scan(
+			&i.SessionID,
+			&i.PublicID,
+			&i.UploadTokenHash,
+			&i.MetadataTokenHash,
+			&i.BlobTokenHash,
+			&i.DeletionTokenHash,
+			&i.S3UploadID,
+			&i.BlobSize,
+			&i.EncryptedMeta,
+			&i.BurnAfterRead,
+			&i.SecretExpiresAt,
+			&i.UploadExpiresAt,
+			&i.State,
+			&i.CreatedAt,
+			&i.CompletedAt,
+			&i.AbortedAt,
+			&i.StorageKey,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listFinishedUploadSessionsForUpdate = `-- name: ListFinishedUploadSessionsForUpdate :many
+SELECT session_id, public_id, upload_token_hash, metadata_token_hash, blob_token_hash, deletion_token_hash, s3_upload_id, blob_size, encrypted_meta, burn_after_read, secret_expires_at, upload_expires_at, state, created_at, completed_at, aborted_at, storage_key
+FROM upload_sessions
+WHERE state <> 'pending'
+  AND COALESCE(completed_at, aborted_at) < $1
+ORDER BY COALESCE(completed_at, aborted_at)
+LIMIT $2
+FOR UPDATE SKIP LOCKED
+`
+
+type ListFinishedUploadSessionsForUpdateParams struct {
+	FinishedBefore pgtype.Timestamptz
+	BatchSize      int32
+}
+
+// Completed and aborted sessions due to be purged, oldest first, one batch
+// at a time. The condition matches idx_upload_sessions_finished.
+func (q *Queries) ListFinishedUploadSessionsForUpdate(ctx context.Context, arg ListFinishedUploadSessionsForUpdateParams) ([]UploadSession, error) {
+	rows, err := q.db.Query(ctx, listFinishedUploadSessionsForUpdate, arg.FinishedBefore, arg.BatchSize)
 	if err != nil {
 		return nil, err
 	}

@@ -15,7 +15,6 @@ import (
 
 	"github.com/labstack/echo/v4"
 
-	"github.com/secretli/server/internal/adapter/metrics"
 	"github.com/secretli/server/internal/domain"
 	"github.com/secretli/server/internal/platform/crypto"
 	apperrors "github.com/secretli/server/internal/platform/errors"
@@ -40,11 +39,10 @@ const (
 type SecretHandler struct {
 	repo      domain.SecretRepo
 	fileStore domain.FileStore
-	metrics   *metrics.SecretMetrics
 }
 
-func NewSecretHandler(repo domain.SecretRepo, fileStore domain.FileStore, m *metrics.SecretMetrics) *SecretHandler {
-	return &SecretHandler{repo: repo, fileStore: fileStore, metrics: m}
+func NewSecretHandler(repo domain.SecretRepo, fileStore domain.FileStore) *SecretHandler {
+	return &SecretHandler{repo: repo, fileStore: fileStore}
 }
 
 func (h *SecretHandler) StartRetrievalSession(c echo.Context) error {
@@ -207,17 +205,12 @@ func (h *SecretHandler) DeleteSecret(c echo.Context) error {
 		return apperrors.ForbiddenError("invalid deletion token")
 	}
 
-	if err := h.fileStore.Delete(ctx, secret.StorageKey); err != nil {
-		return apperrors.InternalError("failed to delete blob from S3", err)
-	}
-
-	// The row may already be gone if cleanup raced with this request; the
-	// object is deleted either way, so report success.
+	// Deleting ends the secret at once: from now on nothing reads it, and the
+	// cleanup removes its object and row as for any expired secret. If it
+	// expired since it was read above, it is over either way.
 	if err := h.repo.Delete(ctx, secret.PublicID, time.Now()); err != nil && !errors.Is(err, domain.ErrNotFound) {
 		return apperrors.InternalError("failed to delete secret", err)
 	}
-
-	h.metrics.SecretsDeleted.WithLabelValues("api").Inc()
 
 	return c.NoContent(http.StatusNoContent)
 }

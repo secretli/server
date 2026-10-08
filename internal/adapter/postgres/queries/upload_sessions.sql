@@ -109,10 +109,20 @@ RETURNING *;
 DELETE FROM upload_parts
 WHERE session_id = $1;
 
--- name: DeleteFinishedUploadSessions :execrows
-DELETE FROM upload_sessions
+-- name: ListFinishedUploadSessionsForUpdate :many
+-- Completed and aborted sessions due to be purged, oldest first, one batch
+-- at a time. The condition matches idx_upload_sessions_finished.
+SELECT *
+FROM upload_sessions
 WHERE state <> 'pending'
-  AND COALESCE(completed_at, aborted_at) < sqlc.arg(finished_before);
+  AND COALESCE(completed_at, aborted_at) < sqlc.arg(finished_before)
+ORDER BY COALESCE(completed_at, aborted_at)
+LIMIT sqlc.arg(batch_size)
+FOR UPDATE SKIP LOCKED;
+
+-- name: DeleteUploadSessionsByIDs :execrows
+DELETE FROM upload_sessions
+WHERE session_id = ANY(sqlc.arg(session_ids)::text[]);
 
 -- name: MarkUploadSessionsAborted :execrows
 UPDATE upload_sessions

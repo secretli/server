@@ -159,16 +159,27 @@ func (r *SecretRepo) Delete(ctx context.Context, publicID string, now time.Time)
 	defer func() { _ = tx.Rollback(ctx) }()
 	qtx := r.q.WithTx(tx)
 
-	row, err := qtx.DeleteSecret(ctx, publicID)
+	row, err := qtx.GetSecretByPublicIDForUpdate(ctx, dbsqlc.GetSecretByPublicIDForUpdateParams{
+		PublicID: publicID,
+		NowAt:    timestamptz(now),
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return domain.ErrNotFound
 	}
 	if err != nil {
-		return fmt.Errorf("delete secret: %w", err)
+		return fmt.Errorf("query secret for delete: %w", err)
 	}
-	// A consumed one-time secret keeps the tombstone of its opening.
+	// The tombstone is written from the row as it was, so it is kept as long
+	// as the secret would have lived. A consumed one-time secret keeps the
+	// tombstone of its opening.
 	if err := qtx.CreateTombstone(ctx, tombstoneParams(secretFromRow(row), domain.TombstoneDeleted, now, false)); err != nil {
 		return fmt.Errorf("record secret deleted: %w", err)
+	}
+	if err := qtx.ExpireSecret(ctx, dbsqlc.ExpireSecretParams{
+		NowAt:    timestamptz(now),
+		PublicID: publicID,
+	}); err != nil {
+		return fmt.Errorf("expire deleted secret: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit delete secret: %w", err)
@@ -476,12 +487,42 @@ func (r *SecretRepo) AbortExpiredUploadSessions(ctx context.Context, now time.Ti
 	return domain.CleanupBatch{Found: len(rows), Removed: int(aborted)}, nil
 }
 
-func (r *SecretRepo) DeleteFinishedUploadSessions(ctx context.Context, finishedBefore time.Time) (int64, error) {
-	n, err := r.q.DeleteFinishedUploadSessions(ctx, timestamptz(finishedBefore))
+func (r *SecretRepo) PurgeFinishedUploadSessions(ctx context.Context, finishedBefore time.Time, limit int, beforePurge func(session *domain.UploadSession) error) (domain.CleanupBatch, error) {
+	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("delete finished upload sessions: %w", err)
+		return domain.CleanupBatch{}, fmt.Errorf("begin finished upload session tx: %w", err)
 	}
-	return n, nil
+	defer func() { _ = tx.Rollback(ctx) }()
+	qtx := r.q.WithTx(tx)
+
+	rows, err := qtx.ListFinishedUploadSessionsForUpdate(ctx, dbsqlc.ListFinishedUploadSessionsForUpdateParams{
+		FinishedBefore: timestamptz(finishedBefore),
+		BatchSize:      int32(limit), //nolint:gosec // small constant chosen by the caller
+	})
+	if err != nil {
+		return domain.CleanupBatch{}, fmt.Errorf("select finished upload sessions: %w", err)
+	}
+
+	purgeable := make([]string, 0, len(rows))
+	for _, row := range rows {
+		session := uploadSessionFromRow(row)
+		if err := beforePurge(session); err != nil {
+			slog.ErrorContext(ctx, "cleanup: beforePurge failed, skipping", "session_id", session.SessionID, "error", err)
+			continue
+		}
+		purgeable = append(purgeable, session.SessionID)
+	}
+
+	var purged int64
+	if len(purgeable) > 0 {
+		if purged, err = qtx.DeleteUploadSessionsByIDs(ctx, purgeable); err != nil {
+			return domain.CleanupBatch{}, fmt.Errorf("delete finished upload sessions: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return domain.CleanupBatch{}, fmt.Errorf("commit finished upload sessions: %w", err)
+	}
+	return domain.CleanupBatch{Found: len(rows), Removed: int(purged)}, nil
 }
 
 func secretFromRow(row dbsqlc.Secret) *domain.Secret {

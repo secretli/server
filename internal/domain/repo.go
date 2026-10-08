@@ -23,6 +23,10 @@ type SecretRepo interface {
 	// count as a recipient getting it.
 	StartRetrievalSession(ctx context.Context, publicID, blobTokenHash, deletionTokenHash, sessionTokenHash string, expiresAt, now time.Time) (*Secret, error)
 	GetByRetrievalSession(ctx context.Context, publicID, sessionTokenHash string, now time.Time) (*Secret, error)
+	// Delete ends a live secret for the owner: it records the tombstone and
+	// moves the expiry to now, so nothing reads the secret any more. Its
+	// object and row are left to the cleanup, as for any expired secret.
+	// ErrNotFound means the secret is not live (any more).
 	Delete(ctx context.Context, publicID string, now time.Time) error
 	// DeleteExpired deletes one batch of at most limit secrets that are
 	// expired, or burn-after-read and consumed with no retrieval session left,
@@ -107,7 +111,10 @@ type UploadSessionCleanupRepo interface {
 	// delete the session's object, e.g. one left by a crash between storage
 	// completion and the database commit.
 	AbortExpiredUploadSessions(ctx context.Context, now time.Time, limit int, beforeAbort func(session *UploadSession) error) (CleanupBatch, error)
-	// DeleteFinishedUploadSessions purges completed and aborted session
-	// tombstones that finished before the given time.
-	DeleteFinishedUploadSessions(ctx context.Context, finishedBefore time.Time) (int64, error)
+	// PurgeFinishedUploadSessions deletes one batch of at most limit completed
+	// and aborted sessions that finished before the given time, oldest first.
+	// beforePurge runs for each row while it is locked; rows it fails for are
+	// kept. An aborted session's key can never belong to a secret, so the
+	// callback may delete whatever storage still holds under it.
+	PurgeFinishedUploadSessions(ctx context.Context, finishedBefore time.Time, limit int, beforePurge func(session *UploadSession) error) (CleanupBatch, error)
 }
