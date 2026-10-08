@@ -141,11 +141,11 @@ func assertEnded(t *testing.T, secret *domain.Secret, outcome domain.Outcome) {
 
 // objectRow is an object's row as the ledger holds it.
 type objectRow struct {
-	State       string
-	S3UploadID  *string
-	CreatedAt   time.Time
-	DoomedAt    *time.Time
-	AttemptedAt *time.Time
+	State          string
+	S3UploadID     *string
+	CreatedAt      time.Time
+	Doomed         bool
+	FailedRemovals int
 }
 
 // getObject reads an object's row, or nil if the ledger does not know it.
@@ -153,8 +153,8 @@ func getObject(t *testing.T, pool *pgxpool.Pool, storageKey string) *objectRow {
 	t.Helper()
 	var o objectRow
 	err := pool.QueryRow(context.Background(),
-		"SELECT state, s3_upload_id, created_at, doomed_at, attempted_at FROM objects WHERE storage_key = $1", storageKey,
-	).Scan(&o.State, &o.S3UploadID, &o.CreatedAt, &o.DoomedAt, &o.AttemptedAt)
+		"SELECT state, s3_upload_id, created_at, doomed, failed_removals FROM objects WHERE storage_key = $1", storageKey,
+	).Scan(&o.State, &o.S3UploadID, &o.CreatedAt, &o.Doomed, &o.FailedRemovals)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -173,18 +173,17 @@ func mustGetObject(t *testing.T, pool *pgxpool.Pool, storageKey string) *objectR
 	return o
 }
 
-func assertDoomed(t *testing.T, pool *pgxpool.Pool, storageKey string, at time.Time) {
+func assertDoomed(t *testing.T, pool *pgxpool.Pool, storageKey string) {
 	t.Helper()
-	o := mustGetObject(t, pool, storageKey)
-	if o.DoomedAt == nil || !o.DoomedAt.Equal(at) {
-		t.Errorf("object %s doomed at %v, want %v", storageKey, o.DoomedAt, at)
+	if o := mustGetObject(t, pool, storageKey); !o.Doomed {
+		t.Errorf("object %s is not doomed", storageKey)
 	}
 }
 
 func assertNotDoomed(t *testing.T, pool *pgxpool.Pool, storageKey string) {
 	t.Helper()
-	if o := mustGetObject(t, pool, storageKey); o.DoomedAt != nil {
-		t.Errorf("object %s doomed at %v, want it kept", storageKey, *o.DoomedAt)
+	if o := mustGetObject(t, pool, storageKey); o.Doomed {
+		t.Errorf("object %s is doomed, want it kept", storageKey)
 	}
 }
 
@@ -496,7 +495,7 @@ func TestSecretRepo_DeleteEndsTheSecretAndDoomsItsObject(t *testing.T) {
 	if !stored.Opened {
 		t.Error("deleting cleared the opened flag")
 	}
-	assertDoomed(t, pool, secret.StorageKey, deletedAt)
+	assertDoomed(t, pool, secret.StorageKey)
 
 	// A running download ends at once, and the secret is gone for everyone.
 	if _, err := download(repo, "doomed", "recipient", deletedAt); !errors.Is(err, domain.ErrForbidden) {

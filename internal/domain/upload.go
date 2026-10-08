@@ -40,5 +40,4 @@ type UploadPart struct {
 	Size       int64
 	SHA256     string
 	ETag       string
-	CreatedAt  time.Time
 }

@@ -214,7 +214,6 @@ func (h *UploadHandler) UploadPart(c echo.Context) error {
 		Size:       size,
 		SHA256:     partSHA256,
 		ETag:       etag,
-		CreatedAt:  time.Now(),
 	})
 	if errors.Is(err, domain.ErrConflict) {
 		return apperrors.ConflictError("part already uploaded with different content")

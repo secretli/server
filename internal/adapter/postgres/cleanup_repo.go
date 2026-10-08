@@ -88,10 +88,7 @@ func (r *SecretRepo) ReleaseDrainedSecrets(ctx context.Context, now time.Time, l
 		if err := qtx.ClearStorageKeys(ctx, publicIDs); err != nil {
 			return 0, fmt.Errorf("clear drained secrets' storage keys: %w", err)
 		}
-		if err := qtx.DoomObjects(ctx, dbsqlc.DoomObjectsParams{
-			NowAt:       timestamptz(now),
-			StorageKeys: storageKeys,
-		}); err != nil {
+		if err := qtx.DoomObjects(ctx, storageKeys); err != nil {
 			return 0, fmt.Errorf("doom drained secrets' objects: %w", err)
 		}
 	}
@@ -129,10 +126,7 @@ func (r *SecretRepo) DeleteExpiredSecrets(ctx context.Context, now time.Time, li
 				storageKeys = append(storageKeys, row.StorageKey.String)
 			}
 		}
-		if err := qtx.DoomObjects(ctx, dbsqlc.DoomObjectsParams{
-			NowAt:       timestamptz(now),
-			StorageKeys: storageKeys,
-		}); err != nil {
+		if err := qtx.DoomObjects(ctx, storageKeys); err != nil {
 			return 0, fmt.Errorf("doom expired secrets' objects: %w", err)
 		}
 		if deleted, err = qtx.DeleteSecretsByPublicIDs(ctx, publicIDs); err != nil {
@@ -145,13 +139,13 @@ func (r *SecretRepo) DeleteExpiredSecrets(ctx context.Context, now time.Time, li
 	return int(deleted), nil
 }
 
-// DeleteDoomedObjects removes one batch of at most limit doomed objects:
-// those not tried yet first, oldest first, then those whose removal failed,
-// the longest ago first. remove runs for each row while it is locked and must
-// delete the object from storage; rows it fails for are kept, marked as tried
-// at now, so they move behind the rest. Nothing but this sweep locks a doomed
-// object's row, so the storage calls hold up no request.
-func (r *SecretRepo) DeleteDoomedObjects(ctx context.Context, now time.Time, limit int, remove func(object *domain.Object) error) (domain.CleanupBatch, error) {
+// DeleteDoomedObjects removes one batch of at most limit doomed objects: the
+// fewest failed removals first, then the oldest. remove runs for each row
+// while it is locked and must delete the object from storage; rows it fails
+// for are kept with one more failed removal, so they sink behind the rest.
+// Nothing but this sweep locks a doomed object's row, so the storage calls
+// hold up no request.
+func (r *SecretRepo) DeleteDoomedObjects(ctx context.Context, limit int, remove func(object *domain.Object) error) (domain.CleanupBatch, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return domain.CleanupBatch{}, fmt.Errorf("begin doomed objects tx: %w", err)
@@ -179,11 +173,8 @@ func (r *SecretRepo) DeleteDoomedObjects(ctx context.Context, now time.Time, lim
 		removed = append(removed, object.StorageKey)
 	}
 	if len(failed) > 0 {
-		if err := qtx.MarkObjectsAttempted(ctx, dbsqlc.MarkObjectsAttemptedParams{
-			NowAt:       timestamptz(now),
-			StorageKeys: failed,
-		}); err != nil {
-			return domain.CleanupBatch{}, fmt.Errorf("mark objects attempted: %w", err)
+		if err := qtx.CountFailedRemovals(ctx, failed); err != nil {
+			return domain.CleanupBatch{}, fmt.Errorf("count failed removals: %w", err)
 		}
 	}
 
@@ -201,11 +192,11 @@ func (r *SecretRepo) DeleteDoomedObjects(ctx context.Context, now time.Time, lim
 
 func objectFromRow(row dbsqlc.Object) *domain.Object {
 	return &domain.Object{
-		StorageKey:  row.StorageKey,
-		State:       domain.ObjectState(row.State),
-		S3UploadID:  row.S3UploadID.String,
-		CreatedAt:   row.CreatedAt.Time,
-		DoomedAt:    pointerFromTimestamp(row.DoomedAt),
-		AttemptedAt: pointerFromTimestamp(row.AttemptedAt),
+		StorageKey:     row.StorageKey,
+		State:          domain.ObjectState(row.State),
+		S3UploadID:     row.S3UploadID.String,
+		CreatedAt:      row.CreatedAt.Time,
+		Doomed:         row.Doomed,
+		FailedRemovals: int(row.FailedRemovals),
 	}
 }

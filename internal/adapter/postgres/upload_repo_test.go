@@ -21,7 +21,6 @@ func newTestUploadPart(sessionID string, number int, offset, size int64) *domain
 		Size:       size,
 		SHA256:     "sha-" + sessionID,
 		ETag:       "etag-" + sessionID,
-		CreatedAt:  time.Now(),
 	}
 }
 
@@ -72,7 +71,7 @@ func TestUploadRepo_StartUploadFilesTheSecretTheUploadAndTheObject(t *testing.T)
 
 	// The object is known before anything is written under its key.
 	object := mustGetObject(t, pool, "blobs/up-start")
-	if object.State != string(domain.ObjectWriting) || object.S3UploadID != nil || object.DoomedAt != nil || !object.CreatedAt.Equal(now) {
+	if object.State != string(domain.ObjectWriting) || object.S3UploadID != nil || object.Doomed || !object.CreatedAt.Equal(now) {
 		t.Errorf("object = %+v, want writing since %v, without upload id, not doomed", object, now)
 	}
 
@@ -178,13 +177,12 @@ func TestUploadRepo_RecordUploadPart(t *testing.T) {
 
 	mustRecordPart(t, repo, newTestUploadPart("up-parts", 2, 512, 512))
 	first := newTestUploadPart("up-parts", 1, 0, 512)
-	first.CreatedAt = now
 	got, err := repo.RecordUploadPart(ctx, first)
 	if err != nil {
 		t.Fatalf("record part 1: %v", err)
 	}
 	if got.SessionID != "up-parts" || got.PartNumber != 1 || got.Offset != 0 || got.Size != 512 ||
-		got.SHA256 != "sha-up-parts" || got.ETag != "etag-up-parts" || !got.CreatedAt.Equal(now) {
+		got.SHA256 != "sha-up-parts" || got.ETag != "etag-up-parts" {
 		t.Errorf("recorded part = %+v, want part 1 as given", got)
 	}
 
@@ -203,7 +201,7 @@ func TestUploadRepo_RecordUploadPart(t *testing.T) {
 	for name, part := range map[string]*domain.UploadPart{
 		"offset": newTestUploadPart("up-parts", 1, 1, 512),
 		"size":   newTestUploadPart("up-parts", 1, 0, 511),
-		"sha":    {SessionID: "up-parts", PartNumber: 1, Offset: 0, Size: 512, SHA256: "other", ETag: "e", CreatedAt: now},
+		"sha":    {SessionID: "up-parts", PartNumber: 1, Offset: 0, Size: 512, SHA256: "other", ETag: "e"},
 	} {
 		if _, err := repo.RecordUploadPart(ctx, part); !errors.Is(err, domain.ErrConflict) {
 			t.Errorf("different %s: err = %v, want ErrConflict", name, err)
@@ -261,7 +259,7 @@ func TestUploadRepo_CompleteMakesTheSecretLive(t *testing.T) {
 	if secret.State != domain.SecretLive || secret.CreatedAt == nil || !secret.CreatedAt.Equal(completedAt) {
 		t.Errorf("secret state = %q, created at %v; want live since %v", secret.State, secret.CreatedAt, completedAt)
 	}
-	if object := mustGetObject(t, pool, "blobs/up-done"); object.State != string(domain.ObjectStored) || object.DoomedAt != nil {
+	if object := mustGetObject(t, pool, "blobs/up-done"); object.State != string(domain.ObjectStored) || object.Doomed {
 		t.Errorf("object = %+v, want stored", object)
 	}
 	stored, parts := mustGetUpload(t, repo, "up-done")
@@ -395,7 +393,7 @@ func TestUploadRepo_AbortAbandonsTheUploadAndFreesThePublicID(t *testing.T) {
 
 	// The secret never existed.
 	assertSecretGone(t, repo, "abort")
-	assertDoomed(t, pool, "blobs/up-abort", abortedAt)
+	assertDoomed(t, pool, "blobs/up-abort")
 	upload, _ := mustGetUpload(t, repo, "up-abort")
 	if upload.State != domain.UploadAbandoned || upload.FinishedAt == nil || !upload.FinishedAt.Equal(abortedAt) {
 		t.Errorf("upload state = %q, finished at %v; want abandoned at %v", upload.State, upload.FinishedAt, abortedAt)
@@ -417,7 +415,7 @@ func TestUploadRepo_AbortAbandonsTheUploadAndFreesThePublicID(t *testing.T) {
 	if got := mustGetSecret(t, repo, "abort"); got.StorageKey != "blobs/up-abort-again" {
 		t.Errorf("new secret's storage key = %q, want blobs/up-abort-again", got.StorageKey)
 	}
-	assertDoomed(t, pool, "blobs/up-abort", abortedAt)
+	assertDoomed(t, pool, "blobs/up-abort")
 	assertNotDoomed(t, pool, "blobs/up-abort-again")
 }
 

@@ -21,8 +21,8 @@ type Object struct {
 	// S3UploadID is the provider's multipart upload, once it is recorded.
 	S3UploadID string
 	CreatedAt  time.Time
-	// DoomedAt is set once nothing may read the object any more.
-	DoomedAt *time.Time
-	// AttemptedAt is when the cleanup last failed to remove it.
-	AttemptedAt *time.Time
+	// Doomed is set once nothing may read the object any more.
+	Doomed bool
+	// FailedRemovals counts how often the cleanup failed to remove it.
+	FailedRemovals int
 }

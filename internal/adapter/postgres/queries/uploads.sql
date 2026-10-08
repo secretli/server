@@ -99,11 +99,10 @@ INSERT INTO upload_parts (
     part_offset,
     part_size,
     part_sha256,
-    etag,
-    created_at
+    etag
 )
 VALUES (
-    $1, $2, $3, $4, $5, $6, $7
+    $1, $2, $3, $4, $5, $6
 )
 RETURNING *;
 

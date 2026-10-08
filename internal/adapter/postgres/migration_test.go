@@ -78,8 +78,8 @@ func TestMigration_AppliesRollsBackAndAppliesAgain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current version: %v", err)
 	}
-	if version != 2 {
-		t.Errorf("version = %d, want both migrations", version)
+	if version != 3 {
+		t.Errorf("version = %d, want every migration", version)
 	}
 	assertSchema(true, "migrating up")
 
