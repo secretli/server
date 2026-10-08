@@ -7,6 +7,8 @@ var (
 	ErrDuplicate = errors.New("duplicate")
 	ErrForbidden = errors.New("forbidden")
 	ErrConflict  = errors.New("conflict")
+	// ErrStorageFull means a new upload would take storage past its cap.
+	ErrStorageFull = errors.New("storage full")
 
 	// ErrInvalidParts is returned by a MultipartFileStore when the storage
 	// backend rejects the recorded parts on completion (stale ETag, wrong

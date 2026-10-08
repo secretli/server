@@ -21,10 +21,39 @@ import (
 type SecretRepo struct {
 	q    *dbsqlc.Queries
 	pool *pgxpool.Pool
+	// maxStoredBytes caps what all secrets together may take up in storage;
+	// 0 means no cap.
+	maxStoredBytes int64
 }
 
-func NewSecretRepo(pool *pgxpool.Pool) *SecretRepo {
-	return &SecretRepo{q: dbsqlc.New(pool), pool: pool}
+// Option configures a SecretRepo.
+type Option func(*SecretRepo)
+
+// WithMaxStoredBytes caps what all secrets together may take up in storage:
+// StartUpload refuses an upload that would go past it. 0 means no cap.
+func WithMaxStoredBytes(n int64) Option {
+	return func(r *SecretRepo) { r.maxStoredBytes = n }
+}
+
+func NewSecretRepo(pool *pgxpool.Pool, opts ...Option) *SecretRepo {
+	r := &SecretRepo{q: dbsqlc.New(pool), pool: pool}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
+}
+
+// StorageStats returns the totals the metrics report.
+func (r *SecretRepo) StorageStats(ctx context.Context, now time.Time) (domain.StorageStats, error) {
+	row, err := r.q.StorageStats(ctx, timestamptz(now))
+	if err != nil {
+		return domain.StorageStats{}, fmt.Errorf("query storage stats: %w", err)
+	}
+	return domain.StorageStats{
+		LiveSecrets:   row.LiveSecrets,
+		StoredBytes:   row.StoredBytes,
+		DoomedObjects: row.DoomedObjects,
+	}, nil
 }
 
 func (r *SecretRepo) GetSecret(ctx context.Context, publicID string) (*domain.Secret, error) {

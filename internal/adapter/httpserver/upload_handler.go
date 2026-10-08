@@ -33,6 +33,10 @@ const (
 	maxMultipartUploadPart  = multipartUploadPartSize + 1024*1024
 	s3MinimumPartSize       = 5 * 1024 * 1024
 	maxMultipartPartNumber  = 10000
+
+	// storageFullRetryAfter is the Retry-After, in seconds, when storage is
+	// at its cap.
+	storageFullRetryAfter = "600"
 )
 
 type UploadHandler struct {
@@ -125,6 +129,12 @@ func (h *UploadHandler) CreateUploadSession(c echo.Context) error {
 	if err := h.repo.StartUpload(ctx, secret, upload, now); err != nil {
 		if errors.Is(err, domain.ErrDuplicate) {
 			return apperrors.ConflictError("secret with this public_id already exists")
+		}
+		if errors.Is(err, domain.ErrStorageFull) {
+			// Room comes back as secrets expire; clients cap how long they
+			// wait before retrying.
+			c.Response().Header().Set("Retry-After", storageFullRetryAfter)
+			return apperrors.UnavailableError("the server has no room for more secrets right now; try again later")
 		}
 		return apperrors.InternalError("failed to create upload session", err)
 	}

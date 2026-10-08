@@ -20,10 +20,14 @@ type S3Config struct {
 }
 
 type Config struct {
-	Port            string        `env:"SERVER_PORT" default:"8080"`
-	DatabaseURL     string        `env:"DATABASE_URL,required"`
-	S3              S3Config      `env:"S3"`
-	MaxFileSize     int64         `env:"MAX_FILE_SIZE" default:"1073741824"`
+	Port        string   `env:"SERVER_PORT" default:"8080"`
+	DatabaseURL string   `env:"DATABASE_URL,required"`
+	S3          S3Config `env:"S3"`
+	MaxFileSize int64    `env:"MAX_FILE_SIZE" default:"1073741824"`
+	// MaxStoredBytes caps what all secrets together may take up in storage,
+	// so that anonymous uploads cannot fill the bucket (and its bill). A new
+	// upload past it is refused for now. 0 means no cap.
+	MaxStoredBytes  int64         `env:"MAX_STORED_BYTES" default:"0"`
 	CleanupInterval time.Duration `env:"CLEANUP_INTERVAL" default:"1m"`
 	AllowedOrigins  string        `env:"ALLOWED_ORIGINS"`
 	MetricsToken    string        `env:"METRICS_TOKEN"`

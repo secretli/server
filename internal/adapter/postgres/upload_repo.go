@@ -20,6 +20,19 @@ func (r *SecretRepo) StartUpload(ctx context.Context, secret *domain.Secret, upl
 	defer func() { _ = tx.Rollback(ctx) }()
 	qtx := r.q.WithTx(tx)
 
+	if r.maxStoredBytes > 0 {
+		if err := qtx.LockUploadStarts(ctx); err != nil {
+			return fmt.Errorf("lock upload starts: %w", err)
+		}
+		stored, err := qtx.StoredBytes(ctx)
+		if err != nil {
+			return fmt.Errorf("query stored bytes: %w", err)
+		}
+		if stored+secret.BlobSize > r.maxStoredBytes {
+			return domain.ErrStorageFull
+		}
+	}
+
 	// The object is known before anything is written under its key.
 	if err := qtx.CreateObject(ctx, dbsqlc.CreateObjectParams{
 		StorageKey: secret.StorageKey,

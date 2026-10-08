@@ -62,6 +62,7 @@ Environment variables; see [`.env.example`](.env.example).
 | `S3_ACCESS_KEY` / `S3_SECRET_KEY` | S3 credentials | — |
 | `S3_REGION` | region for request signing | `us-east-1` |
 | `MAX_FILE_SIZE` | encrypted upload limit in bytes | `1073741824` (1 GiB) |
+| `MAX_STORED_BYTES` | cap on what all secrets together may take up in storage; a new upload past it gets 503 with `Retry-After` (0: no cap) | `0` |
 | `CLEANUP_INTERVAL` | how often the cleanup runs | `1m` |
 | `ALLOWED_ORIGINS` | CORS origins, only needed when the web app is served from another origin | — |
 | `METRICS_TOKEN` | bearer token required for `/metrics` | — |

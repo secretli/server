@@ -14,6 +14,15 @@ type CleanupBatch struct {
 	Removed int
 }
 
+// StorageStats are totals over all secrets, for the metrics: how many can be
+// opened, what storage holds for them, and how many objects wait for the
+// cleanup. No secret is told apart.
+type StorageStats struct {
+	LiveSecrets   int64
+	StoredBytes   int64
+	DoomedObjects int64
+}
+
 type SecretRepo interface {
 	// GetSecret returns the secret filed under publicID in whatever state, or
 	// ErrNotFound.
@@ -38,7 +47,8 @@ type UploadRepo interface {
 	// StartUpload files the secret as uploading, the upload that creates it
 	// and the object it is written to, in one transaction, before anything
 	// reaches storage. It returns ErrDuplicate if the public id is taken,
-	// whatever state that secret is in.
+	// whatever state that secret is in, and ErrStorageFull if storage is
+	// capped and the secret would take it past the cap.
 	StartUpload(ctx context.Context, secret *Secret, upload *Upload, now time.Time) error
 	// RecordS3UploadID notes the provider's multipart upload for an object
 	// that is being written.

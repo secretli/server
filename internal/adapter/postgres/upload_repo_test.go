@@ -134,6 +134,51 @@ func TestUploadRepo_StartUploadRefusesATakenPublicID(t *testing.T) {
 	}
 }
 
+func TestUploadRepo_StartUploadRefusesPastTheStorageCap(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool, pgadapter.WithMaxStoredBytes(1000))
+	ctx := context.Background()
+	now := moment(time.Now())
+	sized := func(id string, size int64) *domain.Secret {
+		s := newTestSecret(id, now.Add(time.Hour))
+		s.BlobSize = size
+		return s
+	}
+
+	mustStartUpload(t, repo, "up-first", sized("first", 600), now.Add(time.Hour), now)
+
+	// 600 + 500 would pass the cap: refused, and nothing is filed for it.
+	tooBig := sized("too-big", 500)
+	if err := repo.StartUpload(ctx, tooBig, newTestUpload("up-too-big", tooBig, now.Add(time.Hour)), now); !errors.Is(err, domain.ErrStorageFull) {
+		t.Fatalf("start past the cap: err = %v, want ErrStorageFull", err)
+	}
+	if getObject(t, pool, "blobs/up-too-big") != nil {
+		t.Error("an object was filed for the refused upload")
+	}
+	if _, err := repo.GetSecret(ctx, "too-big"); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("secret of the refused upload: err = %v, want ErrNotFound", err)
+	}
+
+	// Up to the cap exactly is fine.
+	mustStartUpload(t, repo, "up-exact", sized("exact", 400), now.Add(time.Hour), now)
+
+	// Bytes come free once an object is doomed: abandoning the first upload
+	// makes room again.
+	if err := repo.AbortUpload(ctx, "up-first", now); err != nil {
+		t.Fatalf("abort: %v", err)
+	}
+	mustStartUpload(t, repo, "up-later", sized("later", 500), now.Add(time.Hour), now)
+}
+
+func TestUploadRepo_StartUploadWithoutACapTakesAnySize(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	now := moment(time.Now())
+	big := newTestSecret("big", now.Add(time.Hour))
+	big.BlobSize = 1 << 40
+	mustStartUpload(t, repo, "up-big", big, now.Add(time.Hour), now)
+}
+
 func TestUploadRepo_RecordS3UploadIDWhileTheObjectIsWritten(t *testing.T) {
 	pool := setupTestDB(t)
 	repo := pgadapter.NewSecretRepo(pool)

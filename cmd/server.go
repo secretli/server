@@ -19,6 +19,7 @@ import (
 	"github.com/secretli/server/internal/adapter/postgres"
 	"github.com/secretli/server/internal/adapter/s3"
 	"github.com/secretli/server/internal/cleanup"
+	"github.com/secretli/server/internal/domain"
 	"github.com/secretli/server/internal/platform/config"
 	"github.com/secretli/server/internal/platform/correlation"
 )
@@ -46,7 +47,7 @@ func Run() error {
 	}
 	defer pool.Close()
 
-	secretRepo := postgres.NewSecretRepo(pool)
+	secretRepo := postgres.NewSecretRepo(pool, postgres.WithMaxStoredBytes(cfg.MaxStoredBytes))
 
 	fileStore, err := s3.NewClient(cfg.S3)
 	if err != nil {
@@ -57,6 +58,9 @@ func Run() error {
 	transferEvents := postgres.NewTransferEvents(pool)
 
 	reg := metrics.NewRegistry()
+	reg.MustRegister(metrics.NewStorageCollector(func(ctx context.Context) (domain.StorageStats, error) {
+		return secretRepo.StorageStats(ctx, time.Now())
+	}, cfg.MaxStoredBytes))
 	app, err := httpserver.New(cfg, Version, pool, secretRepo, fileStore, transferEvents, reg)
 	if err != nil {
 		return fmt.Errorf("create HTTP server: %w", err)

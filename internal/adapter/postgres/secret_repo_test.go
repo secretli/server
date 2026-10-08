@@ -196,6 +196,36 @@ func countRows(t *testing.T, pool *pgxpool.Pool, query string, args ...any) int 
 	return n
 }
 
+func TestSecretRepo_StorageStatsCountTotalsOnly(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	ctx := context.Background()
+	now := moment(time.Now())
+
+	live := newTestSecret("live", now.Add(time.Hour))
+	live.BlobSize = 100
+	mustCreate(t, repo, live)
+	uploading := newTestSecret("uploading", now.Add(time.Hour))
+	uploading.BlobSize = 50
+	mustStartUpload(t, repo, "up-uploading", uploading, now.Add(time.Hour), now)
+	deleted := newTestSecret("deleted", now.Add(time.Hour))
+	deleted.BlobSize = 1000
+	mustCreate(t, repo, deleted)
+	if err := repo.Delete(ctx, "deleted", now); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	// One secret can be opened; storage holds it and the upload under way;
+	// the deleted secret's object waits for the cleanup and no longer counts.
+	stats, err := repo.StorageStats(ctx, now)
+	if err != nil {
+		t.Fatalf("storage stats: %v", err)
+	}
+	if want := (domain.StorageStats{LiveSecrets: 1, StoredBytes: 150, DoomedObjects: 1}); stats != want {
+		t.Errorf("stats = %+v, want %+v", stats, want)
+	}
+}
+
 func TestSecretRepo_GetSecretReturnsASecretInAnyState(t *testing.T) {
 	pool := setupTestDB(t)
 	repo := pgadapter.NewSecretRepo(pool)
