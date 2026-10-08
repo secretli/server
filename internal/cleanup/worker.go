@@ -16,8 +16,9 @@ const (
 	cycleTimeout = 10 * time.Minute
 	// finishedUploadRetention is how long a completed or abandoned upload is
 	// kept, so a client retrying complete or abort still gets a consistent
-	// answer.
-	finishedUploadRetention = time.Hour
+	// answer. Clients retry within seconds, so a few minutes do; anything
+	// longer only keeps the upload's traces around.
+	finishedUploadRetention = 10 * time.Minute
 	// endedTransferRetention keeps an ended transfer briefly, so the other
 	// side's next poll learns why it ended instead of finding nothing.
 	endedTransferRetention = time.Minute
