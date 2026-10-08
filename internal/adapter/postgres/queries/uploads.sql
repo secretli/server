@@ -73,7 +73,7 @@ LIMIT sqlc.arg(batch_size)
 FOR UPDATE SKIP LOCKED;
 
 -- name: DeleteFinishedUploads :execrows
--- Finished uploads are kept for an hour so a repeated complete or abort
+-- Finished uploads are kept a few minutes so a repeated complete or abort
 -- gets the same answer; their parts go with them.
 DELETE FROM uploads
 WHERE state <> 'uploading'

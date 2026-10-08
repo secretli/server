@@ -92,7 +92,7 @@ WHERE state <> 'uploading'
   AND finished_at < $1
 `
 
-// Finished uploads are kept for an hour so a repeated complete or abort
+// Finished uploads are kept a few minutes so a repeated complete or abort
 // gets the same answer; their parts go with them.
 func (q *Queries) DeleteFinishedUploads(ctx context.Context, finishedBefore pgtype.Timestamptz) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteFinishedUploads, finishedBefore)
