@@ -55,10 +55,12 @@ SET retrieved_at = sqlc.arg(now_at)
 WHERE public_id = sqlc.arg(public_id)
   AND retrieved_at IS NULL;
 
--- name: DeleteSecret :one
-DELETE FROM secrets
-WHERE public_id = $1
-RETURNING *;
+-- name: ExpireSecret :exec
+-- Ends a secret now: every read filters on expires_at, and the cleanup
+-- removes its object and row as for any other expired secret.
+UPDATE secrets
+SET expires_at = sqlc.arg(now_at)
+WHERE public_id = sqlc.arg(public_id);
 
 -- name: SelectSecretsForCleanup :many
 -- Expired secrets and consumed burn-after-read secrets whose retrieval

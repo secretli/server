@@ -11,7 +11,7 @@ The server cannot read what it stores. Keys are derived and used only by the cli
 - **Owner status:** after a secret is gone, its tombstone keeps for a week whether it was opened and when, expired, or was deleted, for whoever holds its link.
 - **Deletion:** the owner link's deletion token removes a secret at once.
 - **Short-code hand-off:** a relay through which two devices pass a link after a password-authenticated key exchange. The server only sees public key-exchange shares and ciphertext.
-- **Cleanup:** a worker removes expired and consumed secrets every minute.
+- **Cleanup:** a worker removes expired, consumed and deleted secrets every minute.
 
 ### Endpoints
 

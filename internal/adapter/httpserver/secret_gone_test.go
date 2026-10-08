@@ -92,7 +92,7 @@ func deleteSecretAs(t *testing.T, h *SecretHandler, publicID, metadataToken, del
 func TestSecretMetadata_OpenedOneTimeSecretTellsWhenItWasOpened(t *testing.T) {
 	repo := newMockRepo()
 	fs := newMockFileStore()
-	h := NewSecretHandler(repo, fs, testMetrics())
+	h := NewSecretHandler(repo, fs)
 	publicID := testPublicID("gone opened")
 	token := testToken("gone opened token")
 	seedSecret(repo, fs, publicID, token, testToken("gone opened deletion"), true)
@@ -111,7 +111,7 @@ func TestSecretMetadata_OpenedOneTimeSecretTellsWhenItWasOpened(t *testing.T) {
 func TestSecretMetadata_OwnerOpeningTheirOneTimeSecretIsToldApart(t *testing.T) {
 	repo := newMockRepo()
 	fs := newMockFileStore()
-	h := NewSecretHandler(repo, fs, testMetrics())
+	h := NewSecretHandler(repo, fs)
 	publicID := testPublicID("gone owner opened")
 	token := testToken("gone owner opened token")
 	deletionToken := testToken("gone owner opened deletion")
@@ -133,7 +133,7 @@ func TestSecretMetadata_OwnerOpeningTheirOneTimeSecretIsToldApart(t *testing.T) 
 func TestSecretMetadata_DeletedSecretTellsWhenItWasDeleted(t *testing.T) {
 	repo := newMockRepo()
 	fs := newMockFileStore()
-	h := NewSecretHandler(repo, fs, testMetrics())
+	h := NewSecretHandler(repo, fs)
 	publicID := testPublicID("gone deleted")
 	token := testToken("gone deleted token")
 	deletionToken := testToken("gone deleted deletion")
@@ -155,7 +155,7 @@ func TestSecretMetadata_DeletedSecretTellsWhenItWasDeleted(t *testing.T) {
 func TestSecretMetadata_WhatBecameOfASecretNeedsItsLink(t *testing.T) {
 	repo := newMockRepo()
 	fs := newMockFileStore()
-	h := NewSecretHandler(repo, fs, testMetrics())
+	h := NewSecretHandler(repo, fs)
 	publicID := testPublicID("gone guarded")
 	token := testToken("gone guarded token")
 	seedSecret(repo, fs, publicID, token, testToken("gone guarded deletion"), true)
@@ -175,7 +175,7 @@ func TestSecretMetadata_WhatBecameOfASecretNeedsItsLink(t *testing.T) {
 func TestSecretMetadata_ExpiredSecretAwaitingCleanupIsGoneAsExpired(t *testing.T) {
 	repo := newMockRepo()
 	fs := newMockFileStore()
-	h := NewSecretHandler(repo, fs, testMetrics())
+	h := NewSecretHandler(repo, fs)
 	publicID := testPublicID("gone expired")
 	token := testToken("gone expired token")
 	seedSecret(repo, fs, publicID, token, testToken("gone expired deletion"), true)
@@ -195,7 +195,7 @@ func TestSecretMetadata_ExpiredSecretAwaitingCleanupIsGoneAsExpired(t *testing.T
 func TestSecretMetadata_ReusableSecretTellsWhenARecipientFirstOpenedIt(t *testing.T) {
 	repo := newMockRepo()
 	fs := newMockFileStore()
-	h := NewSecretHandler(repo, fs, testMetrics())
+	h := NewSecretHandler(repo, fs)
 	publicID := testPublicID("reusable opened")
 	token := testToken("reusable opened token")
 	deletionToken := testToken("reusable opened deletion")
@@ -222,7 +222,7 @@ func TestSecretMetadata_ReusableSecretTellsWhenARecipientFirstOpenedIt(t *testin
 func TestStartRetrievalSession_MalformedDeletionTokenIsRejected(t *testing.T) {
 	repo := newMockRepo()
 	fs := newMockFileStore()
-	h := NewSecretHandler(repo, fs, testMetrics())
+	h := NewSecretHandler(repo, fs)
 	publicID := testPublicID("malformed deletion")
 	token := testToken("malformed deletion token")
 	seedSecret(repo, fs, publicID, token, testToken("malformed deletion deletion"), false)
