@@ -109,3 +109,22 @@ FOR UPDATE SKIP LOCKED;
 -- name: DeleteSecretsByPublicIDs :execrows
 DELETE FROM secrets
 WHERE public_id = ANY(sqlc.arg(public_ids)::text[]);
+
+-- name: LockUploadStarts :exec
+-- Serializes upload starts while storage is capped, so that two cannot both
+-- squeeze under the cap with room for one.
+SELECT pg_advisory_xact_lock(7302102);
+
+-- name: StoredBytes :one
+-- What the secrets that hold an object take up in storage, uploads under way
+-- included. Doomed objects are left out: they are gone within a minute.
+SELECT COALESCE(SUM(blob_size), 0)::bigint AS stored_bytes
+FROM secrets
+WHERE storage_key IS NOT NULL;
+
+-- name: StorageStats :one
+-- Totals for the metrics: no secret is told apart.
+SELECT
+    (SELECT count(*) FROM secrets AS l WHERE l.state = 'live' AND l.expires_at > sqlc.arg(now_at))::bigint AS live_secrets,
+    (SELECT COALESCE(SUM(h.blob_size), 0) FROM secrets AS h WHERE h.storage_key IS NOT NULL)::bigint AS stored_bytes,
+    (SELECT count(*) FROM objects AS o WHERE o.doomed)::bigint AS doomed_objects;

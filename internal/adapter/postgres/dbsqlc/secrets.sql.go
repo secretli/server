@@ -297,6 +297,17 @@ func (q *Queries) ListExpiredSecretsForUpdate(ctx context.Context, arg ListExpir
 	return items, nil
 }
 
+const lockUploadStarts = `-- name: LockUploadStarts :exec
+SELECT pg_advisory_xact_lock(7302102)
+`
+
+// Serializes upload starts while storage is capped, so that two cannot both
+// squeeze under the cap with room for one.
+func (q *Queries) LockUploadStarts(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, lockUploadStarts)
+	return err
+}
+
 const makeSecretLive = `-- name: MakeSecretLive :execrows
 UPDATE secrets
 SET state = 'live',
@@ -328,4 +339,40 @@ WHERE public_id = $1
 func (q *Queries) MarkSecretOpened(ctx context.Context, publicID string) error {
 	_, err := q.db.Exec(ctx, markSecretOpened, publicID)
 	return err
+}
+
+const storageStats = `-- name: StorageStats :one
+SELECT
+    (SELECT count(*) FROM secrets AS l WHERE l.state = 'live' AND l.expires_at > $1)::bigint AS live_secrets,
+    (SELECT COALESCE(SUM(h.blob_size), 0) FROM secrets AS h WHERE h.storage_key IS NOT NULL)::bigint AS stored_bytes,
+    (SELECT count(*) FROM objects AS o WHERE o.doomed)::bigint AS doomed_objects
+`
+
+type StorageStatsRow struct {
+	LiveSecrets   int64
+	StoredBytes   int64
+	DoomedObjects int64
+}
+
+// Totals for the metrics: no secret is told apart.
+func (q *Queries) StorageStats(ctx context.Context, nowAt pgtype.Timestamptz) (StorageStatsRow, error) {
+	row := q.db.QueryRow(ctx, storageStats, nowAt)
+	var i StorageStatsRow
+	err := row.Scan(&i.LiveSecrets, &i.StoredBytes, &i.DoomedObjects)
+	return i, err
+}
+
+const storedBytes = `-- name: StoredBytes :one
+SELECT COALESCE(SUM(blob_size), 0)::bigint AS stored_bytes
+FROM secrets
+WHERE storage_key IS NOT NULL
+`
+
+// What the secrets that hold an object take up in storage, uploads under way
+// included. Doomed objects are left out: they are gone within a minute.
+func (q *Queries) StoredBytes(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, storedBytes)
+	var stored_bytes int64
+	err := row.Scan(&stored_bytes)
+	return stored_bytes, err
 }

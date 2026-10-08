@@ -33,6 +33,7 @@ type uploadMockRepo struct {
 	objects map[string]*domain.Object
 
 	recordS3Err error
+	startErr    error
 	// completeErr fails the database step of CompleteUpload, after finalize.
 	completeErr error
 	abortCalls  int
@@ -51,6 +52,9 @@ func (m *uploadMockRepo) StartUpload(_ context.Context, secret *domain.Secret, u
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	if m.startErr != nil {
+		return m.startErr
+	}
 	if _, taken := m.secrets[secret.PublicID]; taken {
 		return domain.ErrDuplicate
 	}
@@ -430,6 +434,30 @@ func TestUploadSession_CreateRefusesATakenPublicIDBeforeStorage(t *testing.T) {
 				t.Error("the existing secret must be left alone and no upload filed")
 			}
 		})
+	}
+}
+
+func TestUploadSession_CreateRefusesPastTheStorageCapBeforeStorage(t *testing.T) {
+	repo := newUploadMockRepo()
+	repo.startErr = domain.ErrStorageFull
+	store := newUploadMockStore()
+	h := NewUploadHandler(repo, store, 100*1024*1024, testMetrics())
+
+	rec := callCreate(t, h, createUploadBody("storage-full"))
+
+	// Unavailable for now, not a failure of the request: both clients retry a
+	// 503, waiting as long as Retry-After says (up to their own limit).
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != storageFullRetryAfter {
+		t.Errorf("Retry-After = %q, want %q", got, storageFullRetryAfter)
+	}
+	if len(store.calls) != 0 {
+		t.Errorf("storage calls = %v, want none when storage is full", store.calls)
+	}
+	if len(repo.uploads) != 0 || len(repo.objects) != 0 {
+		t.Error("nothing may be filed when storage is full")
 	}
 }
 
