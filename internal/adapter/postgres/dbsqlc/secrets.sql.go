@@ -11,64 +11,53 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const claimBurnAfterRead = `-- name: ClaimBurnAfterRead :execrows
+const clearStorageKeys = `-- name: ClearStorageKeys :exec
 UPDATE secrets
-SET retrieved_at = $1
-WHERE public_id = $2
-  AND blob_token_hash = $3
-  AND burn_after_read = true
-  AND retrieved_at IS NULL
-  AND expires_at > $1
+SET storage_key = NULL
+WHERE public_id = ANY($1::text[])
 `
 
-type ClaimBurnAfterReadParams struct {
-	NowAt         pgtype.Timestamptz
-	PublicID      string
-	BlobTokenHash string
-}
-
-func (q *Queries) ClaimBurnAfterRead(ctx context.Context, arg ClaimBurnAfterReadParams) (int64, error) {
-	result, err := q.db.Exec(ctx, claimBurnAfterRead, arg.NowAt, arg.PublicID, arg.BlobTokenHash)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+func (q *Queries) ClearStorageKeys(ctx context.Context, publicIds []string) error {
+	_, err := q.db.Exec(ctx, clearStorageKeys, publicIds)
+	return err
 }
 
 const createSecret = `-- name: CreateSecret :exec
 INSERT INTO secrets (
     public_id,
+    state,
+    storage_key,
     metadata_token_hash,
     blob_token_hash,
     deletion_token_hash,
     encrypted_meta,
     blob_size,
     burn_after_read,
-    expires_at,
-    created_at,
-    storage_key
+    expires_at
 )
 VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+    $1, 'uploading', $2, $3, $4, $5, $6, $7, $8, $9
 )
 `
 
 type CreateSecretParams struct {
 	PublicID          string
+	StorageKey        pgtype.Text
 	MetadataTokenHash string
-	BlobTokenHash     string
-	DeletionTokenHash string
-	EncryptedMeta     string
+	BlobTokenHash     pgtype.Text
+	DeletionTokenHash pgtype.Text
+	EncryptedMeta     pgtype.Text
 	BlobSize          int64
 	BurnAfterRead     bool
 	ExpiresAt         pgtype.Timestamptz
-	CreatedAt         pgtype.Timestamptz
-	StorageKey        string
 }
 
+// A secret is filed when its upload starts, so its public id is taken from
+// then on.
 func (q *Queries) CreateSecret(ctx context.Context, arg CreateSecretParams) error {
 	_, err := q.db.Exec(ctx, createSecret,
 		arg.PublicID,
+		arg.StorageKey,
 		arg.MetadataTokenHash,
 		arg.BlobTokenHash,
 		arg.DeletionTokenHash,
@@ -76,8 +65,6 @@ func (q *Queries) CreateSecret(ctx context.Context, arg CreateSecretParams) erro
 		arg.BlobSize,
 		arg.BurnAfterRead,
 		arg.ExpiresAt,
-		arg.CreatedAt,
-		arg.StorageKey,
 	)
 	return err
 }
@@ -95,153 +82,168 @@ func (q *Queries) DeleteSecretsByPublicIDs(ctx context.Context, publicIds []stri
 	return result.RowsAffected(), nil
 }
 
-const expireSecret = `-- name: ExpireSecret :exec
-UPDATE secrets
-SET expires_at = $1
-WHERE public_id = $2
+const deleteUploadingSecrets = `-- name: DeleteUploadingSecrets :many
+DELETE FROM secrets
+WHERE public_id = ANY($1::text[])
+  AND state = 'uploading'
+RETURNING storage_key
 `
 
-type ExpireSecretParams struct {
-	NowAt    pgtype.Timestamptz
-	PublicID string
-}
-
-// Ends a secret now: every read filters on expires_at, and the cleanup
-// removes its object and row as for any other expired secret.
-func (q *Queries) ExpireSecret(ctx context.Context, arg ExpireSecretParams) error {
-	_, err := q.db.Exec(ctx, expireSecret, arg.NowAt, arg.PublicID)
-	return err
-}
-
-const getSecretByPublicID = `-- name: GetSecretByPublicID :one
-SELECT
-    public_id,
-    metadata_token_hash,
-    blob_token_hash,
-    deletion_token_hash,
-    encrypted_meta,
-    blob_size,
-    burn_after_read,
-    expires_at,
-    created_at,
-    retrieved_at,
-    storage_key
-FROM secrets
-WHERE public_id = $1
-  AND expires_at > $2
-`
-
-type GetSecretByPublicIDParams struct {
-	PublicID string
-	NowAt    pgtype.Timestamptz
-}
-
-func (q *Queries) GetSecretByPublicID(ctx context.Context, arg GetSecretByPublicIDParams) (Secret, error) {
-	row := q.db.QueryRow(ctx, getSecretByPublicID, arg.PublicID, arg.NowAt)
-	var i Secret
-	err := row.Scan(
-		&i.PublicID,
-		&i.MetadataTokenHash,
-		&i.BlobTokenHash,
-		&i.DeletionTokenHash,
-		&i.EncryptedMeta,
-		&i.BlobSize,
-		&i.BurnAfterRead,
-		&i.ExpiresAt,
-		&i.CreatedAt,
-		&i.RetrievedAt,
-		&i.StorageKey,
-	)
-	return i, err
-}
-
-const getSecretIgnoringExpiry = `-- name: GetSecretIgnoringExpiry :one
-SELECT public_id, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at, retrieved_at, storage_key
-FROM secrets
-WHERE public_id = $1
-`
-
-// The row whatever its state, to tell what became of an expired secret the
-// cleanup has not reached yet.
-func (q *Queries) GetSecretIgnoringExpiry(ctx context.Context, publicID string) (Secret, error) {
-	row := q.db.QueryRow(ctx, getSecretIgnoringExpiry, publicID)
-	var i Secret
-	err := row.Scan(
-		&i.PublicID,
-		&i.MetadataTokenHash,
-		&i.BlobTokenHash,
-		&i.DeletionTokenHash,
-		&i.EncryptedMeta,
-		&i.BlobSize,
-		&i.BurnAfterRead,
-		&i.ExpiresAt,
-		&i.CreatedAt,
-		&i.RetrievedAt,
-		&i.StorageKey,
-	)
-	return i, err
-}
-
-const markSecretOpened = `-- name: MarkSecretOpened :exec
-UPDATE secrets
-SET retrieved_at = $1
-WHERE public_id = $2
-  AND retrieved_at IS NULL
-`
-
-type MarkSecretOpenedParams struct {
-	NowAt    pgtype.Timestamptz
-	PublicID string
-}
-
-// The first time a recipient opens a reusable secret.
-func (q *Queries) MarkSecretOpened(ctx context.Context, arg MarkSecretOpenedParams) error {
-	_, err := q.db.Exec(ctx, markSecretOpened, arg.NowAt, arg.PublicID)
-	return err
-}
-
-const selectSecretsForCleanup = `-- name: SelectSecretsForCleanup :many
-SELECT s.public_id, s.storage_key
-FROM secrets AS s
-WHERE s.expires_at < $1
-   OR (
-       s.burn_after_read = true
-       AND s.retrieved_at IS NOT NULL
-       AND NOT EXISTS (
-           SELECT 1
-           FROM retrieval_sessions AS rs
-           WHERE rs.public_id = s.public_id
-             AND rs.expires_at > $1
-       )
-   )
-ORDER BY s.expires_at
-LIMIT $2
-FOR UPDATE OF s SKIP LOCKED
-`
-
-type SelectSecretsForCleanupParams struct {
-	NowAt     pgtype.Timestamptz
-	BatchSize int32
-}
-
-type SelectSecretsForCleanupRow struct {
-	PublicID   string
-	StorageKey string
-}
-
-// Expired secrets and consumed burn-after-read secrets whose retrieval
-// sessions have all ended, oldest first, one batch at a time. Postgres plans
-// the OR as a BitmapOr over idx_secrets_expires_at and the partial
-// consumed-burn index, so the cost follows the rows due, not the table size.
-func (q *Queries) SelectSecretsForCleanup(ctx context.Context, arg SelectSecretsForCleanupParams) ([]SelectSecretsForCleanupRow, error) {
-	rows, err := q.db.Query(ctx, selectSecretsForCleanup, arg.NowAt, arg.BatchSize)
+// An abandoned upload's secret never existed: its row goes, which frees the
+// public id. Returns the keys of the objects to doom.
+func (q *Queries) DeleteUploadingSecrets(ctx context.Context, publicIds []string) ([]pgtype.Text, error) {
+	rows, err := q.db.Query(ctx, deleteUploadingSecrets, publicIds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []SelectSecretsForCleanupRow{}
+	items := []pgtype.Text{}
 	for rows.Next() {
-		var i SelectSecretsForCleanupRow
+		var storage_key pgtype.Text
+		if err := rows.Scan(&storage_key); err != nil {
+			return nil, err
+		}
+		items = append(items, storage_key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const endSecretDeleted = `-- name: EndSecretDeleted :exec
+UPDATE secrets
+SET state = 'ended',
+    outcome = 'deleted',
+    storage_key = NULL,
+    encrypted_meta = NULL,
+    blob_token_hash = NULL,
+    deletion_token_hash = NULL
+WHERE public_id = $1
+`
+
+// Deleting ends the secret; the caller dooms its object in the same
+// transaction.
+func (q *Queries) EndSecretDeleted(ctx context.Context, publicID string) error {
+	_, err := q.db.Exec(ctx, endSecretDeleted, publicID)
+	return err
+}
+
+const endSecretOpened = `-- name: EndSecretOpened :exec
+UPDATE secrets
+SET state = 'ended',
+    outcome = 'opened',
+    encrypted_meta = NULL,
+    blob_token_hash = NULL,
+    deletion_token_hash = NULL
+WHERE public_id = $1
+`
+
+// Opening a one-time secret ends it. Its object stays until the download
+// that opened it has ended.
+func (q *Queries) EndSecretOpened(ctx context.Context, publicID string) error {
+	_, err := q.db.Exec(ctx, endSecretOpened, publicID)
+	return err
+}
+
+const getReadableSecretForUpdate = `-- name: GetReadableSecretForUpdate :one
+SELECT public_id, state, storage_key, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at, opened, outcome
+FROM secrets
+WHERE public_id = $1
+  AND state = 'live'
+  AND expires_at > $2
+FOR UPDATE
+`
+
+type GetReadableSecretForUpdateParams struct {
+	PublicID string
+	NowAt    pgtype.Timestamptz
+}
+
+func (q *Queries) GetReadableSecretForUpdate(ctx context.Context, arg GetReadableSecretForUpdateParams) (Secret, error) {
+	row := q.db.QueryRow(ctx, getReadableSecretForUpdate, arg.PublicID, arg.NowAt)
+	var i Secret
+	err := row.Scan(
+		&i.PublicID,
+		&i.State,
+		&i.StorageKey,
+		&i.MetadataTokenHash,
+		&i.BlobTokenHash,
+		&i.DeletionTokenHash,
+		&i.EncryptedMeta,
+		&i.BlobSize,
+		&i.BurnAfterRead,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+		&i.Opened,
+		&i.Outcome,
+	)
+	return i, err
+}
+
+const getSecret = `-- name: GetSecret :one
+SELECT public_id, state, storage_key, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at, opened, outcome
+FROM secrets
+WHERE public_id = $1
+`
+
+func (q *Queries) GetSecret(ctx context.Context, publicID string) (Secret, error) {
+	row := q.db.QueryRow(ctx, getSecret, publicID)
+	var i Secret
+	err := row.Scan(
+		&i.PublicID,
+		&i.State,
+		&i.StorageKey,
+		&i.MetadataTokenHash,
+		&i.BlobTokenHash,
+		&i.DeletionTokenHash,
+		&i.EncryptedMeta,
+		&i.BlobSize,
+		&i.BurnAfterRead,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+		&i.Opened,
+		&i.Outcome,
+	)
+	return i, err
+}
+
+const listDrainedSecretsForUpdate = `-- name: ListDrainedSecretsForUpdate :many
+SELECT s.public_id, s.storage_key
+FROM secrets AS s
+WHERE s.state = 'ended'
+  AND s.storage_key IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM retrieval_sessions AS rs
+      WHERE rs.public_id = s.public_id
+        AND rs.expires_at > $1
+  )
+ORDER BY s.public_id
+LIMIT $2
+FOR UPDATE OF s SKIP LOCKED
+`
+
+type ListDrainedSecretsForUpdateParams struct {
+	NowAt     pgtype.Timestamptz
+	BatchSize int32
+}
+
+type ListDrainedSecretsForUpdateRow struct {
+	PublicID   string
+	StorageKey pgtype.Text
+}
+
+// Opened one-time secrets whose last download session has ended.
+func (q *Queries) ListDrainedSecretsForUpdate(ctx context.Context, arg ListDrainedSecretsForUpdateParams) ([]ListDrainedSecretsForUpdateRow, error) {
+	rows, err := q.db.Query(ctx, listDrainedSecretsForUpdate, arg.NowAt, arg.BatchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListDrainedSecretsForUpdateRow{}
+	for rows.Next() {
+		var i ListDrainedSecretsForUpdateRow
 		if err := rows.Scan(&i.PublicID, &i.StorageKey); err != nil {
 			return nil, err
 		}
@@ -251,4 +253,79 @@ func (q *Queries) SelectSecretsForCleanup(ctx context.Context, arg SelectSecrets
 		return nil, err
 	}
 	return items, nil
+}
+
+const listExpiredSecretsForUpdate = `-- name: ListExpiredSecretsForUpdate :many
+SELECT public_id, storage_key
+FROM secrets
+WHERE state <> 'uploading'
+  AND expires_at <= $1
+ORDER BY expires_at
+LIMIT $2
+FOR UPDATE SKIP LOCKED
+`
+
+type ListExpiredSecretsForUpdateParams struct {
+	NowAt     pgtype.Timestamptz
+	BatchSize int32
+}
+
+type ListExpiredSecretsForUpdateRow struct {
+	PublicID   string
+	StorageKey pgtype.Text
+}
+
+// Live and ended secrets past their expiry, oldest first. An upload under
+// way is left to its own expiry.
+func (q *Queries) ListExpiredSecretsForUpdate(ctx context.Context, arg ListExpiredSecretsForUpdateParams) ([]ListExpiredSecretsForUpdateRow, error) {
+	rows, err := q.db.Query(ctx, listExpiredSecretsForUpdate, arg.NowAt, arg.BatchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListExpiredSecretsForUpdateRow{}
+	for rows.Next() {
+		var i ListExpiredSecretsForUpdateRow
+		if err := rows.Scan(&i.PublicID, &i.StorageKey); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const makeSecretLive = `-- name: MakeSecretLive :execrows
+UPDATE secrets
+SET state = 'live',
+    created_at = $1
+WHERE public_id = $2
+  AND state = 'uploading'
+`
+
+type MakeSecretLiveParams struct {
+	NowAt    pgtype.Timestamptz
+	PublicID string
+}
+
+func (q *Queries) MakeSecretLive(ctx context.Context, arg MakeSecretLiveParams) (int64, error) {
+	result, err := q.db.Exec(ctx, makeSecretLive, arg.NowAt, arg.PublicID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markSecretOpened = `-- name: MarkSecretOpened :exec
+UPDATE secrets
+SET opened = TRUE
+WHERE public_id = $1
+`
+
+// Someone other than the owner opened a reusable secret.
+func (q *Queries) MarkSecretOpened(ctx context.Context, publicID string) error {
+	_, err := q.db.Exec(ctx, markSecretOpened, publicID)
+	return err
 }

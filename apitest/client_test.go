@@ -107,6 +107,16 @@ type gone struct {
 	Details map[string]any `json:"details"`
 }
 
+// expectEnded checks what the link of an ended secret is told: how it ended and
+// whether it was a one-time secret, and nothing else. In particular no time,
+// and not who opened it.
+func (g gone) expectEnded(t *testing.T, when, outcome string, burnAfterRead bool) {
+	t.Helper()
+	if len(g.Details) != 2 || g.Details["outcome"] != outcome || g.Details["burn_after_read"] != burnAfterRead {
+		t.Errorf("%s: details = %v, want exactly outcome %q and burn_after_read %t", when, g.Details, outcome, burnAfterRead)
+	}
+}
+
 func randomBytes(t *testing.T, n int) []byte {
 	t.Helper()
 	b := make([]byte, n)
@@ -197,21 +207,64 @@ func (a api) upload(s secret, parts ...int) {
 		a.putPart(session, i+1, offset, s.blob[offset:offset+size]).expect(a.t, fmt.Sprintf("part %d", i+1), http.StatusOK, nil)
 		offset += size
 	}
-	a.do(http.MethodPost, "/api/v1/secrets/uploads/"+session.SessionID+"/complete", bearer(session.UploadToken), nil).
-		expect(a.t, "complete upload", http.StatusCreated, nil)
+	a.completeUpload(session).expect(a.t, "complete upload", http.StatusCreated, nil)
 }
 
 type metadata struct {
-	EncryptedMeta string  `json:"encrypted_meta"`
-	BlobSize      int64   `json:"blob_size"`
-	BurnAfterRead bool    `json:"burn_after_read"`
-	ExpiresAt     string  `json:"expires_at"`
-	OpenedAt      *string `json:"opened_at"`
+	EncryptedMeta string `json:"encrypted_meta"`
+	BlobSize      int64  `json:"blob_size"`
+	BurnAfterRead bool   `json:"burn_after_read"`
+	ExpiresAt     string `json:"expires_at"`
+	// Opened is a pointer, so that a reply without the field shows as nil and
+	// not as false.
+	Opened *bool `json:"opened"`
+}
+
+// expectOpened checks that the metadata says whether someone other than the
+// owner has opened the secret. A reply without the field fails, even for false.
+func (m metadata) expectOpened(t *testing.T, when string, want bool) {
+	t.Helper()
+	switch {
+	case m.Opened == nil:
+		t.Errorf("%s: the metadata has no opened field", when)
+	case *m.Opened != want:
+		t.Errorf("%s: opened = %t, want %t", when, *m.Opened, want)
+	}
 }
 
 func (a api) metadata(s secret, token string) reply {
 	a.t.Helper()
 	return a.do(http.MethodGet, "/api/v1/secrets/"+s.publicID+"/meta", map[string]string{"X-Metadata-Token": token}, nil)
+}
+
+// expectOpened fetches the secret's metadata and checks what it says about the
+// secret having been opened.
+func (a api) expectOpened(s secret, when string, want bool) {
+	a.t.Helper()
+	var meta metadata
+	a.metadata(s, s.metadataToken).expect(a.t, "metadata "+when, http.StatusOK, &meta)
+	meta.expectOpened(a.t, when, want)
+}
+
+// deleteSecret asks to delete the secret with the given deletion token.
+func (a api) deleteSecret(s secret, deletionToken string) reply {
+	a.t.Helper()
+	return a.do(http.MethodDelete, "/api/v1/secrets/"+s.publicID, map[string]string{
+		"X-Metadata-Token": s.metadataToken,
+		"X-Deletion-Token": deletionToken,
+	}, nil)
+}
+
+// abortUpload ends an upload session under way.
+func (a api) abortUpload(session uploadSession) reply {
+	a.t.Helper()
+	return a.do(http.MethodDelete, "/api/v1/secrets/uploads/"+session.SessionID, bearer(session.UploadToken), nil)
+}
+
+// completeUpload completes an upload session.
+func (a api) completeUpload(session uploadSession) reply {
+	a.t.Helper()
+	return a.do(http.MethodPost, "/api/v1/secrets/uploads/"+session.SessionID+"/complete", bearer(session.UploadToken), nil)
 }
 
 type retrievalSession struct {

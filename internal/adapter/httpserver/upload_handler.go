@@ -36,7 +36,7 @@ const (
 )
 
 type UploadHandler struct {
-	repo        domain.UploadSessionRepo
+	repo        domain.UploadRepo
 	fileStore   domain.MultipartFileStore
 	maxFileSize int64
 	metrics     *metrics.SecretMetrics
@@ -54,7 +54,7 @@ type createUploadSessionRequest struct {
 	BlobSize      int64  `json:"blob_size"`
 }
 
-func NewUploadHandler(repo domain.UploadSessionRepo, fileStore domain.MultipartFileStore, maxFileSize int64, m *metrics.SecretMetrics) *UploadHandler {
+func NewUploadHandler(repo domain.UploadRepo, fileStore domain.MultipartFileStore, maxFileSize int64, m *metrics.SecretMetrics) *UploadHandler {
 	return &UploadHandler{
 		repo:        repo,
 		fileStore:   fileStore,
@@ -94,48 +94,62 @@ func (h *UploadHandler) CreateUploadSession(c echo.Context) error {
 	}
 
 	ctx := c.Request().Context()
-	storageKey := domain.UploadStorageKey(sessionID)
-	uploadID, err := h.fileStore.CreateMultipartUpload(ctx, storageKey)
-	if err != nil {
-		return apperrors.InternalError("failed to create multipart upload", err)
-	}
-
 	now := time.Now()
-	session := &domain.UploadSession{
-		SessionID:         sessionID,
-		UploadTokenHash:   tokencrypto.TokenHash(uploadToken),
+	storageKey := domain.UploadStorageKey(sessionID)
+	secret := &domain.Secret{
 		PublicID:          req.PublicID,
+		State:             domain.SecretUploading,
 		StorageKey:        storageKey,
-		S3UploadID:        uploadID,
-		BlobSize:          req.BlobSize,
 		MetadataTokenHash: tokencrypto.TokenHash(req.MetadataToken),
 		BlobTokenHash:     tokencrypto.TokenHash(req.BlobToken),
 		DeletionTokenHash: tokencrypto.TokenHash(req.DeletionToken),
 		EncryptedMeta:     req.EncryptedMeta,
+		BlobSize:          req.BlobSize,
 		BurnAfterRead:     req.BurnAfterRead,
-		SecretExpiresAt:   now.Add(duration),
-		UploadExpiresAt:   now.Add(uploadSessionTTL),
-		State:             domain.UploadSessionStatePending,
-		CreatedAt:         now,
+		ExpiresAt:         now.Add(duration),
+	}
+	upload := &domain.Upload{
+		SessionID:       sessionID,
+		PublicID:        req.PublicID,
+		UploadTokenHash: tokencrypto.TokenHash(uploadToken),
+		State:           domain.UploadUploading,
+		ExpiresAt:       now.Add(uploadSessionTTL),
+		StorageKey:      storageKey,
+		BlobSize:        req.BlobSize,
+		SecretExpiresAt: secret.ExpiresAt,
 	}
 
-	if err := h.repo.CreateUploadSession(ctx, session); err != nil {
-		_ = h.fileStore.AbortMultipartUpload(ctx, storageKey, uploadID)
+	// The secret, the upload and its object are on file before anything
+	// reaches storage: a taken public id is refused first, and nothing written
+	// can be lost track of.
+	if err := h.repo.StartUpload(ctx, secret, upload, now); err != nil {
 		if errors.Is(err, domain.ErrDuplicate) {
 			return apperrors.ConflictError("secret with this public_id already exists")
 		}
 		return apperrors.InternalError("failed to create upload session", err)
 	}
 
-	return c.JSON(http.StatusCreated, uploadSessionResponse(session, uploadToken))
+	uploadID, err := h.fileStore.CreateMultipartUpload(ctx, storageKey)
+	if err != nil {
+		h.abandon(ctx, sessionID)
+		return apperrors.InternalError("failed to create multipart upload", err)
+	}
+	if err := h.repo.RecordS3UploadID(ctx, storageKey, uploadID); err != nil {
+		// The cleanup finds the multipart upload by its key.
+		h.abandon(ctx, sessionID)
+		return apperrors.InternalError("failed to create upload session", err)
+	}
+	upload.S3UploadID = uploadID
+
+	return c.JSON(http.StatusCreated, uploadSessionResponse(upload, uploadToken))
 }
 
 func (h *UploadHandler) UploadPart(c echo.Context) error {
-	session, parts, _, err := h.authenticateUploadSession(c)
+	upload, parts, _, err := h.authenticateUploadSession(c)
 	if err != nil {
 		return err
 	}
-	if err := validatePendingUploadSession(session); err != nil {
+	if err := validatePendingUpload(upload); err != nil {
 		return err
 	}
 
@@ -154,7 +168,7 @@ func (h *UploadHandler) UploadPart(c echo.Context) error {
 	if size <= 0 || size > maxMultipartUploadPart || size > h.maxFileSize {
 		return apperrors.BadRequestError("invalid " + HeaderPartSize + " header")
 	}
-	if err := validatePartPlacement(session.BlobSize, partNumber, offset, size); err != nil {
+	if err := validatePartPlacement(upload.BlobSize, partNumber, offset, size); err != nil {
 		return apperrors.BadRequestError(err.Error())
 	}
 	if c.Request().ContentLength >= 0 && c.Request().ContentLength != size {
@@ -183,8 +197,8 @@ func (h *UploadHandler) UploadPart(c echo.Context) error {
 
 	etag, err := h.fileStore.UploadPart(
 		c.Request().Context(),
-		session.StorageKey,
-		session.S3UploadID,
+		upload.StorageKey,
+		upload.S3UploadID,
 		partNumber,
 		partFile,
 		size,
@@ -194,7 +208,7 @@ func (h *UploadHandler) UploadPart(c echo.Context) error {
 	}
 
 	recorded, err := h.repo.RecordUploadPart(c.Request().Context(), &domain.UploadPart{
-		SessionID:  session.SessionID,
+		SessionID:  upload.SessionID,
 		PartNumber: partNumber,
 		Offset:     offset,
 		Size:       size,
@@ -213,17 +227,17 @@ func (h *UploadHandler) UploadPart(c echo.Context) error {
 }
 
 func (h *UploadHandler) CompleteUploadSession(c echo.Context) error {
-	session, _, _, err := h.authenticateUploadSession(c)
+	upload, _, _, err := h.authenticateUploadSession(c)
 	if err != nil {
 		return err
 	}
 
 	ctx := c.Request().Context()
 	// stored records that storage assembled the object, so a later failure
-	// leaves an object that no secret references.
+	// leaves an object that no live secret references.
 	stored := false
-	completed, err := h.repo.CompleteUploadSession(ctx, session.SessionID, time.Now(), func(locked *domain.UploadSession, parts []domain.UploadPart) error {
-		if time.Now().After(locked.UploadExpiresAt) {
+	completed, err := h.repo.CompleteUpload(ctx, upload.SessionID, time.Now(), func(locked *domain.Upload, parts []domain.UploadPart) error {
+		if time.Now().After(locked.ExpiresAt) {
 			return apperrors.ConflictError("upload session has expired")
 		}
 		completedParts, err := validateUploadParts(locked, parts)
@@ -237,13 +251,17 @@ func (h *UploadHandler) CompleteUploadSession(c echo.Context) error {
 		return nil
 	})
 	if err != nil {
-		return h.completeUploadFailed(ctx, session, stored, err)
+		return h.completeUploadFailed(ctx, upload, stored, err)
 	}
 
-	// A repeated complete finds the session already completed and answers the
+	// A repeated complete finds the upload already completed and answers the
 	// same way without creating anything.
 	if stored {
 		h.metrics.SecretsCreated.Inc()
+	}
+	// Only a repeat long after the secret expired finds it gone.
+	if completed.SecretExpiresAt.IsZero() {
+		return apperrors.ConflictError("upload session already completed")
 	}
 
 	return c.JSON(http.StatusCreated, map[string]string{
@@ -251,12 +269,10 @@ func (h *UploadHandler) CompleteUploadSession(c echo.Context) error {
 	})
 }
 
-func (h *UploadHandler) completeUploadFailed(ctx context.Context, session *domain.UploadSession, stored bool, err error) error {
+func (h *UploadHandler) completeUploadFailed(ctx context.Context, upload *domain.Upload, stored bool, err error) error {
 	if stored {
-		h.discardUpload(ctx, session)
-		if errors.Is(err, domain.ErrDuplicate) {
-			return apperrors.ConflictError("upload session cannot be completed")
-		}
+		// Storage assembled the object, but the secret did not go live.
+		h.abandon(ctx, upload.SessionID)
 		return apperrors.InternalError("failed to create secret", err)
 	}
 
@@ -269,12 +285,12 @@ func (h *UploadHandler) completeUploadFailed(ctx context.Context, session *domai
 		// Recorded parts no longer match storage (for example a concurrent
 		// re-upload of the same part number with different content). Forget
 		// them so the client can upload the parts again.
-		if clearErr := h.repo.ClearUploadParts(ctx, session.SessionID); clearErr != nil {
+		if clearErr := h.repo.ClearUploadParts(ctx, upload.SessionID); clearErr != nil {
 			return apperrors.InternalError("failed to reset upload parts", clearErr)
 		}
 		return apperrors.ConflictError("uploaded parts were rejected by storage; upload the parts again")
 	case errors.Is(err, domain.ErrUploadNotFound):
-		h.discardUpload(ctx, session)
+		h.abandon(ctx, upload.SessionID)
 		return apperrors.ConflictError("upload session is no longer valid; start a new upload")
 	}
 	if appErr, ok := errors.AsType[*apperrors.Error](err); ok {
@@ -283,50 +299,38 @@ func (h *UploadHandler) completeUploadFailed(ctx context.Context, session *domai
 	return apperrors.InternalError("failed to complete multipart upload", err)
 }
 
-// discardUpload ends a session whose upload can no longer become a secret and
-// removes whatever storage holds under its key. The object is only deleted
-// once this call has moved the session to aborted: from then on no secret can
-// ever reference the key. If the session was completed by a concurrent
-// request in the meantime, the object belongs to that secret and stays.
-func (h *UploadHandler) discardUpload(ctx context.Context, session *domain.UploadSession) {
-	if err := h.repo.AbortUploadSession(ctx, session.SessionID, time.Now()); err != nil {
-		// Still pending (for example the database is down): cleanup deletes
-		// the object once the session expires.
-		if !errors.Is(err, domain.ErrConflict) {
-			slog.ErrorContext(ctx, "failed to abort upload session", "session_id", session.SessionID, "error", err)
-		}
-		return
-	}
-	if err := h.fileStore.Delete(ctx, session.StorageKey); err != nil {
-		slog.ErrorContext(ctx, "failed to delete discarded upload object", "session_id", session.SessionID, "error", err)
+// abandon ends an upload that can no longer become a secret. Its object is
+// doomed with it, and the cleanup removes whatever storage holds under its
+// key. If this fails too (the database is down, say), the upload's expiry
+// does the same; if a concurrent request completed the upload meanwhile, the
+// object belongs to that secret and stays.
+func (h *UploadHandler) abandon(ctx context.Context, sessionID string) {
+	if err := h.repo.AbortUpload(ctx, sessionID, time.Now()); err != nil && !errors.Is(err, domain.ErrConflict) {
+		slog.ErrorContext(ctx, "failed to abandon upload", "error", err)
 	}
 }
 
 func (h *UploadHandler) AbortUploadSession(c echo.Context) error {
-	session, _, _, err := h.authenticateUploadSession(c)
+	upload, _, _, err := h.authenticateUploadSession(c)
 	if err != nil {
 		return err
 	}
-	if session.State == domain.UploadSessionStateCompleted {
+	// The multipart upload and anything stored go with the object, which the
+	// cleanup removes within a cycle.
+	err = h.repo.AbortUpload(c.Request().Context(), upload.SessionID, time.Now())
+	if errors.Is(err, domain.ErrConflict) {
 		return apperrors.ConflictError("upload session already completed")
 	}
-	if session.State == domain.UploadSessionStatePending {
-		if err := h.fileStore.AbortMultipartUpload(c.Request().Context(), session.StorageKey, session.S3UploadID); err != nil {
-			return apperrors.InternalError("failed to abort multipart upload", err)
-		}
-		err := h.repo.AbortUploadSession(c.Request().Context(), session.SessionID, time.Now())
-		if errors.Is(err, domain.ErrConflict) {
-			// A concurrent complete or abort ended the session first.
-			return apperrors.ConflictError("upload session is not pending")
-		}
-		if err != nil {
-			return apperrors.InternalError("failed to abort upload session", err)
-		}
+	if errors.Is(err, domain.ErrNotFound) {
+		return apperrors.NotFoundError("upload session not found")
+	}
+	if err != nil {
+		return apperrors.InternalError("failed to abort upload session", err)
 	}
 	return c.NoContent(http.StatusNoContent)
 }
 
-func (h *UploadHandler) authenticateUploadSession(c echo.Context) (*domain.UploadSession, []domain.UploadPart, string, error) {
+func (h *UploadHandler) authenticateUploadSession(c echo.Context) (*domain.Upload, []domain.UploadPart, string, error) {
 	sessionID := c.Param("sessionID")
 	if sessionID == "" {
 		return nil, nil, "", apperrors.BadRequestError("missing session_id")
@@ -343,17 +347,17 @@ func (h *UploadHandler) authenticateUploadSession(c echo.Context) (*domain.Uploa
 		return nil, nil, "", apperrors.BadRequestError("malformed Authorization header")
 	}
 
-	session, parts, err := h.repo.GetUploadSession(c.Request().Context(), sessionID)
+	upload, parts, err := h.repo.GetUpload(c.Request().Context(), sessionID)
 	if errors.Is(err, domain.ErrNotFound) {
 		return nil, nil, "", apperrors.NotFoundError("upload session not found")
 	}
 	if err != nil {
 		return nil, nil, "", apperrors.InternalError("failed to get upload session", err)
 	}
-	if !tokencrypto.TokensEqual(tokencrypto.TokenHash(uploadToken), session.UploadTokenHash) {
+	if !tokencrypto.TokensEqual(tokencrypto.TokenHash(uploadToken), upload.UploadTokenHash) {
 		return nil, nil, "", apperrors.ForbiddenError("invalid upload token")
 	}
-	return session, parts, uploadToken, nil
+	return upload, parts, uploadToken, nil
 }
 
 func (h *UploadHandler) validateRequest(v any) []string {
@@ -372,15 +376,15 @@ func (h *UploadHandler) validateRequest(v any) []string {
 	return details
 }
 
-func uploadSessionResponse(session *domain.UploadSession, uploadToken string) map[string]any {
+func uploadSessionResponse(upload *domain.Upload, uploadToken string) map[string]any {
 	return map[string]any{
-		"session_id":        session.SessionID,
-		"public_id":         session.PublicID,
+		"session_id":        upload.SessionID,
+		"public_id":         upload.PublicID,
 		"part_size":         multipartUploadPartSize,
-		"blob_size":         session.BlobSize,
-		"expires_at":        session.SecretExpiresAt.UTC().Format(time.RFC3339),
-		"upload_expires_at": session.UploadExpiresAt.UTC().Format(time.RFC3339),
-		"state":             session.State,
+		"blob_size":         upload.BlobSize,
+		"expires_at":        upload.SecretExpiresAt.UTC().Format(time.RFC3339),
+		"upload_expires_at": upload.ExpiresAt.UTC().Format(time.RFC3339),
+		"state":             domain.UploadStatePending,
 		"upload_token":      uploadToken,
 	}
 }
@@ -395,17 +399,18 @@ func uploadPartResponse(part domain.UploadPart) map[string]any {
 	}
 }
 
-func validatePendingUploadSession(session *domain.UploadSession) error {
-	if session.State != domain.UploadSessionStatePending {
+func validatePendingUpload(upload *domain.Upload) error {
+	// Without a recorded multipart upload the start failed half-way.
+	if upload.State != domain.UploadUploading || upload.S3UploadID == "" {
 		return apperrors.ConflictError("upload session is not pending")
 	}
-	if time.Now().After(session.UploadExpiresAt) {
+	if time.Now().After(upload.ExpiresAt) {
 		return apperrors.ConflictError("upload session has expired")
 	}
 	return nil
 }
 
-func validateUploadParts(session *domain.UploadSession, parts []domain.UploadPart) ([]domain.CompletedPart, error) {
+func validateUploadParts(upload *domain.Upload, parts []domain.UploadPart) ([]domain.CompletedPart, error) {
 	if len(parts) == 0 {
 		return nil, errors.New("upload session has no parts")
 	}
@@ -427,7 +432,7 @@ func validateUploadParts(session *domain.UploadSession, parts []domain.UploadPar
 			return nil, fmt.Errorf("upload part %d is below minimum size", part.PartNumber)
 		}
 		expectedOffset += part.Size
-		if expectedOffset > session.BlobSize {
+		if expectedOffset > upload.BlobSize {
 			return nil, errors.New("uploaded parts exceed expected size")
 		}
 		completed = append(completed, domain.CompletedPart{
@@ -435,7 +440,7 @@ func validateUploadParts(session *domain.UploadSession, parts []domain.UploadPar
 			ETag:       part.ETag,
 		})
 	}
-	if expectedOffset != session.BlobSize {
+	if expectedOffset != upload.BlobSize {
 		return nil, errors.New("upload is missing parts")
 	}
 	return completed, nil

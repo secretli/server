@@ -1,88 +1,110 @@
 -- name: CreateSecret :exec
+-- A secret is filed when its upload starts, so its public id is taken from
+-- then on.
 INSERT INTO secrets (
     public_id,
+    state,
+    storage_key,
     metadata_token_hash,
     blob_token_hash,
     deletion_token_hash,
     encrypted_meta,
     blob_size,
     burn_after_read,
-    expires_at,
-    created_at,
-    storage_key
+    expires_at
 )
 VALUES (
-    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10
+    $1, 'uploading', $2, $3, $4, $5, $6, $7, $8, $9
 );
 
--- name: GetSecretByPublicID :one
-SELECT
-    public_id,
-    metadata_token_hash,
-    blob_token_hash,
-    deletion_token_hash,
-    encrypted_meta,
-    blob_size,
-    burn_after_read,
-    expires_at,
-    created_at,
-    retrieved_at,
-    storage_key
-FROM secrets
-WHERE public_id = sqlc.arg(public_id)
-  AND expires_at > sqlc.arg(now_at);
-
--- name: GetSecretIgnoringExpiry :one
--- The row whatever its state, to tell what became of an expired secret the
--- cleanup has not reached yet.
+-- name: GetSecret :one
 SELECT *
 FROM secrets
 WHERE public_id = $1;
 
--- name: ClaimBurnAfterRead :execrows
-UPDATE secrets
-SET retrieved_at = sqlc.arg(now_at)
+-- name: GetReadableSecretForUpdate :one
+SELECT *
+FROM secrets
 WHERE public_id = sqlc.arg(public_id)
-  AND blob_token_hash = sqlc.arg(blob_token_hash)
-  AND burn_after_read = true
-  AND retrieved_at IS NULL
-  AND expires_at > sqlc.arg(now_at);
+  AND state = 'live'
+  AND expires_at > sqlc.arg(now_at)
+FOR UPDATE;
+
+-- name: MakeSecretLive :execrows
+UPDATE secrets
+SET state = 'live',
+    created_at = sqlc.arg(now_at)
+WHERE public_id = sqlc.arg(public_id)
+  AND state = 'uploading';
+
+-- name: EndSecretOpened :exec
+-- Opening a one-time secret ends it. Its object stays until the download
+-- that opened it has ended.
+UPDATE secrets
+SET state = 'ended',
+    outcome = 'opened',
+    encrypted_meta = NULL,
+    blob_token_hash = NULL,
+    deletion_token_hash = NULL
+WHERE public_id = $1;
 
 -- name: MarkSecretOpened :exec
--- The first time a recipient opens a reusable secret.
+-- Someone other than the owner opened a reusable secret.
 UPDATE secrets
-SET retrieved_at = sqlc.arg(now_at)
-WHERE public_id = sqlc.arg(public_id)
-  AND retrieved_at IS NULL;
+SET opened = TRUE
+WHERE public_id = $1;
 
--- name: ExpireSecret :exec
--- Ends a secret now: every read filters on expires_at, and the cleanup
--- removes its object and row as for any other expired secret.
+-- name: EndSecretDeleted :exec
+-- Deleting ends the secret; the caller dooms its object in the same
+-- transaction.
 UPDATE secrets
-SET expires_at = sqlc.arg(now_at)
-WHERE public_id = sqlc.arg(public_id);
+SET state = 'ended',
+    outcome = 'deleted',
+    storage_key = NULL,
+    encrypted_meta = NULL,
+    blob_token_hash = NULL,
+    deletion_token_hash = NULL
+WHERE public_id = $1;
 
--- name: SelectSecretsForCleanup :many
--- Expired secrets and consumed burn-after-read secrets whose retrieval
--- sessions have all ended, oldest first, one batch at a time. Postgres plans
--- the OR as a BitmapOr over idx_secrets_expires_at and the partial
--- consumed-burn index, so the cost follows the rows due, not the table size.
+-- name: DeleteUploadingSecrets :many
+-- An abandoned upload's secret never existed: its row goes, which frees the
+-- public id. Returns the keys of the objects to doom.
+DELETE FROM secrets
+WHERE public_id = ANY(sqlc.arg(public_ids)::text[])
+  AND state = 'uploading'
+RETURNING storage_key;
+
+-- name: ListDrainedSecretsForUpdate :many
+-- Opened one-time secrets whose last download session has ended.
 SELECT s.public_id, s.storage_key
 FROM secrets AS s
-WHERE s.expires_at < sqlc.arg(now_at)
-   OR (
-       s.burn_after_read = true
-       AND s.retrieved_at IS NOT NULL
-       AND NOT EXISTS (
-           SELECT 1
-           FROM retrieval_sessions AS rs
-           WHERE rs.public_id = s.public_id
-             AND rs.expires_at > sqlc.arg(now_at)
-       )
-   )
-ORDER BY s.expires_at
+WHERE s.state = 'ended'
+  AND s.storage_key IS NOT NULL
+  AND NOT EXISTS (
+      SELECT 1
+      FROM retrieval_sessions AS rs
+      WHERE rs.public_id = s.public_id
+        AND rs.expires_at > sqlc.arg(now_at)
+  )
+ORDER BY s.public_id
 LIMIT sqlc.arg(batch_size)
 FOR UPDATE OF s SKIP LOCKED;
+
+-- name: ClearStorageKeys :exec
+UPDATE secrets
+SET storage_key = NULL
+WHERE public_id = ANY(sqlc.arg(public_ids)::text[]);
+
+-- name: ListExpiredSecretsForUpdate :many
+-- Live and ended secrets past their expiry, oldest first. An upload under
+-- way is left to its own expiry.
+SELECT public_id, storage_key
+FROM secrets
+WHERE state <> 'uploading'
+  AND expires_at <= sqlc.arg(now_at)
+ORDER BY expires_at
+LIMIT sqlc.arg(batch_size)
+FOR UPDATE SKIP LOCKED;
 
 -- name: DeleteSecretsByPublicIDs :execrows
 DELETE FROM secrets

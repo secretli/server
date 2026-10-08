@@ -10,48 +10,48 @@ import (
 )
 
 const (
-	// cycleTimeout bounds one cleanup pass. The repo holds row locks while the
-	// storage callbacks run, so a hung S3 call must not block API deletes
-	// forever.
+	// cycleTimeout bounds one cleanup pass, so a hung storage call cannot
+	// stall the cleanup for good. Only the object sweep talks to storage, and
+	// it locks only rows that no request touches.
 	cycleTimeout = 10 * time.Minute
-	// finishedUploadRetention is how long a completed or aborted upload
-	// session's tombstone is kept, so a client retrying complete or abort
-	// still gets a consistent answer. Purging an aborted one removes its
-	// object first, in case the delete that followed the abort failed.
+	// finishedUploadRetention is how long a completed or abandoned upload is
+	// kept, so a client retrying complete or abort still gets a consistent
+	// answer.
 	finishedUploadRetention = time.Hour
 	// endedTransferRetention keeps an ended transfer briefly, so the other
 	// side's next poll learns why it ended instead of finding nothing.
 	endedTransferRetention = time.Minute
-	// batchSize bounds how many rows one cleanup transaction locks while it
-	// makes storage calls. Each batch commits, so a large backlog (after an
-	// outage, say) is worked off across batches and cycles instead of in one
-	// transaction that times out and rolls back every time.
+	// batchSize bounds how many rows one cleanup transaction locks. Each batch
+	// commits, so a large backlog (after an outage, say) is worked off across
+	// batches and cycles instead of in one transaction that times out and
+	// rolls back every time.
 	batchSize = 100
 )
 
 // Repo is the slice of the datastore this worker touches.
 type Repo interface {
-	DeleteExpired(ctx context.Context, now time.Time, limit int, beforeDelete func(storageKey string) error) (domain.CleanupBatch, error)
 	DeleteExpiredRetrievalSessions(ctx context.Context, now time.Time) (int64, error)
-	DeleteExpiredTombstones(ctx context.Context, now time.Time) (int64, error)
-	AbortExpiredUploadSessions(ctx context.Context, now time.Time, limit int, beforeAbort func(session *domain.UploadSession) error) (domain.CleanupBatch, error)
-	PurgeFinishedUploadSessions(ctx context.Context, finishedBefore time.Time, limit int, beforePurge func(session *domain.UploadSession) error) (domain.CleanupBatch, error)
+	AbandonExpiredUploads(ctx context.Context, now time.Time, limit int) (int, error)
+	DeleteFinishedUploads(ctx context.Context, finishedBefore time.Time) (int64, error)
+	ReleaseDrainedSecrets(ctx context.Context, now time.Time, limit int) (int, error)
+	DeleteExpiredSecrets(ctx context.Context, now time.Time, limit int) (int, error)
+	DeleteDoomedObjects(ctx context.Context, limit int, remove func(object *domain.Object) error) (domain.CleanupBatch, error)
 	DeleteEndedTransfers(ctx context.Context, endedBefore time.Time) (int64, error)
 }
 
 type Worker struct {
-	interval   time.Duration
-	secretRepo Repo
-	fileStore  domain.MultipartFileStore
-	metrics    *metrics.SecretMetrics
+	interval  time.Duration
+	repo      Repo
+	fileStore domain.MultipartFileStore
+	metrics   *metrics.SecretMetrics
 }
 
-func NewWorker(interval time.Duration, secretRepo Repo, fileStore domain.MultipartFileStore, m *metrics.SecretMetrics) *Worker {
+func NewWorker(interval time.Duration, repo Repo, fileStore domain.MultipartFileStore, m *metrics.SecretMetrics) *Worker {
 	return &Worker{
-		interval:   interval,
-		secretRepo: secretRepo,
-		fileStore:  fileStore,
-		metrics:    m,
+		interval:  interval,
+		repo:      repo,
+		fileStore: fileStore,
+		metrics:   m,
 	}
 }
 
@@ -71,87 +71,102 @@ func (w *Worker) Run(ctx context.Context) {
 	}
 }
 
+// runCycle ends what ran out and dooms the objects nothing may read any more,
+// all in the database, and then removes the doomed objects from storage. The
+// object sweep runs last, so what this cycle doomed is usually gone by its
+// end.
 func (w *Worker) runCycle(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, cycleTimeout)
 	defer cancel()
 	now := time.Now()
 
-	if count, err := w.secretRepo.DeleteExpiredRetrievalSessions(ctx, now); err != nil {
-		slog.ErrorContext(ctx, "cleanup: expired retrieval session cleanup failed", "error", err)
-		w.metrics.CleanupErrors.Inc()
-	} else if count > 0 {
-		slog.InfoContext(ctx, "cleanup: deleted retrieval sessions", "count", count)
-	}
+	w.sweep(ctx, "expired retrieval sessions", func() (int64, error) {
+		return w.repo.DeleteExpiredRetrievalSessions(ctx, now)
+	})
+	w.sweep(ctx, "expired uploads", func() (int64, error) {
+		return drainSQL(ctx, func() (int, error) { return w.repo.AbandonExpiredUploads(ctx, now, batchSize) })
+	})
+	w.sweep(ctx, "finished uploads", func() (int64, error) {
+		return w.repo.DeleteFinishedUploads(ctx, now.Add(-finishedUploadRetention))
+	})
+	w.sweep(ctx, "ended transfers", func() (int64, error) {
+		return w.repo.DeleteEndedTransfers(ctx, now.Add(-endedTransferRetention))
+	})
+	w.sweep(ctx, "drained one-time secrets", func() (int64, error) {
+		return drainSQL(ctx, func() (int, error) { return w.repo.ReleaseDrainedSecrets(ctx, now, batchSize) })
+	})
+	w.sweep(ctx, "expired secrets", func() (int64, error) {
+		return drainSQL(ctx, func() (int, error) { return w.repo.DeleteExpiredSecrets(ctx, now, batchSize) })
+	})
 
-	abortUpload := func(session *domain.UploadSession) error {
-		if err := w.fileStore.AbortMultipartUpload(ctx, session.StorageKey, session.S3UploadID); err != nil {
+	removed, err := drainBatches(ctx, func() (domain.CleanupBatch, error) {
+		return w.repo.DeleteDoomedObjects(ctx, batchSize, func(object *domain.Object) error {
+			// The object stays doomed and is tried again next cycle. Count it,
+			// so storage refusing deletes shows in the metrics, not only in
+			// the log.
+			err := w.removeObject(ctx, object)
+			if err != nil {
+				w.metrics.CleanupErrors.Inc()
+			}
+			return err
+		})
+	})
+	if removed > 0 {
+		slog.InfoContext(ctx, "cleanup: deleted objects", "count", removed)
+		w.metrics.ObjectsDeleted.Add(float64(removed))
+	}
+	if err != nil {
+		slog.ErrorContext(ctx, "cleanup: object cleanup failed", "error", err)
+		w.metrics.CleanupErrors.Inc()
+	}
+}
+
+// removeObject deletes an object from storage. One that was still being
+// written may have a multipart upload open, holding uploaded parts; those are
+// aborted first. The object itself is deleted either way: a crash between
+// assembling an upload and recording it leaves an object behind a row that
+// still says writing.
+func (w *Worker) removeObject(ctx context.Context, object *domain.Object) error {
+	if object.State == domain.ObjectWriting {
+		if err := w.fileStore.AbortMultipartUploads(ctx, object.StorageKey); err != nil {
 			return err
 		}
-		// A crash between storage completion and the database commit leaves a
-		// finished object with no secret row. The key belongs to this session
-		// alone, so remove it rather than leaking storage.
-		return w.fileStore.Delete(ctx, session.StorageKey)
 	}
-	aborted, err := drainBatches(ctx, func() (domain.CleanupBatch, error) {
-		return w.secretRepo.AbortExpiredUploadSessions(ctx, now, batchSize, abortUpload)
-	})
-	if aborted > 0 {
-		slog.InfoContext(ctx, "cleanup: aborted expired upload sessions", "count", aborted)
+	return w.fileStore.Delete(ctx, object.StorageKey)
+}
+
+// sweep runs one database-only cleanup step and logs its outcome. A failed
+// step does not stop the others; a cycle cut short (at shutdown, say) skips
+// the steps it has no time for.
+func (w *Worker) sweep(ctx context.Context, what string, step func() (int64, error)) {
+	if ctx.Err() != nil {
+		return
+	}
+	count, err := step()
+	if count > 0 {
+		slog.InfoContext(ctx, "cleanup: "+what, "count", count)
 	}
 	if err != nil {
-		slog.ErrorContext(ctx, "cleanup: expired upload session cleanup failed", "error", err)
+		slog.ErrorContext(ctx, "cleanup: "+what+" failed", "error", err)
 		w.metrics.CleanupErrors.Inc()
 	}
+}
 
-	purgeUpload := func(session *domain.UploadSession) error {
-		// A completed session's object belongs to its secret.
-		if session.State != domain.UploadSessionStateAborted {
-			return nil
+// drainSQL runs a database-only batch until a short batch says the backlog
+// is worked off, and returns how many rows it handled.
+func drainSQL(ctx context.Context, batch func() (int, error)) (int64, error) {
+	var handled int64
+	for ctx.Err() == nil {
+		n, err := batch()
+		handled += int64(n)
+		if err != nil {
+			return handled, err
 		}
-		// An aborted session's key can never belong to a secret, and every
-		// path that aborts one has already ended the multipart upload. What
-		// can be left is the object, if the delete after the abort failed.
-		return w.fileStore.Delete(ctx, session.StorageKey)
+		if n < batchSize {
+			break
+		}
 	}
-	purged, err := drainBatches(ctx, func() (domain.CleanupBatch, error) {
-		return w.secretRepo.PurgeFinishedUploadSessions(ctx, now.Add(-finishedUploadRetention), batchSize, purgeUpload)
-	})
-	if purged > 0 {
-		slog.InfoContext(ctx, "cleanup: deleted finished upload sessions", "count", purged)
-	}
-	if err != nil {
-		slog.ErrorContext(ctx, "cleanup: finished upload session cleanup failed", "error", err)
-		w.metrics.CleanupErrors.Inc()
-	}
-
-	if count, err := w.secretRepo.DeleteEndedTransfers(ctx, now.Add(-endedTransferRetention)); err != nil {
-		slog.ErrorContext(ctx, "cleanup: ended transfer cleanup failed", "error", err)
-		w.metrics.CleanupErrors.Inc()
-	} else if count > 0 {
-		slog.InfoContext(ctx, "cleanup: deleted ended transfers", "count", count)
-	}
-
-	beforeDelete := func(storageKey string) error {
-		return w.fileStore.Delete(ctx, storageKey)
-	}
-	deleted, err := drainBatches(ctx, func() (domain.CleanupBatch, error) {
-		return w.secretRepo.DeleteExpired(ctx, now, batchSize, beforeDelete)
-	})
-	if deleted > 0 {
-		slog.InfoContext(ctx, "cleanup: deleted secrets", "count", deleted)
-		w.metrics.SecretsCleaned.Add(float64(deleted))
-	}
-	if err != nil {
-		slog.ErrorContext(ctx, "cleanup: secret cleanup failed", "error", err)
-		w.metrics.CleanupErrors.Inc()
-	}
-
-	if count, err := w.secretRepo.DeleteExpiredTombstones(ctx, now); err != nil {
-		slog.ErrorContext(ctx, "cleanup: tombstone cleanup failed", "error", err)
-		w.metrics.CleanupErrors.Inc()
-	} else if count > 0 {
-		slog.InfoContext(ctx, "cleanup: forgot tombstones", "count", count)
-	}
+	return handled, nil
 }
 
 // drainBatches runs batch until the backlog is worked off and returns how
@@ -160,7 +175,7 @@ func (w *Worker) runCycle(ctx context.Context) {
 // next cycle retries) or at an error, whose earlier batches stay committed.
 // Rows that fail are picked up again by the next batch alongside new ones,
 // so a few bad rows cannot stall the rest. Every batch either removes a row
-// or ends the loop, and the set of due rows is fixed by now, so it ends.
+// or ends the loop, so it ends.
 func drainBatches(ctx context.Context, batch func() (domain.CleanupBatch, error)) (int, error) {
 	removed := 0
 	for ctx.Err() == nil {

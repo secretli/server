@@ -5,7 +5,6 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/tern/v2/migrate"
@@ -45,121 +44,52 @@ func migrationDatabase(t *testing.T) (*pgx.Conn, *migrate.Migrator) {
 	return conn, migrator
 }
 
-// TestMigration004_BackfillsAndScrubs migrates a database holding rows written
-// before per-upload storage keys and checks they are carried over.
-func TestMigration004_BackfillsAndScrubs(t *testing.T) {
+// TestMigration_AppliesRollsBackAndAppliesAgain migrates an empty database to
+// the schema, all the way back down and up again.
+func TestMigration_AppliesRollsBackAndAppliesAgain(t *testing.T) {
 	conn, migrator := migrationDatabase(t)
 	ctx := context.Background()
-
-	if err := migrator.MigrateTo(ctx, 3); err != nil {
-		t.Fatalf("migrate to 3: %v", err)
-	}
-
-	now := time.Now()
-	if _, err := conn.Exec(ctx, `
-		INSERT INTO secrets (public_id, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, expires_at, created_at)
-		VALUES ('legacy-secret', 'm', 'b', 'd', 'meta', 1, $1, $2)`, now.Add(time.Hour), now); err != nil {
-		t.Fatalf("insert secret: %v", err)
-	}
-	for _, s := range []struct{ id, state string }{{"legacy-pending", "pending"}, {"legacy-done", "completed"}} {
-		if _, err := conn.Exec(ctx, `
-			INSERT INTO upload_sessions (session_id, public_id, upload_token_hash, metadata_token_hash, blob_token_hash, deletion_token_hash,
-				s3_upload_id, blob_size, encrypted_meta, secret_expires_at, upload_expires_at, state, created_at)
-			VALUES ($1, $1 || '-public', 'u', 'm', 'b', 'd', 's3', 1, 'meta', $2, $2, $3, $4)`,
-			s.id, now.Add(time.Hour), s.state, now); err != nil {
-			t.Fatalf("insert session %s: %v", s.id, err)
-		}
-		if _, err := conn.Exec(ctx, `
-			INSERT INTO upload_parts (session_id, part_number, part_offset, part_size, part_sha256, etag, created_at)
-			VALUES ($1, 1, 0, 1, 'sha', 'etag', $2)`, s.id, now); err != nil {
-			t.Fatalf("insert part for %s: %v", s.id, err)
-		}
-	}
-
-	if err := migrator.MigrateTo(ctx, 4); err != nil {
-		t.Fatalf("migrate to 4: %v", err)
-	}
-
-	var secretKey string
-	if err := conn.QueryRow(ctx, "SELECT storage_key FROM secrets WHERE public_id = 'legacy-secret'").Scan(&secretKey); err != nil {
-		t.Fatalf("query secret: %v", err)
-	}
-	if secretKey != "secrets/legacy-secret" {
-		t.Errorf("secret storage key = %q, want the legacy key", secretKey)
-	}
-
-	for _, tc := range []struct {
-		id            string
-		wantKey       string
-		wantMaterial  int
-		wantPartCount int
-	}{
-		{id: "legacy-pending", wantKey: "secrets/legacy-pending-public", wantMaterial: 4, wantPartCount: 1},
-		{id: "legacy-done", wantKey: "secrets/legacy-done-public", wantMaterial: 0, wantPartCount: 0},
-	} {
-		var key string
-		var material, parts int
-		if err := conn.QueryRow(ctx, `
-			SELECT storage_key,
-			       num_nonnulls(metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta),
-			       (SELECT count(*) FROM upload_parts p WHERE p.session_id = s.session_id)
-			FROM upload_sessions s WHERE session_id = $1`, tc.id).Scan(&key, &material, &parts); err != nil {
-			t.Fatalf("query %s: %v", tc.id, err)
-		}
-		if key != tc.wantKey || material != tc.wantMaterial || parts != tc.wantPartCount {
-			t.Errorf("%s: key = %q, share columns = %d, parts = %d; want %q, %d, %d",
-				tc.id, key, material, parts, tc.wantKey, tc.wantMaterial, tc.wantPartCount)
-		}
-	}
-
-	// The migration can be rolled back.
-	if err := migrator.MigrateTo(ctx, 3); err != nil {
-		t.Fatalf("migrate down to 3: %v", err)
-	}
-}
-
-// TestMigration008_DropsTheOldTransferTablesAndCanRestoreThem migrates up to
-// 8, back to 7 and up again.
-func TestMigration008_DropsTheOldTransferTablesAndCanRestoreThem(t *testing.T) {
-	conn, migrator := migrationDatabase(t)
-	ctx := context.Background()
-	exists := func(table string) bool {
+	tables := []string{"objects", "secrets", "uploads", "upload_parts", "retrieval_sessions", "code_transfers"}
+	exists := func(kind, name string) bool {
 		t.Helper()
 		var found bool
-		if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", table).Scan(&found); err != nil {
-			t.Fatalf("look up %s: %v", table, err)
+		if err := conn.QueryRow(ctx, "SELECT to_"+kind+"($1) IS NOT NULL", name).Scan(&found); err != nil {
+			t.Fatalf("look up %s: %v", name, err)
 		}
 		return found
 	}
-	oldTriggers := func() int {
+	assertSchema := func(want bool, after string) {
 		t.Helper()
-		var n int
-		err := conn.QueryRow(ctx,
-			"SELECT count(*) FROM pg_trigger WHERE tgname IN ('transfer_messages_notify', 'transfers_closed_notify')").Scan(&n)
-		if err != nil {
-			t.Fatalf("count triggers: %v", err)
+		for _, table := range tables {
+			if exists("regclass", table) != want {
+				t.Errorf("after %s: table %s exists = %v, want %v", after, table, !want, want)
+			}
 		}
-		return n
+		// The trigger's function is dropped on its own, not with its table.
+		if exists("regproc", "notify_transfer_event") != want {
+			t.Errorf("after %s: notify_transfer_event exists = %v, want %v", after, !want, want)
+		}
 	}
 
-	if err := migrator.MigrateTo(ctx, 8); err != nil {
-		t.Fatalf("migrate to 8: %v", err)
+	if err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
 	}
-	if exists("transfers") || exists("transfer_messages") || oldTriggers() != 0 {
-		t.Error("the old transfer tables or their triggers survived migration 8")
+	version, err := migrator.GetCurrentVersion(ctx)
+	if err != nil {
+		t.Fatalf("current version: %v", err)
 	}
-	if !exists("code_transfers") {
-		t.Error("code_transfers is gone")
+	if version != 1 {
+		t.Errorf("version = %d, want the single migration", version)
 	}
+	assertSchema(true, "migrating up")
 
-	if err := migrator.MigrateTo(ctx, 7); err != nil {
-		t.Fatalf("migrate down to 7: %v", err)
+	if err := migrator.MigrateTo(ctx, 0); err != nil {
+		t.Fatalf("migrate down to 0: %v", err)
 	}
-	if !exists("transfers") || !exists("transfer_messages") || oldTriggers() != 2 {
-		t.Error("rolling back to 7 did not restore the old tables and triggers")
-	}
+	assertSchema(false, "rolling back")
 
-	if err := migrator.MigrateTo(ctx, 8); err != nil {
-		t.Fatalf("migrate to 8 again: %v", err)
+	if err := migrator.MigrateTo(ctx, 1); err != nil {
+		t.Fatalf("migrate to 1 again: %v", err)
 	}
+	assertSchema(true, "migrating up again")
 }
