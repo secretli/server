@@ -322,6 +322,9 @@ func TestRunCycle_KeepsCommittedBatchesAfterAnError(t *testing.T) {
 	if len(repo.expiredKeys) != batchSize {
 		t.Errorf("%d secrets left, want the first batch deleted before the error", len(repo.expiredKeys))
 	}
+	if got := counterValue(t, m.SecretsCleaned); got != batchSize {
+		t.Errorf("cleaned metric = %v, want %d", got, batchSize)
+	}
 	if got := counterValue(t, m.CleanupErrors); got != 1 {
 		t.Errorf("cleanup errors = %v, want 1", got)
 	}

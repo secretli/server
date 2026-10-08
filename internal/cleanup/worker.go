@@ -139,6 +139,7 @@ func (w *Worker) runCycle(ctx context.Context) {
 	})
 	if deleted > 0 {
 		slog.InfoContext(ctx, "cleanup: deleted secrets", "count", deleted)
+		w.metrics.SecretsCleaned.Add(float64(deleted))
 	}
 	if err != nil {
 		slog.ErrorContext(ctx, "cleanup: secret cleanup failed", "error", err)
