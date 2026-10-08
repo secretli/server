@@ -56,10 +56,9 @@ Environment variables; see [`.env.example`](.env.example).
 |---|---|---|
 | `SERVER_PORT` | HTTP port | `8080` |
 | `DATABASE_URL` | PostgreSQL connection string | — |
-| `S3_ENDPOINT` | S3-compatible endpoint, host:port or URL | — |
-| `S3_BUCKET` | bucket name, which must exist | `secretli` |
+| `S3_ENDPOINT` | URL of the S3-compatible API, with `http://` or `https://` | — |
+| `S3_BUCKET` | bucket name, which must exist | — |
 | `S3_ACCESS_KEY` / `S3_SECRET_KEY` | S3 credentials | — |
-| `S3_USE_SSL` | HTTPS for a bare host:port endpoint | `true` |
 | `S3_REGION` | region for request signing | `us-east-1` |
 | `MAX_FILE_SIZE` | encrypted upload limit in bytes | `1073741824` (1 GiB) |
 | `CLEANUP_INTERVAL` | how often expired secrets are removed | `1m` |

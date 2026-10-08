@@ -85,7 +85,8 @@ func startSeaweedFS() {
 
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "chrislusf/seaweedfs:latest",
+			// The version docker/docker-compose.yml runs.
+			Image:        "chrislusf/seaweedfs:4.21",
 			ExposedPorts: []string{"8333/tcp"},
 			Cmd:          []string{"server", "-s3", "-dir=/data"},
 			WaitingFor: wait.ForListeningPort("8333/tcp").
@@ -109,7 +110,7 @@ func startSeaweedFS() {
 		seaweedErr = err
 		return
 	}
-	endpoint := net.JoinHostPort(host, port.Port())
+	endpoint := "http://" + net.JoinHostPort(host, port.Port())
 	seaweedEnv.endpoint = endpoint
 
 	if err := createBucket(endpoint, testBucket); err != nil {
@@ -122,7 +123,6 @@ func startSeaweedFS() {
 		Bucket:    testBucket,
 		AccessKey: "admin",
 		SecretKey: "admin",
-		UseSSL:    false,
 		Region:    "us-east-1",
 	})
 	if err != nil {
@@ -134,7 +134,7 @@ func startSeaweedFS() {
 }
 
 func createBucket(endpoint, bucket string) error {
-	url := "http://" + endpoint + "/" + bucket
+	url := endpoint + "/" + bucket
 	deadline := time.Now().Add(10 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
@@ -318,7 +318,6 @@ func TestNewS3Client_BucketNotFound(t *testing.T) {
 		Bucket:    "nonexistent-bucket",
 		AccessKey: "admin",
 		SecretKey: "admin",
-		UseSSL:    false,
 		Region:    "us-east-1",
 	})
 	if err == nil {
