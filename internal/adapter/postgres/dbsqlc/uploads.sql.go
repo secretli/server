@@ -48,13 +48,12 @@ INSERT INTO upload_parts (
     part_offset,
     part_size,
     part_sha256,
-    etag,
-    created_at
+    etag
 )
 VALUES (
-    $1, $2, $3, $4, $5, $6, $7
+    $1, $2, $3, $4, $5, $6
 )
-RETURNING session_id, part_number, part_offset, part_size, part_sha256, etag, created_at
+RETURNING session_id, part_number, part_offset, part_size, part_sha256, etag
 `
 
 type CreateUploadPartParams struct {
@@ -64,7 +63,6 @@ type CreateUploadPartParams struct {
 	PartSize   int64
 	PartSha256 string
 	Etag       string
-	CreatedAt  pgtype.Timestamptz
 }
 
 func (q *Queries) CreateUploadPart(ctx context.Context, arg CreateUploadPartParams) (UploadPart, error) {
@@ -75,7 +73,6 @@ func (q *Queries) CreateUploadPart(ctx context.Context, arg CreateUploadPartPara
 		arg.PartSize,
 		arg.PartSha256,
 		arg.Etag,
-		arg.CreatedAt,
 	)
 	var i UploadPart
 	err := row.Scan(
@@ -85,7 +82,6 @@ func (q *Queries) CreateUploadPart(ctx context.Context, arg CreateUploadPartPara
 		&i.PartSize,
 		&i.PartSha256,
 		&i.Etag,
-		&i.CreatedAt,
 	)
 	return i, err
 }
@@ -218,7 +214,7 @@ func (q *Queries) GetUploadForUpdate(ctx context.Context, sessionID string) (Get
 }
 
 const getUploadPartForUpdate = `-- name: GetUploadPartForUpdate :one
-SELECT session_id, part_number, part_offset, part_size, part_sha256, etag, created_at
+SELECT session_id, part_number, part_offset, part_size, part_sha256, etag
 FROM upload_parts
 WHERE session_id = $1
   AND part_number = $2
@@ -240,7 +236,6 @@ func (q *Queries) GetUploadPartForUpdate(ctx context.Context, arg GetUploadPartF
 		&i.PartSize,
 		&i.PartSha256,
 		&i.Etag,
-		&i.CreatedAt,
 	)
 	return i, err
 }
@@ -281,7 +276,7 @@ func (q *Queries) ListExpiredUploadsForUpdate(ctx context.Context, arg ListExpir
 }
 
 const listUploadParts = `-- name: ListUploadParts :many
-SELECT session_id, part_number, part_offset, part_size, part_sha256, etag, created_at
+SELECT session_id, part_number, part_offset, part_size, part_sha256, etag
 FROM upload_parts
 WHERE session_id = $1
 ORDER BY part_number
@@ -303,7 +298,6 @@ func (q *Queries) ListUploadParts(ctx context.Context, sessionID string) ([]Uplo
 			&i.PartSize,
 			&i.PartSha256,
 			&i.Etag,
-			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

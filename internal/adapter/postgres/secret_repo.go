@@ -131,10 +131,7 @@ func (r *SecretRepo) Delete(ctx context.Context, publicID string, now time.Time)
 	}
 	// The cleanup removes the object from storage within a cycle; from now on
 	// nothing reads it.
-	if err := qtx.DoomObjects(ctx, dbsqlc.DoomObjectsParams{
-		NowAt:       timestamptz(now),
-		StorageKeys: validTexts([]pgtype.Text{row.StorageKey}),
-	}); err != nil {
+	if err := qtx.DoomObjects(ctx, validTexts([]pgtype.Text{row.StorageKey})); err != nil {
 		return fmt.Errorf("doom deleted secret's object: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {

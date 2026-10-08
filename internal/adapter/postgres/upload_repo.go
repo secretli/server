@@ -122,7 +122,6 @@ func (r *SecretRepo) RecordUploadPart(ctx context.Context, part *domain.UploadPa
 		PartSize:   part.Size,
 		PartSha256: part.SHA256,
 		Etag:       part.ETag,
-		CreatedAt:  timestamptz(part.CreatedAt),
 	})
 	if err != nil && isDuplicateKeyError(err) {
 		return nil, domain.ErrConflict
@@ -257,10 +256,7 @@ func abandonUploads(ctx context.Context, qtx *dbsqlc.Queries, sessionIDs []strin
 	if err != nil {
 		return fmt.Errorf("delete abandoned uploads' secrets: %w", err)
 	}
-	if err := qtx.DoomObjects(ctx, dbsqlc.DoomObjectsParams{
-		NowAt:       timestamptz(now),
-		StorageKeys: validTexts(storageKeys),
-	}); err != nil {
+	if err := qtx.DoomObjects(ctx, validTexts(storageKeys)); err != nil {
 		return fmt.Errorf("doom abandoned uploads' objects: %w", err)
 	}
 	return nil
@@ -297,6 +293,5 @@ func uploadPartFromRow(row dbsqlc.UploadPart) *domain.UploadPart {
 		Size:       row.PartSize,
 		SHA256:     row.PartSha256,
 		ETag:       row.Etag,
-		CreatedAt:  row.CreatedAt.Time,
 	}
 }

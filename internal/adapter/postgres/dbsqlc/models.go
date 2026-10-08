@@ -24,12 +24,12 @@ type CodeTransfer struct {
 }
 
 type Object struct {
-	StorageKey  string
-	State       string
-	S3UploadID  pgtype.Text
-	CreatedAt   pgtype.Timestamptz
-	DoomedAt    pgtype.Timestamptz
-	AttemptedAt pgtype.Timestamptz
+	StorageKey     string
+	State          string
+	S3UploadID     pgtype.Text
+	CreatedAt      pgtype.Timestamptz
+	Doomed         bool
+	FailedRemovals int32
 }
 
 type RetrievalSession struct {
@@ -70,5 +70,4 @@ type UploadPart struct {
 	PartSize   int64
 	PartSha256 string
 	Etag       string
-	CreatedAt  pgtype.Timestamptz
 }

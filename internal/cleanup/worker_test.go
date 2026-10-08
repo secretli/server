@@ -84,7 +84,6 @@ type mockRepo struct {
 	doomed           []*domain.Object
 	doomedCalls      int
 	doomedLimits     []int
-	doomedNows       []time.Time
 	doomedErr        error // fails the call numbered doomedErrAt, or every call when that is 0
 	doomedErrAt      int
 	afterDoomedBatch func() // like sqlBacklog.afterBatch
@@ -139,11 +138,10 @@ func (m *mockRepo) DeleteEndedTransfers(ctx context.Context, endedBefore time.Ti
 	return m.endedTransfers.run(endedBefore)
 }
 
-func (m *mockRepo) DeleteDoomedObjects(ctx context.Context, now time.Time, limit int, remove func(*domain.Object) error) (domain.CleanupBatch, error) {
+func (m *mockRepo) DeleteDoomedObjects(ctx context.Context, limit int, remove func(*domain.Object) error) (domain.CleanupBatch, error) {
 	m.called(ctx, "DeleteDoomedObjects")
 	m.doomedCalls++
 	m.doomedLimits = append(m.doomedLimits, limit)
-	m.doomedNows = append(m.doomedNows, now)
 	if m.doomedErr != nil && (m.doomedErrAt == 0 || m.doomedErrAt == m.doomedCalls) {
 		return domain.CleanupBatch{}, m.doomedErr
 	}
@@ -154,8 +152,8 @@ func (m *mockRepo) DeleteDoomedObjects(ctx context.Context, now time.Time, limit
 			kept = append(kept, object)
 		}
 	}
-	// Like the database: objects whose removal failed are marked as tried and
-	// move behind the ones not tried yet.
+	// Like the database: objects whose removal failed count one more failed
+	// removal and sink behind the rest.
 	m.doomed = append(slices.Clone(m.doomed[len(batch):]), kept...)
 	if m.afterDoomedBatch != nil {
 		m.afterDoomedBatch()
@@ -291,10 +289,6 @@ func TestRunCycle_RunsEverySweepWithItsCutoff(t *testing.T) {
 		if earliest, latest := before.Add(-c.retention), after.Add(-c.retention); c.cutoff.Before(earliest) || c.cutoff.After(latest) {
 			t.Errorf("%s: cutoff %v, want the cycle's start less %v, between %v and %v", c.sweep, c.cutoff, c.retention, earliest, latest)
 		}
-	}
-	// Objects that fail are marked as tried at the cycle's start.
-	if len(repo.doomedNows) != 1 || repo.doomedNows[0].Before(before) || repo.doomedNows[0].After(after) {
-		t.Errorf("object sweep now = %v, want the cycle's start once", repo.doomedNows)
 	}
 
 	// Batches are bounded, and only the object sweep touches storage.

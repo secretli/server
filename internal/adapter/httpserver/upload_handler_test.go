@@ -203,7 +203,7 @@ func (m *uploadMockRepo) AbortUpload(_ context.Context, sessionID string, now ti
 	if secret, ok := m.secrets[upload.PublicID]; ok && secret.State == domain.SecretUploading {
 		delete(m.secrets, upload.PublicID)
 		if object, ok := m.objects[secret.StorageKey]; ok {
-			object.DoomedAt = &now
+			object.Doomed = true
 		}
 	}
 	upload.PublicID = ""
@@ -223,7 +223,7 @@ func assertAbandoned(t *testing.T, repo *uploadMockRepo, upload *domain.Upload) 
 	if _, ok := repo.secrets[upload.PublicID]; ok {
 		t.Error("the abandoned upload's secret should be gone, freeing its public id")
 	}
-	if object := repo.objects[upload.StorageKey]; object == nil || object.DoomedAt == nil {
+	if object := repo.objects[upload.StorageKey]; object == nil || !object.Doomed {
 		t.Error("the abandoned upload's object should be doomed for the cleanup")
 	}
 }

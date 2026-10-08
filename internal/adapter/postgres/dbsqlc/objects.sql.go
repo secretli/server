@@ -11,6 +11,17 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const countFailedRemovals = `-- name: CountFailedRemovals :exec
+UPDATE objects
+SET failed_removals = failed_removals + 1
+WHERE storage_key = ANY($1::text[])
+`
+
+func (q *Queries) CountFailedRemovals(ctx context.Context, storageKeys []string) error {
+	_, err := q.db.Exec(ctx, countFailedRemovals, storageKeys)
+	return err
+}
+
 const createObject = `-- name: CreateObject :exec
 INSERT INTO objects (
     storage_key,
@@ -47,39 +58,33 @@ func (q *Queries) DeleteObjects(ctx context.Context, storageKeys []string) (int6
 
 const doomObjects = `-- name: DoomObjects :exec
 UPDATE objects
-SET doomed_at = $1
-WHERE storage_key = ANY($2::text[])
-  AND doomed_at IS NULL
+SET doomed = TRUE
+WHERE storage_key = ANY($1::text[])
 `
 
-type DoomObjectsParams struct {
-	NowAt       pgtype.Timestamptz
-	StorageKeys []string
-}
-
-func (q *Queries) DoomObjects(ctx context.Context, arg DoomObjectsParams) error {
-	_, err := q.db.Exec(ctx, doomObjects, arg.NowAt, arg.StorageKeys)
+func (q *Queries) DoomObjects(ctx context.Context, storageKeys []string) error {
+	_, err := q.db.Exec(ctx, doomObjects, storageKeys)
 	return err
 }
 
 const listDoomedObjectsForUpdate = `-- name: ListDoomedObjectsForUpdate :many
-SELECT o.storage_key, o.state, o.s3_upload_id, o.created_at, o.doomed_at, o.attempted_at
+SELECT o.storage_key, o.state, o.s3_upload_id, o.created_at, o.doomed, o.failed_removals
 FROM objects AS o
-WHERE o.doomed_at IS NOT NULL
+WHERE o.doomed
   AND NOT EXISTS (
       SELECT 1
       FROM secrets AS s
       WHERE s.storage_key = o.storage_key
   )
-ORDER BY o.attempted_at NULLS FIRST, o.doomed_at
+ORDER BY o.failed_removals, o.created_at
 LIMIT $1
 FOR UPDATE OF o SKIP LOCKED
 `
 
-// Doomed objects, one batch at a time: those not tried yet first, oldest
-// first, then those whose removal failed, the longest ago first. One a secret
-// still points at would be a bug; it is left alone rather than deleted from
-// under the secret.
+// Doomed objects, one batch at a time: the fewest failed removals first,
+// then the oldest, so objects that storage keeps refusing sink behind the
+// rest. One a secret still points at would be a bug; it is left alone rather
+// than deleted from under the secret.
 func (q *Queries) ListDoomedObjectsForUpdate(ctx context.Context, batchSize int32) ([]Object, error) {
 	rows, err := q.db.Query(ctx, listDoomedObjectsForUpdate, batchSize)
 	if err != nil {
@@ -94,8 +99,8 @@ func (q *Queries) ListDoomedObjectsForUpdate(ctx context.Context, batchSize int3
 			&i.State,
 			&i.S3UploadID,
 			&i.CreatedAt,
-			&i.DoomedAt,
-			&i.AttemptedAt,
+			&i.Doomed,
+			&i.FailedRemovals,
 		); err != nil {
 			return nil, err
 		}
@@ -115,22 +120,6 @@ WHERE storage_key = $1
 
 func (q *Queries) MarkObjectStored(ctx context.Context, storageKey string) error {
 	_, err := q.db.Exec(ctx, markObjectStored, storageKey)
-	return err
-}
-
-const markObjectsAttempted = `-- name: MarkObjectsAttempted :exec
-UPDATE objects
-SET attempted_at = $1
-WHERE storage_key = ANY($2::text[])
-`
-
-type MarkObjectsAttemptedParams struct {
-	NowAt       pgtype.Timestamptz
-	StorageKeys []string
-}
-
-func (q *Queries) MarkObjectsAttempted(ctx context.Context, arg MarkObjectsAttemptedParams) error {
-	_, err := q.db.Exec(ctx, markObjectsAttempted, arg.NowAt, arg.StorageKeys)
 	return err
 }
 

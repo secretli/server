@@ -21,30 +21,29 @@ WHERE storage_key = $1;
 
 -- name: DoomObjects :exec
 UPDATE objects
-SET doomed_at = sqlc.arg(now_at)
-WHERE storage_key = ANY(sqlc.arg(storage_keys)::text[])
-  AND doomed_at IS NULL;
+SET doomed = TRUE
+WHERE storage_key = ANY(sqlc.arg(storage_keys)::text[]);
 
 -- name: ListDoomedObjectsForUpdate :many
--- Doomed objects, one batch at a time: those not tried yet first, oldest
--- first, then those whose removal failed, the longest ago first. One a secret
--- still points at would be a bug; it is left alone rather than deleted from
--- under the secret.
+-- Doomed objects, one batch at a time: the fewest failed removals first,
+-- then the oldest, so objects that storage keeps refusing sink behind the
+-- rest. One a secret still points at would be a bug; it is left alone rather
+-- than deleted from under the secret.
 SELECT o.*
 FROM objects AS o
-WHERE o.doomed_at IS NOT NULL
+WHERE o.doomed
   AND NOT EXISTS (
       SELECT 1
       FROM secrets AS s
       WHERE s.storage_key = o.storage_key
   )
-ORDER BY o.attempted_at NULLS FIRST, o.doomed_at
+ORDER BY o.failed_removals, o.created_at
 LIMIT sqlc.arg(batch_size)
 FOR UPDATE OF o SKIP LOCKED;
 
--- name: MarkObjectsAttempted :exec
+-- name: CountFailedRemovals :exec
 UPDATE objects
-SET attempted_at = sqlc.arg(now_at)
+SET failed_removals = failed_removals + 1
 WHERE storage_key = ANY(sqlc.arg(storage_keys)::text[]);
 
 -- name: DeleteObjects :execrows
