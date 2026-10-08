@@ -416,7 +416,7 @@ func TestCleanupRepo_DeleteDoomedObjects(t *testing.T) {
 	mustCreate(t, repo, newTestSecret("live", now.Add(time.Hour)))
 
 	var got []domain.Object
-	batch, err := repo.DeleteDoomedObjects(ctx, testBatchSize, func(object *domain.Object) error {
+	batch, err := repo.DeleteDoomedObjects(ctx, time.Now(), testBatchSize, func(object *domain.Object) error {
 		got = append(got, *object)
 		return nil
 	})
@@ -452,7 +452,7 @@ func TestCleanupRepo_DeleteDoomedObjects(t *testing.T) {
 	}
 	assertNotDoomed(t, pool, domain.UploadStorageKey(uploadSessionOf("live")))
 
-	if batch, err := repo.DeleteDoomedObjects(ctx, testBatchSize, removeAll(new([]string))); err != nil || batch != (domain.CleanupBatch{}) {
+	if batch, err := repo.DeleteDoomedObjects(ctx, time.Now(), testBatchSize, removeAll(new([]string))); err != nil || batch != (domain.CleanupBatch{}) {
 		t.Errorf("second run = %+v, %v; want nothing left", batch, err)
 	}
 }
@@ -470,7 +470,8 @@ func TestCleanupRepo_DeleteDoomedObjectsKeepsTheOnesStorageFailedFor(t *testing.
 	}
 	stuckKey := domain.UploadStorageKey(uploadSessionOf("stuck"))
 
-	batch, err := repo.DeleteDoomedObjects(ctx, testBatchSize, func(object *domain.Object) error {
+	tried := moment(time.Now())
+	batch, err := repo.DeleteDoomedObjects(ctx, tried, testBatchSize, func(object *domain.Object) error {
 		if object.StorageKey == stuckKey {
 			return errors.New("storage unavailable")
 		}
@@ -485,16 +486,59 @@ func TestCleanupRepo_DeleteDoomedObjectsKeepsTheOnesStorageFailedFor(t *testing.
 		t.Errorf("batch = %+v, want 2 found, 1 removed", batch)
 	}
 	assertDoomed(t, pool, stuckKey, now)
+	if attempted := mustGetObject(t, pool, stuckKey).AttemptedAt; attempted == nil || !attempted.Equal(tried) {
+		t.Errorf("attempted_at = %v, want the failed try, %v", attempted, tried)
+	}
 	if getObject(t, pool, domain.UploadStorageKey(uploadSessionOf("ok"))) != nil {
 		t.Error("removed object is still in the ledger")
 	}
 
 	var seen []string
-	if batch, err := repo.DeleteDoomedObjects(ctx, testBatchSize, removeAll(&seen)); err != nil || batch != (domain.CleanupBatch{Found: 1, Removed: 1}) {
+	if batch, err := repo.DeleteDoomedObjects(ctx, time.Now(), testBatchSize, removeAll(&seen)); err != nil || batch != (domain.CleanupBatch{Found: 1, Removed: 1}) {
 		t.Errorf("retry = %+v, %v; want the kept object removed", batch, err)
 	}
 	if !slices.Equal(seen, []string{stuckKey}) {
 		t.Errorf("retry removed %v, want %s", seen, stuckKey)
+	}
+}
+
+func TestCleanupRepo_DeleteDoomedObjectsTriesUntriedOnesFirst(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	ctx := context.Background()
+	now := moment(time.Now())
+	// Doomed oldest first: stuck, then next, then last.
+	for i, id := range []string{"stuck", "next", "last"} {
+		mustCreate(t, repo, newTestSecret(id, now.Add(time.Hour)))
+		if err := repo.Delete(ctx, id, now.Add(time.Duration(i)*time.Second)); err != nil {
+			t.Fatalf("delete %s: %v", id, err)
+		}
+	}
+	key := func(id string) string { return domain.UploadStorageKey(uploadSessionOf(id)) }
+	refuse := func(object *domain.Object) error {
+		if object.StorageKey == key("stuck") {
+			return errors.New("storage refuses this one")
+		}
+		return nil
+	}
+
+	// One object per batch: the oldest fails, and the next batches take the
+	// ones not tried yet before trying it again, so an object storage keeps
+	// refusing cannot hold up the rest.
+	var order []string
+	for range 4 {
+		if _, err := repo.DeleteDoomedObjects(ctx, now.Add(time.Minute), 1, func(object *domain.Object) error {
+			order = append(order, object.StorageKey)
+			return refuse(object)
+		}); err != nil {
+			t.Fatalf("delete doomed objects: %v", err)
+		}
+	}
+	if want := []string{key("stuck"), key("next"), key("last"), key("stuck")}; !slices.Equal(order, want) {
+		t.Errorf("tried %v, want %v", order, want)
+	}
+	if left := countRows(t, pool, "SELECT count(*) FROM objects"); left != 1 {
+		t.Errorf("objects left = %d, want only the refused one", left)
 	}
 }
 
@@ -511,10 +555,10 @@ func TestCleanupRepo_DeleteDoomedObjectsInBatches(t *testing.T) {
 	}
 
 	var seen []string
-	if batch, err := repo.DeleteDoomedObjects(ctx, 2, removeAll(&seen)); err != nil || batch != (domain.CleanupBatch{Found: 2, Removed: 2}) {
+	if batch, err := repo.DeleteDoomedObjects(ctx, time.Now(), 2, removeAll(&seen)); err != nil || batch != (domain.CleanupBatch{Found: 2, Removed: 2}) {
 		t.Errorf("first batch = %+v, %v; want 2", batch, err)
 	}
-	if batch, err := repo.DeleteDoomedObjects(ctx, 2, removeAll(&seen)); err != nil || batch != (domain.CleanupBatch{Found: 1, Removed: 1}) {
+	if batch, err := repo.DeleteDoomedObjects(ctx, time.Now(), 2, removeAll(&seen)); err != nil || batch != (domain.CleanupBatch{Found: 1, Removed: 1}) {
 		t.Errorf("second batch = %+v, %v; want 1", batch, err)
 	}
 	want := []string{
@@ -541,7 +585,7 @@ func TestCleanupRepo_DeleteDoomedObjectsLeavesObjectsASecretStillHolds(t *testin
 		t.Fatalf("doom held object: %v", err)
 	}
 
-	batch, err := repo.DeleteDoomedObjects(ctx, testBatchSize, func(*domain.Object) error {
+	batch, err := repo.DeleteDoomedObjects(ctx, time.Now(), testBatchSize, func(*domain.Object) error {
 		t.Error("remove ran for an object a secret still holds")
 		return nil
 	})
@@ -615,7 +659,7 @@ func TestCleanupRepo_NothingOutlivesASecret(t *testing.T) {
 				{"drained secrets", func() error { _, err := repo.ReleaseDrainedSecrets(ctx, later, testBatchSize); return err }},
 				{"expired secrets", func() error { _, err := repo.DeleteExpiredSecrets(ctx, later, testBatchSize); return err }},
 				{"doomed objects", func() error {
-					_, err := repo.DeleteDoomedObjects(ctx, testBatchSize, removeAll(&removed))
+					_, err := repo.DeleteDoomedObjects(ctx, time.Now(), testBatchSize, removeAll(&removed))
 					return err
 				}},
 			}

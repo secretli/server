@@ -78,8 +78,8 @@ func TestMigration_AppliesRollsBackAndAppliesAgain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current version: %v", err)
 	}
-	if version != 1 {
-		t.Errorf("version = %d, want the single migration", version)
+	if version != 2 {
+		t.Errorf("version = %d, want both migrations", version)
 	}
 	assertSchema(true, "migrating up")
 
@@ -88,8 +88,8 @@ func TestMigration_AppliesRollsBackAndAppliesAgain(t *testing.T) {
 	}
 	assertSchema(false, "rolling back")
 
-	if err := migrator.MigrateTo(ctx, 1); err != nil {
-		t.Fatalf("migrate to 1 again: %v", err)
+	if err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("migrate up again: %v", err)
 	}
 	assertSchema(true, "migrating up again")
 }

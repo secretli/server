@@ -23,4 +23,6 @@ type Object struct {
 	CreatedAt  time.Time
 	// DoomedAt is set once nothing may read the object any more.
 	DoomedAt *time.Time
+	// AttemptedAt is when the cleanup last failed to remove it.
+	AttemptedAt *time.Time
 }
