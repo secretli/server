@@ -35,7 +35,7 @@ type Repo interface {
 	DeleteFinishedUploads(ctx context.Context, finishedBefore time.Time) (int64, error)
 	ReleaseDrainedSecrets(ctx context.Context, now time.Time, limit int) (int, error)
 	DeleteExpiredSecrets(ctx context.Context, now time.Time, limit int) (int, error)
-	DeleteDoomedObjects(ctx context.Context, limit int, remove func(object *domain.Object) error) (domain.CleanupBatch, error)
+	DeleteDoomedObjects(ctx context.Context, now time.Time, limit int, remove func(object *domain.Object) error) (domain.CleanupBatch, error)
 	DeleteEndedTransfers(ctx context.Context, endedBefore time.Time) (int64, error)
 }
 
@@ -100,7 +100,7 @@ func (w *Worker) runCycle(ctx context.Context) {
 	})
 
 	removed, err := drainBatches(ctx, func() (domain.CleanupBatch, error) {
-		return w.repo.DeleteDoomedObjects(ctx, batchSize, func(object *domain.Object) error {
+		return w.repo.DeleteDoomedObjects(ctx, now, batchSize, func(object *domain.Object) error {
 			// The object stays doomed and is tried again next cycle. Count it,
 			// so storage refusing deletes shows in the metrics, not only in
 			// the log.
@@ -173,9 +173,10 @@ func drainSQL(ctx context.Context, batch func() (int, error)) (int64, error) {
 // many rows were removed. It stops at a short batch (nothing left), at a
 // batch that removed nothing (every row failed, e.g. storage is down; the
 // next cycle retries) or at an error, whose earlier batches stay committed.
-// Rows that fail are picked up again by the next batch alongside new ones,
-// so a few bad rows cannot stall the rest. Every batch either removes a row
-// or ends the loop, so it ends.
+// Objects that fail are marked as tried and come after the ones not tried
+// yet, so even a full batch of objects that storage keeps refusing cannot
+// stall the rest. Every batch either removes a row or ends the loop, so it
+// ends.
 func drainBatches(ctx context.Context, batch func() (domain.CleanupBatch, error)) (int, error) {
 	removed := 0
 	for ctx.Err() == nil {

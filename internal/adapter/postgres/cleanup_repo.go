@@ -145,12 +145,13 @@ func (r *SecretRepo) DeleteExpiredSecrets(ctx context.Context, now time.Time, li
 	return int(deleted), nil
 }
 
-// DeleteDoomedObjects removes one batch of at most limit doomed objects,
-// oldest first. remove runs for each row while it is locked and must delete
-// the object from storage; rows it fails for are kept for a later cycle.
-// Nothing but this sweep locks a doomed object's row, so the storage calls
-// hold up no request.
-func (r *SecretRepo) DeleteDoomedObjects(ctx context.Context, limit int, remove func(object *domain.Object) error) (domain.CleanupBatch, error) {
+// DeleteDoomedObjects removes one batch of at most limit doomed objects:
+// those not tried yet first, oldest first, then those whose removal failed,
+// the longest ago first. remove runs for each row while it is locked and must
+// delete the object from storage; rows it fails for are kept, marked as tried
+// at now, so they move behind the rest. Nothing but this sweep locks a doomed
+// object's row, so the storage calls hold up no request.
+func (r *SecretRepo) DeleteDoomedObjects(ctx context.Context, now time.Time, limit int, remove func(object *domain.Object) error) (domain.CleanupBatch, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return domain.CleanupBatch{}, fmt.Errorf("begin doomed objects tx: %w", err)
@@ -167,13 +168,23 @@ func (r *SecretRepo) DeleteDoomedObjects(ctx context.Context, limit int, remove 
 	// statement aborts the whole transaction, so there is no deleting row by
 	// row and carrying on after an error.
 	removed := make([]string, 0, len(rows))
+	var failed []string
 	for _, row := range rows {
 		object := objectFromRow(row)
 		if err := remove(object); err != nil {
 			slog.ErrorContext(ctx, "cleanup: removing object failed, keeping it", "storage_key", object.StorageKey, "error", err)
+			failed = append(failed, object.StorageKey)
 			continue
 		}
 		removed = append(removed, object.StorageKey)
+	}
+	if len(failed) > 0 {
+		if err := qtx.MarkObjectsAttempted(ctx, dbsqlc.MarkObjectsAttemptedParams{
+			NowAt:       timestamptz(now),
+			StorageKeys: failed,
+		}); err != nil {
+			return domain.CleanupBatch{}, fmt.Errorf("mark objects attempted: %w", err)
+		}
 	}
 
 	var deleted int64
@@ -190,10 +201,11 @@ func (r *SecretRepo) DeleteDoomedObjects(ctx context.Context, limit int, remove 
 
 func objectFromRow(row dbsqlc.Object) *domain.Object {
 	return &domain.Object{
-		StorageKey: row.StorageKey,
-		State:      domain.ObjectState(row.State),
-		S3UploadID: row.S3UploadID.String,
-		CreatedAt:  row.CreatedAt.Time,
-		DoomedAt:   pointerFromTimestamp(row.DoomedAt),
+		StorageKey:  row.StorageKey,
+		State:       domain.ObjectState(row.State),
+		S3UploadID:  row.S3UploadID.String,
+		CreatedAt:   row.CreatedAt.Time,
+		DoomedAt:    pointerFromTimestamp(row.DoomedAt),
+		AttemptedAt: pointerFromTimestamp(row.AttemptedAt),
 	}
 }

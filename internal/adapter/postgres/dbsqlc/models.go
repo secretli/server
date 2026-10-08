@@ -24,11 +24,12 @@ type CodeTransfer struct {
 }
 
 type Object struct {
-	StorageKey string
-	State      string
-	S3UploadID pgtype.Text
-	CreatedAt  pgtype.Timestamptz
-	DoomedAt   pgtype.Timestamptz
+	StorageKey  string
+	State       string
+	S3UploadID  pgtype.Text
+	CreatedAt   pgtype.Timestamptz
+	DoomedAt    pgtype.Timestamptz
+	AttemptedAt pgtype.Timestamptz
 }
 
 type RetrievalSession struct {

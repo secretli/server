@@ -63,7 +63,7 @@ func (q *Queries) DoomObjects(ctx context.Context, arg DoomObjectsParams) error 
 }
 
 const listDoomedObjectsForUpdate = `-- name: ListDoomedObjectsForUpdate :many
-SELECT o.storage_key, o.state, o.s3_upload_id, o.created_at, o.doomed_at
+SELECT o.storage_key, o.state, o.s3_upload_id, o.created_at, o.doomed_at, o.attempted_at
 FROM objects AS o
 WHERE o.doomed_at IS NOT NULL
   AND NOT EXISTS (
@@ -71,14 +71,15 @@ WHERE o.doomed_at IS NOT NULL
       FROM secrets AS s
       WHERE s.storage_key = o.storage_key
   )
-ORDER BY o.doomed_at
+ORDER BY o.attempted_at NULLS FIRST, o.doomed_at
 LIMIT $1
 FOR UPDATE OF o SKIP LOCKED
 `
 
-// Doomed objects, oldest first, one batch at a time. One a secret still
-// points at would be a bug; it is left alone rather than deleted from under
-// the secret.
+// Doomed objects, one batch at a time: those not tried yet first, oldest
+// first, then those whose removal failed, the longest ago first. One a secret
+// still points at would be a bug; it is left alone rather than deleted from
+// under the secret.
 func (q *Queries) ListDoomedObjectsForUpdate(ctx context.Context, batchSize int32) ([]Object, error) {
 	rows, err := q.db.Query(ctx, listDoomedObjectsForUpdate, batchSize)
 	if err != nil {
@@ -94,6 +95,7 @@ func (q *Queries) ListDoomedObjectsForUpdate(ctx context.Context, batchSize int3
 			&i.S3UploadID,
 			&i.CreatedAt,
 			&i.DoomedAt,
+			&i.AttemptedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -113,6 +115,22 @@ WHERE storage_key = $1
 
 func (q *Queries) MarkObjectStored(ctx context.Context, storageKey string) error {
 	_, err := q.db.Exec(ctx, markObjectStored, storageKey)
+	return err
+}
+
+const markObjectsAttempted = `-- name: MarkObjectsAttempted :exec
+UPDATE objects
+SET attempted_at = $1
+WHERE storage_key = ANY($2::text[])
+`
+
+type MarkObjectsAttemptedParams struct {
+	NowAt       pgtype.Timestamptz
+	StorageKeys []string
+}
+
+func (q *Queries) MarkObjectsAttempted(ctx context.Context, arg MarkObjectsAttemptedParams) error {
+	_, err := q.db.Exec(ctx, markObjectsAttempted, arg.NowAt, arg.StorageKeys)
 	return err
 }
 
