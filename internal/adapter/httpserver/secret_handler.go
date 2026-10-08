@@ -1,7 +1,6 @@
 package httpserver
 
 import (
-	"context"
 	cryptorand "crypto/rand"
 	"encoding/base64"
 	"errors"
@@ -180,7 +179,7 @@ func (h *SecretHandler) SecretMetadata(c echo.Context) error {
 		BurnAfterRead: secret.BurnAfterRead,
 		ExpiresAt:     secret.ExpiresAt.UTC().Format(time.RFC3339),
 		CreatedAt:     secret.CreatedAt.UTC().Format(time.RFC3339),
-		OpenedAt:      rfc3339Pointer(secret.RetrievedAt),
+		Opened:        secret.Opened,
 	})
 }
 
@@ -205,9 +204,9 @@ func (h *SecretHandler) DeleteSecret(c echo.Context) error {
 		return apperrors.ForbiddenError("invalid deletion token")
 	}
 
-	// Deleting ends the secret at once: from now on nothing reads it, and the
-	// cleanup removes its object and row as for any expired secret. If it
-	// expired since it was read above, it is over either way.
+	// Deleting ends the secret at once and dooms its object: from now on
+	// nothing reads it, and the cleanup removes the object within a cycle. If
+	// the secret expired since it was read above, it is over either way.
 	if err := h.repo.Delete(ctx, secret.PublicID, time.Now()); err != nil && !errors.Is(err, domain.ErrNotFound) {
 		return apperrors.InternalError("failed to delete secret", err)
 	}
@@ -235,64 +234,37 @@ func (h *SecretHandler) authenticateMetadata(c echo.Context) (*domain.Secret, er
 	tokenHash := crypto.TokenHash(token)
 	now := time.Now()
 
-	secret, err := h.repo.GetByPublicID(r.Context(), publicID, now)
+	secret, err := h.repo.GetSecret(r.Context(), publicID)
 	if errors.Is(err, domain.ErrNotFound) {
-		return nil, h.secretGone(r.Context(), publicID, tokenHash, now)
+		return nil, apperrors.NotFoundError("secret not found")
 	}
 	if err != nil {
 		return nil, apperrors.InternalError("failed to get secret", err)
 	}
 
-	if !crypto.TokensEqual(tokenHash, secret.MetadataTokenHash) {
-		return nil, apperrors.ForbiddenError("invalid token")
+	switch {
+	case secret.Readable(now):
+		if !crypto.TokensEqual(tokenHash, secret.MetadataTokenHash) {
+			return nil, apperrors.ForbiddenError("invalid token")
+		}
+		return secret, nil
+	case secret.Ended(now) && crypto.TokensEqual(tokenHash, secret.MetadataTokenHash):
+		// Until the secret expires, its link is told how it ended.
+		return nil, apperrors.GoneError("secret is gone", goneDetails(secret))
+	default:
+		// An upload under way, a secret past its expiry, or the wrong token
+		// for an ended one: there is nothing to tell.
+		return nil, apperrors.NotFoundError("secret not found")
 	}
-
-	// A consumed one-time secret stays on file while its download runs, but
-	// to everyone else it is gone.
-	if secret.BurnAfterRead && secret.RetrievedAt != nil {
-		return nil, h.secretGone(r.Context(), publicID, tokenHash, now)
-	}
-
-	return secret, nil
 }
 
-// secretGone answers for a secret that is not there any more: with what
-// became of it, when the request carries the link's metadata token, and with
-// a plain not found otherwise.
-func (h *SecretHandler) secretGone(ctx context.Context, publicID, metadataTokenHash string, now time.Time) error {
-	tomb, err := h.repo.GetTombstone(ctx, publicID, now)
-	if errors.Is(err, domain.ErrNotFound) {
-		return apperrors.NotFoundError("secret not found")
+// goneDetails is what a link is told about a secret that has ended: how, and
+// nothing else.
+func goneDetails(secret *domain.Secret) map[string]any {
+	return map[string]any{
+		"outcome":         string(secret.Outcome),
+		"burn_after_read": secret.BurnAfterRead,
 	}
-	if err != nil {
-		return apperrors.InternalError("failed to look up secret", err)
-	}
-	if !crypto.TokensEqual(metadataTokenHash, tomb.MetadataTokenHash) {
-		return apperrors.NotFoundError("secret not found")
-	}
-	return apperrors.GoneError("secret is gone", tombstoneDetails(tomb))
-}
-
-// tombstoneDetails is what a client is told about a secret that is gone.
-func tombstoneDetails(tomb *domain.SecretTombstone) map[string]any {
-	details := map[string]any{
-		"outcome":         string(tomb.Outcome),
-		"burn_after_read": tomb.BurnAfterRead,
-		"ended_at":        tomb.EndedAt.UTC().Format(time.RFC3339),
-		"opened_by_owner": tomb.OpenedByOwner,
-	}
-	if tomb.FirstOpenedAt != nil {
-		details["first_opened_at"] = tomb.FirstOpenedAt.UTC().Format(time.RFC3339)
-	}
-	return details
-}
-
-func rfc3339Pointer(t *time.Time) *string {
-	if t == nil {
-		return nil
-	}
-	s := t.UTC().Format(time.RFC3339)
-	return &s
 }
 
 var expirationDurations = map[string]time.Duration{

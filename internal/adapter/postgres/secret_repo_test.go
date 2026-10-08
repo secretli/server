@@ -3,10 +3,12 @@ package postgres_test
 import (
 	"context"
 	"errors"
-	"strings"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	pgadapter "github.com/secretli/server/internal/adapter/postgres"
 	"github.com/secretli/server/internal/domain"
@@ -15,6 +17,11 @@ import (
 
 // testBatchSize is larger than any test's backlog unless a test is about batching.
 const testBatchSize = 100
+
+// Postgres keeps microseconds, so moments that are compared are rounded first.
+func moment(t time.Time) time.Time {
+	return t.Truncate(time.Microsecond)
+}
 
 func newTestSecret(publicID string, expiresAt time.Time) *domain.Secret {
 	return &domain.Secret{
@@ -26,519 +33,514 @@ func newTestSecret(publicID string, expiresAt time.Time) *domain.Secret {
 		BlobSize:          1024,
 		BurnAfterRead:     false,
 		ExpiresAt:         expiresAt,
-		StorageKey:        "secrets/" + publicID,
 	}
 }
 
-func markRetrieved(t *testing.T, pool *pgxpool.Pool, publicID string) {
+// newTestUpload returns the upload under sessionID that creates secret, and
+// points the secret at the session's own object, as the service does.
+func newTestUpload(sessionID string, secret *domain.Secret, expiresAt time.Time) *domain.Upload {
+	secret.StorageKey = domain.UploadStorageKey(sessionID)
+	return &domain.Upload{
+		SessionID:       sessionID,
+		UploadTokenHash: tokencrypto.TokenHash("upload-token-" + sessionID),
+		ExpiresAt:       expiresAt,
+	}
+}
+
+// uploadSessionOf is the session mustCreate uploads a secret under.
+func uploadSessionOf(publicID string) string {
+	return "upload-" + publicID
+}
+
+func mustStartUpload(t *testing.T, repo *pgadapter.SecretRepo, sessionID string, secret *domain.Secret, uploadExpiresAt, now time.Time) {
 	t.Helper()
-	if _, err := pool.Exec(context.Background(), "UPDATE secrets SET retrieved_at = $2 WHERE public_id = $1", publicID, time.Now()); err != nil {
-		t.Fatalf("mark retrieved %s: %v", publicID, err)
+	if err := repo.StartUpload(context.Background(), secret, newTestUpload(sessionID, secret, uploadExpiresAt), now); err != nil {
+		t.Fatalf("start upload %s for %s: %v", sessionID, secret.PublicID, err)
 	}
 }
 
-func TestSecretRepo_CreateAndGet(t *testing.T) {
-	pool := setupTestDB(t)
-	repo := pgadapter.NewSecretRepo(pool)
-	ctx := context.Background()
-
-	secret := newTestSecret("pub-001", time.Now().Add(1*time.Hour))
-	if err := repo.Create(ctx, secret, time.Now()); err != nil {
-		t.Fatalf("create secret: %v", err)
-	}
-
-	got, err := repo.GetByPublicID(ctx, "pub-001", time.Now())
-	if err != nil {
-		t.Fatalf("get secret: %v", err)
-	}
-
-	if got.PublicID != "pub-001" {
-		t.Errorf("public_id = %q, want %q", got.PublicID, "pub-001")
-	}
-	if got.MetadataTokenHash != tokencrypto.TokenHash("metadata-token-pub-001") {
-		t.Errorf("metadata_token_hash = %q, want hash", got.MetadataTokenHash)
-	}
-	if got.BlobTokenHash != tokencrypto.TokenHash("blob-token-pub-001") {
-		t.Errorf("blob_token_hash = %q, want hash", got.BlobTokenHash)
-	}
-	if got.DeletionTokenHash != tokencrypto.TokenHash("deletion-token-pub-001") {
-		t.Errorf("deletion_token_hash = %q, want hash", got.DeletionTokenHash)
-	}
-	if got.EncryptedMeta != "v2$nonce$meta-pub-001" {
-		t.Errorf("encrypted_meta = %q, want %q", got.EncryptedMeta, "v2$nonce$meta-pub-001")
-	}
-	if got.BlobSize != 1024 {
-		t.Errorf("blob_size = %d, want %d", got.BlobSize, 1024)
-	}
-	if got.CreatedAt.IsZero() {
-		t.Error("expected non-zero created_at")
+func mustComplete(t *testing.T, repo *pgadapter.SecretRepo, sessionID string, now time.Time) {
+	t.Helper()
+	if _, err := repo.CompleteUpload(context.Background(), sessionID, now, noopFinalize); err != nil {
+		t.Fatalf("complete upload %s: %v", sessionID, err)
 	}
 }
 
-func TestSecretRepo_CreateDuplicate(t *testing.T) {
-	pool := setupTestDB(t)
-	repo := pgadapter.NewSecretRepo(pool)
-	ctx := context.Background()
-
-	secret := newTestSecret("dup-001", time.Now().Add(1*time.Hour))
-	if err := repo.Create(ctx, secret, time.Now()); err != nil {
-		t.Fatalf("create first: %v", err)
-	}
-
-	secret2 := newTestSecret("dup-001", time.Now().Add(2*time.Hour))
-	err := repo.Create(ctx, secret2, time.Now())
-	if !errors.Is(err, domain.ErrDuplicate) {
-		t.Fatalf("expected ErrDuplicate, got %v", err)
-	}
+// mustCreate uploads a live secret. Neither step looks at the secret's
+// expiry, so it also makes secrets that have already expired.
+func mustCreate(t *testing.T, repo *pgadapter.SecretRepo, secret *domain.Secret) {
+	t.Helper()
+	now := time.Now()
+	sessionID := uploadSessionOf(secret.PublicID)
+	mustStartUpload(t, repo, sessionID, secret, now.Add(time.Hour), now)
+	mustComplete(t, repo, sessionID, now)
 }
 
-func TestSecretRepo_GetExpired(t *testing.T) {
-	pool := setupTestDB(t)
-	repo := pgadapter.NewSecretRepo(pool)
-	ctx := context.Background()
-
-	secret := newTestSecret("expired-001", time.Now().Add(-1*time.Hour))
-	if err := repo.Create(ctx, secret, time.Now()); err != nil {
-		t.Fatalf("create expired secret: %v", err)
+// openAs starts a retrieval session on a secret made by newTestSecret, as a
+// recipient, or as the owner when asOwner is set.
+func openAs(repo *pgadapter.SecretRepo, publicID, session string, asOwner bool, now time.Time) (*domain.Secret, error) {
+	deletionHash := ""
+	if asOwner {
+		deletionHash = tokencrypto.TokenHash("deletion-token-" + publicID)
 	}
-
-	_, err := repo.GetByPublicID(ctx, "expired-001", time.Now())
-	if !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("expected ErrNotFound for expired secret, got %v", err)
-	}
-}
-
-func TestSecretRepo_RetrievalSession(t *testing.T) {
-	pool := setupTestDB(t)
-	repo := pgadapter.NewSecretRepo(pool)
-	ctx := context.Background()
-
-	secret := newTestSecret("session-001", time.Now().Add(1*time.Hour))
-	if err := repo.Create(ctx, secret, time.Now()); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-
-	sessionHash := tokencrypto.TokenHash("session-token")
-	got, err := repo.StartRetrievalSession(
-		ctx,
-		"session-001",
-		tokencrypto.TokenHash("blob-token-session-001"),
-		"",
-		sessionHash,
-		time.Now().Add(15*time.Minute),
-		time.Now(),
+	return repo.StartRetrievalSession(
+		context.Background(),
+		publicID,
+		tokencrypto.TokenHash("blob-token-"+publicID),
+		deletionHash,
+		tokencrypto.TokenHash(session),
+		now.Add(15*time.Minute),
+		now,
 	)
+}
+
+func mustOpen(t *testing.T, repo *pgadapter.SecretRepo, publicID, session string, asOwner bool, now time.Time) *domain.Secret {
+	t.Helper()
+	secret, err := openAs(repo, publicID, session, asOwner, now)
 	if err != nil {
-		t.Fatalf("start retrieval session: %v", err)
+		t.Fatalf("open %s: %v", publicID, err)
 	}
-	if got.PublicID != "session-001" {
-		t.Errorf("public_id = %q, want %q", got.PublicID, "session-001")
-	}
+	return secret
+}
 
-	got, err = repo.GetByRetrievalSession(ctx, "session-001", sessionHash, time.Now())
+func download(repo *pgadapter.SecretRepo, publicID, session string, now time.Time) (*domain.Secret, error) {
+	return repo.GetByRetrievalSession(context.Background(), publicID, tokencrypto.TokenHash(session), now)
+}
+
+func mustGetSecret(t *testing.T, repo *pgadapter.SecretRepo, publicID string) *domain.Secret {
+	t.Helper()
+	secret, err := repo.GetSecret(context.Background(), publicID)
 	if err != nil {
-		t.Fatalf("get by retrieval session: %v", err)
+		t.Fatalf("get secret %s: %v", publicID, err)
 	}
-	if got.PublicID != "session-001" {
-		t.Errorf("session public_id = %q, want %q", got.PublicID, "session-001")
-	}
+	return secret
+}
 
-	_, err = repo.GetByRetrievalSession(ctx, "session-001", tokencrypto.TokenHash("wrong-session"), time.Now())
-	if !errors.Is(err, domain.ErrForbidden) {
-		t.Fatalf("expected ErrForbidden for wrong session, got %v", err)
-	}
-
-	_, err = repo.StartRetrievalSession(
-		ctx,
-		"session-001",
-		tokencrypto.TokenHash("wrong-blob-token"),
-		"",
-		tokencrypto.TokenHash("session-token-wrong-blob"),
-		time.Now().Add(15*time.Minute),
-		time.Now(),
-	)
-	if !errors.Is(err, domain.ErrForbidden) {
-		t.Fatalf("expected ErrForbidden for wrong blob token, got %v", err)
+func assertSecretGone(t *testing.T, repo *pgadapter.SecretRepo, publicID string) {
+	t.Helper()
+	if _, err := repo.GetSecret(context.Background(), publicID); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("secret %s: err = %v, want it gone", publicID, err)
 	}
 }
 
-func TestSecretRepo_RetrievalSessionExpiry(t *testing.T) {
+// assertEnded checks that an ended secret keeps nothing but its metadata
+// token hash and how it ended.
+func assertEnded(t *testing.T, secret *domain.Secret, outcome domain.Outcome) {
+	t.Helper()
+	if secret.State != domain.SecretEnded || secret.Outcome != outcome {
+		t.Errorf("%s: state = %q, outcome = %q; want ended, %q", secret.PublicID, secret.State, secret.Outcome, outcome)
+	}
+	if secret.EncryptedMeta != "" || secret.BlobTokenHash != "" || secret.DeletionTokenHash != "" {
+		t.Errorf("%s: ended secret keeps content: meta %q, blob hash %q, deletion hash %q",
+			secret.PublicID, secret.EncryptedMeta, secret.BlobTokenHash, secret.DeletionTokenHash)
+	}
+	if secret.MetadataTokenHash != tokencrypto.TokenHash("metadata-token-"+secret.PublicID) {
+		t.Errorf("%s: metadata token hash = %q, want it kept to answer how the secret ended", secret.PublicID, secret.MetadataTokenHash)
+	}
+}
+
+// objectRow is an object's row as the ledger holds it.
+type objectRow struct {
+	State      string
+	S3UploadID *string
+	CreatedAt  time.Time
+	DoomedAt   *time.Time
+}
+
+// getObject reads an object's row, or nil if the ledger does not know it.
+func getObject(t *testing.T, pool *pgxpool.Pool, storageKey string) *objectRow {
+	t.Helper()
+	var o objectRow
+	err := pool.QueryRow(context.Background(),
+		"SELECT state, s3_upload_id, created_at, doomed_at FROM objects WHERE storage_key = $1", storageKey,
+	).Scan(&o.State, &o.S3UploadID, &o.CreatedAt, &o.DoomedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("query object %s: %v", storageKey, err)
+	}
+	return &o
+}
+
+func mustGetObject(t *testing.T, pool *pgxpool.Pool, storageKey string) *objectRow {
+	t.Helper()
+	o := getObject(t, pool, storageKey)
+	if o == nil {
+		t.Fatalf("object %s is not in the ledger", storageKey)
+	}
+	return o
+}
+
+func assertDoomed(t *testing.T, pool *pgxpool.Pool, storageKey string, at time.Time) {
+	t.Helper()
+	o := mustGetObject(t, pool, storageKey)
+	if o.DoomedAt == nil || !o.DoomedAt.Equal(at) {
+		t.Errorf("object %s doomed at %v, want %v", storageKey, o.DoomedAt, at)
+	}
+}
+
+func assertNotDoomed(t *testing.T, pool *pgxpool.Pool, storageKey string) {
+	t.Helper()
+	if o := mustGetObject(t, pool, storageKey); o.DoomedAt != nil {
+		t.Errorf("object %s doomed at %v, want it kept", storageKey, *o.DoomedAt)
+	}
+}
+
+func countRows(t *testing.T, pool *pgxpool.Pool, query string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(), query, args...).Scan(&n); err != nil {
+		t.Fatalf("%s: %v", query, err)
+	}
+	return n
+}
+
+func TestSecretRepo_GetSecretReturnsASecretInAnyState(t *testing.T) {
 	pool := setupTestDB(t)
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
+	now := moment(time.Now())
+	expiresAt := moment(now.Add(time.Hour))
 
-	active := newTestSecret("session-expiry-active", time.Now().Add(1*time.Hour))
-	expired := newTestSecret("session-expiry-expired", time.Now().Add(1*time.Hour))
-	for _, secret := range []*domain.Secret{active, expired} {
-		if err := repo.Create(ctx, secret, time.Now()); err != nil {
-			t.Fatalf("create %s: %v", secret.PublicID, err)
+	secret := newTestSecret("get-any", expiresAt)
+	secret.BurnAfterRead = true
+	mustStartUpload(t, repo, "upload-get-any", secret, now.Add(time.Hour), now)
+
+	// A secret is filed when its upload starts, already with all its fields.
+	got := mustGetSecret(t, repo, "get-any")
+	want := domain.Secret{
+		PublicID:          "get-any",
+		State:             domain.SecretUploading,
+		StorageKey:        domain.UploadStorageKey("upload-get-any"),
+		MetadataTokenHash: tokencrypto.TokenHash("metadata-token-get-any"),
+		BlobTokenHash:     tokencrypto.TokenHash("blob-token-get-any"),
+		DeletionTokenHash: tokencrypto.TokenHash("deletion-token-get-any"),
+		EncryptedMeta:     "v2$nonce$meta-get-any",
+		BlobSize:          1024,
+		BurnAfterRead:     true,
+	}
+	gotFields := *got
+	gotFields.ExpiresAt, gotFields.CreatedAt = time.Time{}, nil
+	if gotFields != want {
+		t.Errorf("uploading secret = %+v, want %+v", gotFields, want)
+	}
+	if !got.ExpiresAt.Equal(expiresAt) {
+		t.Errorf("expires_at = %v, want %v", got.ExpiresAt, expiresAt)
+	}
+	if got.CreatedAt != nil {
+		t.Errorf("created_at = %v, want none while uploading", *got.CreatedAt)
+	}
+	if got.Readable(now) || got.Ended(now) {
+		t.Error("an uploading secret is neither readable nor ended")
+	}
+
+	// Expired secrets are returned until the cleanup deletes them.
+	mustCreate(t, repo, newTestSecret("get-expired", now.Add(-time.Minute)))
+	if got := mustGetSecret(t, repo, "get-expired"); got.State != domain.SecretLive || got.Readable(now) {
+		t.Errorf("expired secret: state = %q, readable = %v; want live and not readable", got.State, got.Readable(now))
+	}
+
+	if _, err := repo.GetSecret(ctx, "unknown"); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("unknown secret: err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSecretRepo_OpeningAOneTimeSecretEndsIt(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		asOwner bool
+	}{
+		{name: "by a recipient"},
+		// There is no owner's preview of a one-time secret: opening it ends it.
+		{name: "by the owner", asOwner: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := setupTestDB(t)
+			repo := pgadapter.NewSecretRepo(pool)
+			now := moment(time.Now())
+			secret := newTestSecret("one-time", now.Add(time.Hour))
+			secret.BurnAfterRead = true
+			mustCreate(t, repo, secret)
+
+			opened := mustOpen(t, repo, "one-time", "opener", tc.asOwner, now)
+
+			// The answer still carries what the opener needs to read it.
+			if opened.State != domain.SecretEnded || opened.Outcome != domain.OutcomeOpened {
+				t.Errorf("returned state = %q, outcome = %q; want ended, opened", opened.State, opened.Outcome)
+			}
+			if opened.EncryptedMeta != "v2$nonce$meta-one-time" || opened.StorageKey != secret.StorageKey {
+				t.Errorf("returned meta = %q, storage key = %q; want the secret's", opened.EncryptedMeta, opened.StorageKey)
+			}
+
+			stored := mustGetSecret(t, repo, "one-time")
+			assertEnded(t, stored, domain.OutcomeOpened)
+			if stored.Opened {
+				t.Error("opened flag set on a one-time secret; it ends instead")
+			}
+			if !stored.Ended(now) || stored.Readable(now) {
+				t.Errorf("ended = %v, readable = %v; want ended and not readable", stored.Ended(now), stored.Readable(now))
+			}
+			// The object stays for the download that opened it.
+			if stored.StorageKey != secret.StorageKey {
+				t.Errorf("storage key = %q, want %q kept until drained", stored.StorageKey, secret.StorageKey)
+			}
+			assertNotDoomed(t, pool, secret.StorageKey)
+
+			if _, err := download(repo, "one-time", "opener", now); err != nil {
+				t.Errorf("opener's download: %v, want it allowed until the session ends", err)
+			}
+			if _, err := openAs(repo, "one-time", "second", false, now); !errors.Is(err, domain.ErrNotFound) {
+				t.Errorf("second open: err = %v, want ErrNotFound", err)
+			}
+		})
+	}
+}
+
+func TestSecretRepo_RecipientOpeningAReusableSecretMarksItOpened(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	ctx := context.Background()
+	now := moment(time.Now())
+	mustCreate(t, repo, newTestSecret("reusable", now.Add(time.Hour)))
+
+	// The owner looking at their own secret is not a recipient getting it.
+	if got := mustOpen(t, repo, "reusable", "owner", true, now); got.Opened {
+		t.Error("owner's open returned opened = true")
+	}
+	if mustGetSecret(t, repo, "reusable").Opened {
+		t.Error("owner's open marked the secret opened")
+	}
+
+	// A wrong deletion token is just a recipient.
+	got, err := repo.StartRetrievalSession(ctx, "reusable",
+		tokencrypto.TokenHash("blob-token-reusable"), tokencrypto.TokenHash("not-the-deletion-token"),
+		tokencrypto.TokenHash("recipient"), now.Add(15*time.Minute), now)
+	if err != nil {
+		t.Fatalf("recipient's open: %v", err)
+	}
+	if !got.Opened {
+		t.Error("recipient's open returned opened = false")
+	}
+	stored := mustGetSecret(t, repo, "reusable")
+	if !stored.Opened || stored.State != domain.SecretLive || stored.EncryptedMeta == "" {
+		t.Errorf("after recipient: opened = %v, state = %q, meta = %q; want opened, still live with its content",
+			stored.Opened, stored.State, stored.EncryptedMeta)
+	}
+
+	// It stays readable for everyone, and opened stays set.
+	mustOpen(t, repo, "reusable", "recipient-again", false, now)
+	mustOpen(t, repo, "reusable", "owner-again", true, now)
+	if !mustGetSecret(t, repo, "reusable").Opened {
+		t.Error("opened flag was cleared by a later open")
+	}
+	for _, session := range []string{"owner", "recipient", "recipient-again", "owner-again"} {
+		if _, err := download(repo, "reusable", session, now); err != nil {
+			t.Errorf("download with %s's session: %v", session, err)
+		}
+	}
+}
+
+func TestSecretRepo_StartRetrievalSessionRefusesAWrongBlobToken(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	now := moment(time.Now())
+	secret := newTestSecret("wrong-blob", now.Add(time.Hour))
+	secret.BurnAfterRead = true
+	mustCreate(t, repo, secret)
+
+	_, err := repo.StartRetrievalSession(context.Background(), "wrong-blob",
+		tokencrypto.TokenHash("not-the-blob-token"), "", tokencrypto.TokenHash("session"), now.Add(15*time.Minute), now)
+	if !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("err = %v, want ErrForbidden", err)
+	}
+
+	// A wrong guess neither burns the secret nor opens a session.
+	if got := mustGetSecret(t, repo, "wrong-blob"); got.State != domain.SecretLive {
+		t.Errorf("state = %q, want live", got.State)
+	}
+	if n := countRows(t, pool, "SELECT count(*) FROM retrieval_sessions"); n != 0 {
+		t.Errorf("retrieval sessions = %d, want 0", n)
+	}
+}
+
+func TestSecretRepo_StartRetrievalSessionNeedsAReadableSecret(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	now := moment(time.Now())
+
+	uploading := newTestSecret("not-yet", now.Add(time.Hour))
+	mustStartUpload(t, repo, "upload-not-yet", uploading, now.Add(time.Hour), now)
+	mustCreate(t, repo, newTestSecret("expired", now.Add(-time.Second)))
+	mustCreate(t, repo, newTestSecret("deleted", now.Add(time.Hour)))
+	if err := repo.Delete(context.Background(), "deleted", now); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	burned := newTestSecret("burned", now.Add(time.Hour))
+	burned.BurnAfterRead = true
+	mustCreate(t, repo, burned)
+	mustOpen(t, repo, "burned", "first", false, now)
+
+	for _, id := range []string{"unknown", "not-yet", "expired", "deleted", "burned"} {
+		if _, err := openAs(repo, id, "session-"+id, false, now); !errors.Is(err, domain.ErrNotFound) {
+			t.Errorf("%s: err = %v, want ErrNotFound", id, err)
+		}
+	}
+	// The expiry is exclusive: a secret is gone at the moment it expires.
+	mustCreate(t, repo, newTestSecret("at-expiry", now))
+	if _, err := openAs(repo, "at-expiry", "session-at-expiry", false, now); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("at expiry: err = %v, want ErrNotFound", err)
+	}
+}
+
+func TestSecretRepo_ConcurrentOpensOfAOneTimeSecretSucceedOnce(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	now := moment(time.Now())
+	secret := newTestSecret("race", now.Add(time.Hour))
+	secret.BurnAfterRead = true
+	mustCreate(t, repo, secret)
+
+	const callers = 8
+	errs := make([]error, callers)
+	var wg sync.WaitGroup
+	for i := range callers {
+		wg.Go(func() {
+			// Each opener brings its own session token, so losing can only
+			// mean the secret is gone.
+			_, errs[i] = openAs(repo, "race", fmt.Sprintf("racer-%d", i), false, now)
+		})
+	}
+	wg.Wait()
+
+	winners := 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			winners++
+		case !errors.Is(err, domain.ErrNotFound):
+			t.Errorf("caller %d: err = %v, want nil or ErrNotFound", i, err)
+		}
+	}
+	if winners != 1 {
+		t.Errorf("%d callers opened the one-time secret, want exactly 1", winners)
+	}
+	if n := countRows(t, pool, "SELECT count(*) FROM retrieval_sessions WHERE public_id = 'race'"); n != 1 {
+		t.Errorf("retrieval sessions = %d, want 1", n)
+	}
+}
+
+func TestSecretRepo_GetByRetrievalSession(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	ctx := context.Background()
+	now := moment(time.Now())
+	mustCreate(t, repo, newTestSecret("dl", now.Add(time.Hour)))
+	mustCreate(t, repo, newTestSecret("dl-other", now.Add(time.Hour)))
+	mustOpen(t, repo, "dl", "session", false, now)
+
+	got, err := download(repo, "dl", "session", now)
+	if err != nil {
+		t.Fatalf("download: %v", err)
+	}
+	if got.PublicID != "dl" || got.StorageKey != domain.UploadStorageKey(uploadSessionOf("dl")) || got.BlobSize != 1024 {
+		t.Errorf("download = %+v, want the secret with its object", got)
+	}
+
+	for _, tc := range []struct {
+		name, publicID, session string
+		at                      time.Time
+	}{
+		{"wrong session", "dl", "other-session", now},
+		{"another secret's id", "dl-other", "session", now},
+		// openAs gives sessions 15 minutes.
+		{"session ended", "dl", "session", now.Add(15 * time.Minute)},
+	} {
+		if _, err := download(repo, tc.publicID, tc.session, tc.at); !errors.Is(err, domain.ErrForbidden) {
+			t.Errorf("%s: err = %v, want ErrForbidden", tc.name, err)
 		}
 	}
 
-	activeHash := tokencrypto.TokenHash("active-session-token")
-	if _, err := repo.StartRetrievalSession(
-		ctx,
-		"session-expiry-active",
-		tokencrypto.TokenHash("blob-token-session-expiry-active"),
-		"",
-		activeHash,
-		time.Now().Add(15*time.Minute),
-		time.Now(),
-	); err != nil {
-		t.Fatalf("start active session: %v", err)
+	// A session longer than the secret ends with the secret.
+	mustCreate(t, repo, newTestSecret("dl-short", now.Add(time.Minute)))
+	if _, err := repo.StartRetrievalSession(ctx, "dl-short", tokencrypto.TokenHash("blob-token-dl-short"), "",
+		tokencrypto.TokenHash("long-session"), now.Add(time.Hour), now); err != nil {
+		t.Fatalf("open dl-short: %v", err)
 	}
-
-	expiredHash := tokencrypto.TokenHash("expired-session-token")
-	if _, err := repo.StartRetrievalSession(
-		ctx,
-		"session-expiry-expired",
-		tokencrypto.TokenHash("blob-token-session-expiry-expired"),
-		"",
-		expiredHash,
-		time.Now().Add(-time.Minute),
-		time.Now(),
-	); err != nil {
-		t.Fatalf("start expired session: %v", err)
-	}
-
-	if _, err := repo.GetByRetrievalSession(ctx, "session-expiry-active", activeHash, time.Now()); err != nil {
-		t.Fatalf("active session should validate: %v", err)
-	}
-	if _, err := repo.GetByRetrievalSession(ctx, "session-expiry-expired", expiredHash, time.Now()); !errors.Is(err, domain.ErrForbidden) {
-		t.Fatalf("expected ErrForbidden for expired session, got %v", err)
-	}
-
-	deleted, err := repo.DeleteExpiredRetrievalSessions(ctx, time.Now())
-	if err != nil {
-		t.Fatalf("delete expired sessions: %v", err)
-	}
-	if deleted != 1 {
-		t.Errorf("deleted sessions = %d, want 1", deleted)
-	}
-
-	if _, err := repo.GetByRetrievalSession(ctx, "session-expiry-active", activeHash, time.Now()); err != nil {
-		t.Fatalf("active session should remain after cleanup: %v", err)
+	if _, err := download(repo, "dl-short", "long-session", now.Add(time.Minute)); !errors.Is(err, domain.ErrForbidden) {
+		t.Errorf("expired secret: err = %v, want ErrForbidden", err)
 	}
 }
 
-func TestSecretRepo_StartRetrievalSession_BurnAfterRead(t *testing.T) {
+func TestSecretRepo_DeleteEndsTheSecretAndDoomsItsObject(t *testing.T) {
 	pool := setupTestDB(t)
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
+	now := moment(time.Now())
+	secret := newTestSecret("doomed", now.Add(time.Hour))
+	mustCreate(t, repo, secret)
+	mustOpen(t, repo, "doomed", "recipient", false, now)
 
-	secret := newTestSecret("session-burn-001", time.Now().Add(1*time.Hour))
-	secret.BurnAfterRead = true
-	if err := repo.Create(ctx, secret, time.Now()); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-
-	_, err := repo.StartRetrievalSession(
-		ctx,
-		"session-burn-001",
-		tokencrypto.TokenHash("blob-token-session-burn-001"),
-		"",
-		tokencrypto.TokenHash("session-token"),
-		time.Now().Add(15*time.Minute),
-		time.Now(),
-	)
-	if err != nil {
-		t.Fatalf("start retrieval session: %v", err)
-	}
-
-	got, err := repo.GetByPublicID(ctx, "session-burn-001", time.Now())
-	if err != nil {
-		t.Fatalf("get after session: %v", err)
-	}
-	if got.RetrievedAt == nil {
-		t.Fatal("retrieved_at should be set")
-	}
-
-	_, err = repo.StartRetrievalSession(
-		ctx,
-		"session-burn-001",
-		tokencrypto.TokenHash("blob-token-session-burn-001"),
-		"",
-		tokencrypto.TokenHash("session-token-2"),
-		time.Now().Add(15*time.Minute),
-		time.Now(),
-	)
-	if !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("expected ErrNotFound on second burn session, got %v", err)
-	}
-}
-
-func TestSecretRepo_Delete(t *testing.T) {
-	pool := setupTestDB(t)
-	repo := pgadapter.NewSecretRepo(pool)
-	ctx := context.Background()
-
-	secret := newTestSecret("del-001", time.Now().Add(1*time.Hour))
-	if err := repo.Create(ctx, secret, time.Now()); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-
-	if err := repo.Delete(ctx, "del-001", time.Now()); err != nil {
+	deletedAt := moment(now.Add(time.Second))
+	if err := repo.Delete(ctx, "doomed", deletedAt); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 
-	err := repo.Delete(ctx, "del-001", time.Now())
-	if !errors.Is(err, domain.ErrNotFound) {
-		t.Fatalf("expected ErrNotFound on second delete, got %v", err)
+	stored := mustGetSecret(t, repo, "doomed")
+	assertEnded(t, stored, domain.OutcomeDeleted)
+	if stored.StorageKey != "" {
+		t.Errorf("storage key = %q, want it cleared", stored.StorageKey)
+	}
+	// Whether a recipient had opened it is still worth telling the owner.
+	if !stored.Opened {
+		t.Error("deleting cleared the opened flag")
+	}
+	assertDoomed(t, pool, secret.StorageKey, deletedAt)
+
+	// A running download ends at once, and the secret is gone for everyone.
+	if _, err := download(repo, "doomed", "recipient", deletedAt); !errors.Is(err, domain.ErrForbidden) {
+		t.Errorf("running download: err = %v, want ErrForbidden", err)
+	}
+	if _, err := openAs(repo, "doomed", "late", false, deletedAt); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("open after delete: err = %v, want ErrNotFound", err)
+	}
+	if err := repo.Delete(ctx, "doomed", deletedAt); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("second delete: err = %v, want ErrNotFound", err)
 	}
 }
 
-func TestSecretRepo_DeleteExpired(t *testing.T) {
+func TestSecretRepo_DeleteNeedsAReadableSecret(t *testing.T) {
 	pool := setupTestDB(t)
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
+	now := moment(time.Now())
 
-	expired1 := newTestSecret("exp-del-001", time.Now().Add(-1*time.Hour))
-	expired2 := newTestSecret("exp-del-002", time.Now().Add(-2*time.Hour))
-	valid := newTestSecret("exp-del-003", time.Now().Add(1*time.Hour))
+	uploading := newTestSecret("not-yet", now.Add(time.Hour))
+	mustStartUpload(t, repo, "upload-not-yet", uploading, now.Add(time.Hour), now)
+	expired := newTestSecret("expired", now.Add(-time.Second))
+	mustCreate(t, repo, expired)
+	burned := newTestSecret("burned", now.Add(time.Hour))
+	burned.BurnAfterRead = true
+	mustCreate(t, repo, burned)
+	mustOpen(t, repo, "burned", "opener", false, now)
 
-	for _, s := range []*domain.Secret{expired1, expired2, valid} {
-		if err := repo.Create(ctx, s, time.Now()); err != nil {
-			t.Fatalf("create %s: %v", s.PublicID, err)
+	for _, id := range []string{"unknown", "not-yet", "expired", "burned"} {
+		if err := repo.Delete(ctx, id, now); !errors.Is(err, domain.ErrNotFound) {
+			t.Errorf("%s: err = %v, want ErrNotFound", id, err)
 		}
 	}
 
-	noop := func(string) error { return nil }
-	count, err := repo.DeleteExpired(ctx, time.Now(), testBatchSize, noop)
-	if err != nil {
-		t.Fatalf("delete expired: %v", err)
+	// Nothing was touched: the upload goes on, the opened secret still drains.
+	if got := mustGetSecret(t, repo, "not-yet"); got.State != domain.SecretUploading {
+		t.Errorf("uploading secret state = %q, want uploading", got.State)
 	}
-
-	if count.Removed != 2 {
-		t.Errorf("deleted count = %d, want 2", count.Removed)
+	if got := mustGetSecret(t, repo, "burned"); got.Outcome != domain.OutcomeOpened || got.StorageKey != burned.StorageKey {
+		t.Errorf("opened secret: outcome = %q, storage key = %q; want opened and kept", got.Outcome, got.StorageKey)
 	}
-
-	// Valid secret should still exist
-	_, err = repo.GetByPublicID(ctx, "exp-del-003", time.Now())
-	if err != nil {
-		t.Fatalf("valid secret should still exist: %v", err)
+	for _, key := range []string{uploading.StorageKey, expired.StorageKey, burned.StorageKey} {
+		assertNotDoomed(t, pool, key)
 	}
-}
-
-func TestSecretRepo_DeleteExpired_BurnAfterRead(t *testing.T) {
-	pool := setupTestDB(t)
-	repo := pgadapter.NewSecretRepo(pool)
-	ctx := context.Background()
-
-	// 1. Retrieved burn-after-read secret — should be deleted
-	burnRetrieved := newTestSecret("burn-retr-001", time.Now().Add(1*time.Hour))
-	burnRetrieved.BurnAfterRead = true
-	if err := repo.Create(ctx, burnRetrieved, time.Now()); err != nil {
-		t.Fatalf("create burn-retrieved: %v", err)
-	}
-	markRetrieved(t, pool, "burn-retr-001")
-
-	// 2. Retrieved regular secret — should NOT be deleted
-	regularRetrieved := newTestSecret("reg-retr-001", time.Now().Add(1*time.Hour))
-	if err := repo.Create(ctx, regularRetrieved, time.Now()); err != nil {
-		t.Fatalf("create regular-retrieved: %v", err)
-	}
-	markRetrieved(t, pool, "reg-retr-001")
-
-	// 3. Unretrieved burn-after-read secret — should NOT be deleted
-	burnUnretrieved := newTestSecret("burn-unretr-001", time.Now().Add(1*time.Hour))
-	burnUnretrieved.BurnAfterRead = true
-	if err := repo.Create(ctx, burnUnretrieved, time.Now()); err != nil {
-		t.Fatalf("create burn-unretrieved: %v", err)
-	}
-
-	noop := func(string) error { return nil }
-	count, err := repo.DeleteExpired(ctx, time.Now(), testBatchSize, noop)
-	if err != nil {
-		t.Fatalf("delete expired: %v", err)
-	}
-
-	if count.Removed != 1 {
-		t.Errorf("deleted count = %d, want 1", count.Removed)
-	}
-
-	// Regular retrieved secret should still exist
-	if _, err := repo.GetByPublicID(ctx, "reg-retr-001", time.Now()); err != nil {
-		t.Fatalf("regular retrieved secret should still exist: %v", err)
-	}
-
-	// Unretrieved burn secret should still exist
-	if _, err := repo.GetByPublicID(ctx, "burn-unretr-001", time.Now()); err != nil {
-		t.Fatalf("unretrieved burn secret should still exist: %v", err)
-	}
-}
-
-func TestSecretRepo_DeleteExpired_KeepsBurnedSecretWithActiveSession(t *testing.T) {
-	pool := setupTestDB(t)
-	repo := pgadapter.NewSecretRepo(pool)
-	ctx := context.Background()
-
-	secret := newTestSecret("burn-active-session", time.Now().Add(1*time.Hour))
-	secret.BurnAfterRead = true
-	if err := repo.Create(ctx, secret, time.Now()); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	if _, err := repo.StartRetrievalSession(
-		ctx,
-		"burn-active-session",
-		tokencrypto.TokenHash("blob-token-burn-active-session"),
-		"",
-		tokencrypto.TokenHash("session-active"),
-		time.Now().Add(15*time.Minute),
-		time.Now(),
-	); err != nil {
-		t.Fatalf("start retrieval session: %v", err)
-	}
-
-	noop := func(string) error { return nil }
-	count, err := repo.DeleteExpired(ctx, time.Now(), testBatchSize, noop)
-	if err != nil {
-		t.Fatalf("delete expired: %v", err)
-	}
-	if count.Removed != 0 {
-		t.Errorf("deleted count = %d, want 0", count.Removed)
-	}
-
-	if _, err := pool.Exec(ctx, "UPDATE retrieval_sessions SET expires_at = $2 WHERE public_id = $1", "burn-active-session", time.Now().Add(-time.Minute)); err != nil {
-		t.Fatalf("expire retrieval session: %v", err)
-	}
-	deletedSessions, err := repo.DeleteExpiredRetrievalSessions(ctx, time.Now())
-	if err != nil {
-		t.Fatalf("delete expired retrieval sessions: %v", err)
-	}
-	if deletedSessions != 1 {
-		t.Errorf("deleted sessions = %d, want 1", deletedSessions)
-	}
-
-	count, err = repo.DeleteExpired(ctx, time.Now(), testBatchSize, noop)
-	if err != nil {
-		t.Fatalf("delete expired after session cleanup: %v", err)
-	}
-	if count.Removed != 1 {
-		t.Errorf("deleted count after session cleanup = %d, want 1", count.Removed)
-	}
-}
-
-func TestSecretRepo_DeleteExpired_Batches(t *testing.T) {
-	pool := setupTestDB(t)
-	repo := pgadapter.NewSecretRepo(pool)
-	ctx := context.Background()
-
-	now := time.Now()
-	consumed := newTestSecret("batch-consumed", now.Add(time.Hour))
-	consumed.BurnAfterRead = true
-	for _, s := range []*domain.Secret{
-		newTestSecret("batch-exp-3h", now.Add(-3*time.Hour)),
-		newTestSecret("batch-exp-1h", now.Add(-1*time.Hour)),
-		newTestSecret("batch-exp-2h", now.Add(-2*time.Hour)),
-		consumed,
-		newTestSecret("batch-live", now.Add(time.Hour)),
-	} {
-		if err := repo.Create(ctx, s, now); err != nil {
-			t.Fatalf("create %s: %v", s.PublicID, err)
-		}
-	}
-	markRetrieved(t, pool, "batch-consumed")
-
-	var seen []string
-	record := func(storageKey string) error {
-		seen = append(seen, storageKey)
-		return nil
-	}
-
-	// Oldest first, never more than the limit per batch; expired and consumed
-	// burn-after-read secrets come from the same backlog.
-	for i, want := range []domain.CleanupBatch{{Found: 2, Removed: 2}, {Found: 2, Removed: 2}, {Found: 0, Removed: 0}} {
-		got, err := repo.DeleteExpired(ctx, now, 2, record)
-		if err != nil {
-			t.Fatalf("batch %d: %v", i+1, err)
-		}
-		if got != want {
-			t.Errorf("batch %d = %+v, want %+v", i+1, got, want)
-		}
-	}
-	wantOrder := []string{"secrets/batch-exp-3h", "secrets/batch-exp-2h", "secrets/batch-exp-1h", "secrets/batch-consumed"}
-	if strings.Join(seen, ",") != strings.Join(wantOrder, ",") {
-		t.Errorf("cleanup order = %v, want %v", seen, wantOrder)
-	}
-	if _, err := repo.GetByPublicID(ctx, "batch-live", now); err != nil {
-		t.Errorf("live secret should survive: %v", err)
-	}
-}
-
-func TestSecretRepo_DeleteExpired_SkipsRowsLockedElsewhere(t *testing.T) {
-	pool := setupTestDB(t)
-	repo := pgadapter.NewSecretRepo(pool)
-	ctx := context.Background()
-
-	for _, id := range []string{"locked-elsewhere", "free-to-delete"} {
-		if err := repo.Create(ctx, newTestSecret(id, time.Now().Add(-time.Hour)), time.Now()); err != nil {
-			t.Fatalf("create %s: %v", id, err)
-		}
-	}
-
-	// Another replica's cleanup (or a request) holds one row.
-	other, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatalf("begin: %v", err)
-	}
-	defer func() { _ = other.Rollback(ctx) }()
-	if _, err := other.Exec(ctx, "SELECT 1 FROM secrets WHERE public_id = 'locked-elsewhere' FOR UPDATE"); err != nil {
-		t.Fatalf("lock row: %v", err)
-	}
-
-	var seen []string
-	got, err := repo.DeleteExpired(ctx, time.Now(), testBatchSize, func(storageKey string) error {
-		seen = append(seen, storageKey)
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("delete expired: %v", err)
-	}
-	if got != (domain.CleanupBatch{Found: 1, Removed: 1}) || len(seen) != 1 || seen[0] != "secrets/free-to-delete" {
-		t.Errorf("batch = %+v, saw %v; want only the unlocked row", got, seen)
-	}
-}
-
-func TestSecretRepo_DeleteExpired_HookError(t *testing.T) {
-	pool := setupTestDB(t)
-	repo := pgadapter.NewSecretRepo(pool)
-	ctx := context.Background()
-
-	expired1 := newTestSecret("hook-err-001", time.Now().Add(-1*time.Hour))
-	expired2 := newTestSecret("hook-err-002", time.Now().Add(-2*time.Hour))
-
-	for _, s := range []*domain.Secret{expired1, expired2} {
-		if err := repo.Create(ctx, s, time.Now()); err != nil {
-			t.Fatalf("create %s: %v", s.PublicID, err)
-		}
-	}
-
-	// Hook fails for hook-err-001, succeeds for hook-err-002
-	failOne := func(storageKey string) error {
-		if storageKey == "secrets/hook-err-001" {
-			return errors.New("S3 delete failed")
-		}
-		return nil
-	}
-
-	count, err := repo.DeleteExpired(ctx, time.Now(), testBatchSize, failOne)
-	if err != nil {
-		t.Fatalf("delete expired: %v", err)
-	}
-
-	if count.Removed != 1 {
-		t.Errorf("deleted count = %d, want 1", count.Removed)
-	}
-
-	// hook-err-001 should still exist (hook failed, row kept)
-	// We can't use GetByPublicID because it filters by expires_at.
-	// Instead, call DeleteExpired again with a noop — if it finds a row, it was kept.
-	noop := func(string) error { return nil }
-	count2, err := repo.DeleteExpired(ctx, time.Now(), testBatchSize, noop)
-	if err != nil {
-		t.Fatalf("second delete expired: %v", err)
-	}
-	if count2.Removed != 1 {
-		t.Errorf("second pass count = %d, want 1 (the skipped row)", count2.Removed)
+	if _, err := download(repo, "burned", "opener", now); err != nil {
+		t.Errorf("opener's download after a refused delete: %v", err)
 	}
 }

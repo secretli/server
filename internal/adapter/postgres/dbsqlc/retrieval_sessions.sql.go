@@ -13,36 +13,28 @@ import (
 
 const createRetrievalSession = `-- name: CreateRetrievalSession :exec
 INSERT INTO retrieval_sessions (
-    public_id,
     session_token_hash,
-    expires_at,
-    created_at
+    public_id,
+    expires_at
 )
 VALUES (
-    $1, $2, $3, $4
+    $1, $2, $3
 )
 `
 
 type CreateRetrievalSessionParams struct {
-	PublicID         string
 	SessionTokenHash string
+	PublicID         string
 	ExpiresAt        pgtype.Timestamptz
-	CreatedAt        pgtype.Timestamptz
 }
 
 func (q *Queries) CreateRetrievalSession(ctx context.Context, arg CreateRetrievalSessionParams) error {
-	_, err := q.db.Exec(ctx, createRetrievalSession,
-		arg.PublicID,
-		arg.SessionTokenHash,
-		arg.ExpiresAt,
-		arg.CreatedAt,
-	)
+	_, err := q.db.Exec(ctx, createRetrievalSession, arg.SessionTokenHash, arg.PublicID, arg.ExpiresAt)
 	return err
 }
 
 const deleteExpiredRetrievalSessions = `-- name: DeleteExpiredRetrievalSessions :execrows
-DELETE
-FROM retrieval_sessions
+DELETE FROM retrieval_sessions
 WHERE expires_at < $1
 `
 
@@ -54,70 +46,33 @@ func (q *Queries) DeleteExpiredRetrievalSessions(ctx context.Context, nowAt pgty
 	return result.RowsAffected(), nil
 }
 
-const getSecretByPublicIDForUpdate = `-- name: GetSecretByPublicIDForUpdate :one
-SELECT public_id, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at, retrieved_at, storage_key
-FROM secrets
-WHERE public_id = $1
-  AND expires_at > $2
-FOR UPDATE
-`
-
-type GetSecretByPublicIDForUpdateParams struct {
-	PublicID string
-	NowAt    pgtype.Timestamptz
-}
-
-func (q *Queries) GetSecretByPublicIDForUpdate(ctx context.Context, arg GetSecretByPublicIDForUpdateParams) (Secret, error) {
-	row := q.db.QueryRow(ctx, getSecretByPublicIDForUpdate, arg.PublicID, arg.NowAt)
-	var i Secret
-	err := row.Scan(
-		&i.PublicID,
-		&i.MetadataTokenHash,
-		&i.BlobTokenHash,
-		&i.DeletionTokenHash,
-		&i.EncryptedMeta,
-		&i.BlobSize,
-		&i.BurnAfterRead,
-		&i.ExpiresAt,
-		&i.CreatedAt,
-		&i.RetrievedAt,
-		&i.StorageKey,
-	)
-	return i, err
-}
-
-const getSecretByRetrievalSession = `-- name: GetSecretByRetrievalSession :one
-SELECT
-    s.public_id,
-    s.metadata_token_hash,
-    s.blob_token_hash,
-    s.deletion_token_hash,
-    s.encrypted_meta,
-    s.blob_size,
-    s.burn_after_read,
-    s.expires_at,
-    s.created_at,
-    s.retrieved_at,
-    s.storage_key
+const getDownloadableSecret = `-- name: GetDownloadableSecret :one
+SELECT s.public_id, s.state, s.storage_key, s.metadata_token_hash, s.blob_token_hash, s.deletion_token_hash, s.encrypted_meta, s.blob_size, s.burn_after_read, s.expires_at, s.created_at, s.opened, s.outcome
 FROM retrieval_sessions AS rs
 JOIN secrets AS s ON s.public_id = rs.public_id
-WHERE s.public_id = $1
-  AND rs.session_token_hash = $2
+WHERE rs.session_token_hash = $1
+  AND rs.public_id = $2
   AND rs.expires_at > $3
   AND s.expires_at > $3
+  AND s.storage_key IS NOT NULL
 `
 
-type GetSecretByRetrievalSessionParams struct {
-	PublicID         string
+type GetDownloadableSecretParams struct {
 	SessionTokenHash string
+	PublicID         string
 	NowAt            pgtype.Timestamptz
 }
 
-func (q *Queries) GetSecretByRetrievalSession(ctx context.Context, arg GetSecretByRetrievalSessionParams) (Secret, error) {
-	row := q.db.QueryRow(ctx, getSecretByRetrievalSession, arg.PublicID, arg.SessionTokenHash, arg.NowAt)
+// The secret a valid session may read: not expired, and still holding its
+// object. Whatever dooms an object clears it from its secret in the same
+// transaction, so deleting a secret ends running downloads.
+func (q *Queries) GetDownloadableSecret(ctx context.Context, arg GetDownloadableSecretParams) (Secret, error) {
+	row := q.db.QueryRow(ctx, getDownloadableSecret, arg.SessionTokenHash, arg.PublicID, arg.NowAt)
 	var i Secret
 	err := row.Scan(
 		&i.PublicID,
+		&i.State,
+		&i.StorageKey,
 		&i.MetadataTokenHash,
 		&i.BlobTokenHash,
 		&i.DeletionTokenHash,
@@ -126,8 +81,8 @@ func (q *Queries) GetSecretByRetrievalSession(ctx context.Context, arg GetSecret
 		&i.BurnAfterRead,
 		&i.ExpiresAt,
 		&i.CreatedAt,
-		&i.RetrievedAt,
-		&i.StorageKey,
+		&i.Opened,
+		&i.Outcome,
 	)
 	return i, err
 }

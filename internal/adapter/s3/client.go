@@ -146,6 +146,37 @@ func (s *Client) AbortMultipartUpload(ctx context.Context, key, uploadID string)
 	return nil
 }
 
+// AbortMultipartUploads aborts every multipart upload in progress under key.
+// It finds them by listing, so it needs no upload id: one that was never
+// recorded is found too, and an upload that already completed is not listed.
+// Listing by prefix can also return longer keys; only key itself is aborted.
+func (s *Client) AbortMultipartUploads(ctx context.Context, key string) error {
+	var keyMarker, uploadIDMarker *string
+	for {
+		out, err := s.client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
+			Bucket:         aws.String(s.bucket),
+			Prefix:         aws.String(key),
+			KeyMarker:      keyMarker,
+			UploadIdMarker: uploadIDMarker,
+		})
+		if err != nil {
+			return fmt.Errorf("list multipart uploads %q: %w", key, err)
+		}
+		for _, upload := range out.Uploads {
+			if aws.ToString(upload.Key) != key {
+				continue
+			}
+			if err := s.AbortMultipartUpload(ctx, key, aws.ToString(upload.UploadId)); err != nil {
+				return err
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) {
+			return nil
+		}
+		keyMarker, uploadIDMarker = out.NextKeyMarker, out.NextUploadIdMarker
+	}
+}
+
 func errorCode(err error) string {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {

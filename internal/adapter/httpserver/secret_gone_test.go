@@ -1,24 +1,16 @@
 package httpserver
 
 import (
-	"context"
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/secretli/server/internal/domain"
 )
-
-// goneDetails is what the metadata endpoint tells about a secret that is gone.
-type goneDetails struct {
-	Outcome       string `json:"outcome"`
-	BurnAfterRead bool   `json:"burn_after_read"`
-	EndedAt       string `json:"ended_at"`
-	FirstOpenedAt string `json:"first_opened_at"`
-	OpenedByOwner bool   `json:"opened_by_owner"`
-}
 
 func getMetadata(t *testing.T, h *SecretHandler, publicID, metadataToken string) *httptest.ResponseRecorder {
 	t.Helper()
@@ -32,19 +24,41 @@ func getMetadata(t *testing.T, h *SecretHandler, publicID, metadataToken string)
 	return rec
 }
 
-func decodeGone(t *testing.T, rec *httptest.ResponseRecorder) goneDetails {
+// decodeGone returns the details of a 410. They tell how the secret ended and
+// nothing else, so any other key fails the test.
+func decodeGone(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
 	t.Helper()
 	if rec.Code != http.StatusGone {
 		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusGone, rec.Body.String())
 	}
 	var body struct {
-		Error   string      `json:"error"`
-		Details goneDetails `json:"details"`
+		Error   string         `json:"error"`
+		Details map[string]any `json:"details"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode body: %v", err)
 	}
+	keys := slices.Sorted(maps.Keys(body.Details))
+	if want := []string{"burn_after_read", "outcome"}; !slices.Equal(keys, want) {
+		t.Errorf("details keys = %v, want exactly %v", keys, want)
+	}
 	return body.Details
+}
+
+// assertNothingTold checks for a plain 404 that does not let on whether the
+// secret ever existed or how it ended.
+func assertNothingTold(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d. body: %s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if _, ok := body["details"]; ok {
+		t.Errorf("body = %s, want no details", rec.Body.String())
+	}
 }
 
 func decodeMetadata(t *testing.T, rec *httptest.ResponseRecorder) domain.SecretMetadataResponse {
@@ -89,7 +103,7 @@ func deleteSecretAs(t *testing.T, h *SecretHandler, publicID, metadataToken, del
 	return rec
 }
 
-func TestSecretMetadata_OpenedOneTimeSecretTellsWhenItWasOpened(t *testing.T) {
+func TestSecretMetadata_OpenedOneTimeSecretTellsItWasOpened(t *testing.T) {
 	repo := newMockRepo()
 	fs := newMockFileStore()
 	h := NewSecretHandler(repo, fs)
@@ -100,15 +114,12 @@ func TestSecretMetadata_OpenedOneTimeSecretTellsWhenItWasOpened(t *testing.T) {
 	startTestRetrievalSession(t, h, publicID, token)
 
 	details := decodeGone(t, getMetadata(t, h, publicID, token))
-	if details.Outcome != "opened" || !details.BurnAfterRead || details.OpenedByOwner {
-		t.Errorf("details = %+v, want a one-time secret opened by a recipient", details)
-	}
-	if details.EndedAt == "" || details.FirstOpenedAt != details.EndedAt {
-		t.Errorf("first_opened_at = %q, ended_at = %q, want the same moment", details.FirstOpenedAt, details.EndedAt)
+	if details["outcome"] != "opened" || details["burn_after_read"] != true {
+		t.Errorf("details = %v, want an opened one-time secret", details)
 	}
 }
 
-func TestSecretMetadata_OwnerOpeningTheirOneTimeSecretIsToldApart(t *testing.T) {
+func TestSecretMetadata_OwnerOpeningTheirOneTimeSecretEndsItAlike(t *testing.T) {
 	repo := newMockRepo()
 	fs := newMockFileStore()
 	h := NewSecretHandler(repo, fs)
@@ -121,34 +132,50 @@ func TestSecretMetadata_OwnerOpeningTheirOneTimeSecretIsToldApart(t *testing.T) 
 		t.Fatalf("owner open status = %d, want %d. body: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
 
+	// Nothing tells who opened it: the answer is the same as for a recipient.
 	details := decodeGone(t, getMetadata(t, h, publicID, token))
-	if details.Outcome != "opened" || !details.OpenedByOwner {
-		t.Errorf("details = %+v, want opened by the owner", details)
-	}
-	if details.FirstOpenedAt != "" {
-		t.Errorf("first_opened_at = %q, want none: no recipient got it", details.FirstOpenedAt)
+	if details["outcome"] != "opened" || details["burn_after_read"] != true {
+		t.Errorf("details = %v, want an opened one-time secret", details)
 	}
 }
 
-func TestSecretMetadata_DeletedSecretTellsWhenItWasDeleted(t *testing.T) {
+func TestSecretMetadata_DeletedSecretTellsItWasDeleted(t *testing.T) {
+	for _, burnAfterRead := range []bool{false, true} {
+		repo := newMockRepo()
+		fs := newMockFileStore()
+		h := NewSecretHandler(repo, fs)
+		publicID := testPublicID("gone deleted")
+		token := testToken("gone deleted token")
+		deletionToken := testToken("gone deleted deletion")
+		seedSecret(repo, fs, publicID, token, deletionToken, burnAfterRead)
+
+		if rec := deleteSecretAs(t, h, publicID, token, deletionToken); rec.Code != http.StatusNoContent {
+			t.Fatalf("delete status = %d, want %d. body: %s", rec.Code, http.StatusNoContent, rec.Body.String())
+		}
+
+		details := decodeGone(t, getMetadata(t, h, publicID, token))
+		if details["outcome"] != "deleted" || details["burn_after_read"] != burnAfterRead {
+			t.Errorf("details = %v, want deleted with burn_after_read %v", details, burnAfterRead)
+		}
+	}
+}
+
+func TestDeleteSecret_DeletingTwiceTellsItIsGone(t *testing.T) {
 	repo := newMockRepo()
 	fs := newMockFileStore()
 	h := NewSecretHandler(repo, fs)
-	publicID := testPublicID("gone deleted")
-	token := testToken("gone deleted token")
-	deletionToken := testToken("gone deleted deletion")
+	publicID := testPublicID("gone deleted twice")
+	token := testToken("gone deleted twice token")
+	deletionToken := testToken("gone deleted twice deletion")
 	seedSecret(repo, fs, publicID, token, deletionToken, false)
 
 	if rec := deleteSecretAs(t, h, publicID, token, deletionToken); rec.Code != http.StatusNoContent {
-		t.Fatalf("delete status = %d, want %d. body: %s", rec.Code, http.StatusNoContent, rec.Body.String())
+		t.Fatalf("first delete status = %d. body: %s", rec.Code, rec.Body.String())
 	}
 
-	details := decodeGone(t, getMetadata(t, h, publicID, token))
-	if details.Outcome != "deleted" || details.BurnAfterRead || details.OpenedByOwner {
-		t.Errorf("details = %+v, want a deleted reusable secret", details)
-	}
-	if details.EndedAt == "" || details.FirstOpenedAt != "" {
-		t.Errorf("ended_at = %q, first_opened_at = %q, want a time and none", details.EndedAt, details.FirstOpenedAt)
+	details := decodeGone(t, deleteSecretAs(t, h, publicID, token, deletionToken))
+	if details["outcome"] != "deleted" {
+		t.Errorf("details = %v, want deleted", details)
 	}
 }
 
@@ -160,39 +187,58 @@ func TestSecretMetadata_WhatBecameOfASecretNeedsItsLink(t *testing.T) {
 	token := testToken("gone guarded token")
 	seedSecret(repo, fs, publicID, token, testToken("gone guarded deletion"), true)
 	startTestRetrievalSession(t, h, publicID, token)
-	// Once the cleanup has taken the row, only the tombstone is left.
-	if _, err := repo.DeleteExpired(context.Background(), time.Now(), 10, func(string) error { return nil }); err != nil {
-		t.Fatalf("cleanup: %v", err)
-	}
 
 	rec := getMetadata(t, h, publicID, testToken("somebody else's token"))
 
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want %d: a guess must learn nothing", rec.Code, http.StatusNotFound)
+	// A guess must learn nothing, not even that the id was ever used.
+	assertNothingTold(t, rec)
+}
+
+func TestSecretMetadata_ExpiredSecretIsNotFound(t *testing.T) {
+	tests := []struct {
+		name  string
+		state domain.SecretState
+	}{
+		{name: "live", state: domain.SecretLive},
+		{name: "ended", state: domain.SecretEnded},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo := newMockRepo()
+			fs := newMockFileStore()
+			h := NewSecretHandler(repo, fs)
+			publicID := testPublicID("gone expired " + tt.name)
+			token := testToken("gone expired token " + tt.name)
+			seedSecret(repo, fs, publicID, token, testToken("gone expired deletion "+tt.name), true)
+			// The cleanup has not reached the row yet, but expiry keeps
+			// nothing: not even how the secret ended.
+			secret := repo.secrets[publicID]
+			secret.State = tt.state
+			if tt.state == domain.SecretEnded {
+				secret.Outcome = domain.OutcomeOpened
+			}
+			secret.ExpiresAt = time.Now().Add(-time.Minute)
+
+			assertNothingTold(t, getMetadata(t, h, publicID, token))
+		})
 	}
 }
 
-func TestSecretMetadata_ExpiredSecretAwaitingCleanupIsGoneAsExpired(t *testing.T) {
+func TestSecretMetadata_UploadingSecretIsNotFound(t *testing.T) {
 	repo := newMockRepo()
 	fs := newMockFileStore()
 	h := NewSecretHandler(repo, fs)
-	publicID := testPublicID("gone expired")
-	token := testToken("gone expired token")
-	seedSecret(repo, fs, publicID, token, testToken("gone expired deletion"), true)
-	expiredAt := time.Now().Add(-time.Minute)
-	repo.secrets[publicID].ExpiresAt = expiredAt
+	publicID := testPublicID("gone uploading")
+	token := testToken("gone uploading token")
+	seedSecret(repo, fs, publicID, token, testToken("gone uploading deletion"), false)
+	repo.secrets[publicID].State = domain.SecretUploading
+	repo.secrets[publicID].CreatedAt = nil
 
-	details := decodeGone(t, getMetadata(t, h, publicID, token))
-
-	if details.Outcome != "expired" || details.FirstOpenedAt != "" {
-		t.Errorf("details = %+v, want expired unopened", details)
-	}
-	if details.EndedAt != expiredAt.UTC().Format(time.RFC3339) {
-		t.Errorf("ended_at = %q, want the expiry %v", details.EndedAt, expiredAt)
-	}
+	// Until the upload completes, the secret does not exist for anybody.
+	assertNothingTold(t, getMetadata(t, h, publicID, token))
 }
 
-func TestSecretMetadata_ReusableSecretTellsWhenARecipientFirstOpenedIt(t *testing.T) {
+func TestSecretMetadata_ReusableSecretTellsWhetherARecipientOpenedIt(t *testing.T) {
 	repo := newMockRepo()
 	fs := newMockFileStore()
 	h := NewSecretHandler(repo, fs)
@@ -205,17 +251,13 @@ func TestSecretMetadata_ReusableSecretTellsWhenARecipientFirstOpenedIt(t *testin
 	if rec := startSessionAs(t, h, publicID, token, deletionToken); rec.Code != http.StatusCreated {
 		t.Fatalf("owner open status = %d. body: %s", rec.Code, rec.Body.String())
 	}
-	if meta := decodeMetadata(t, getMetadata(t, h, publicID, token)); meta.OpenedAt != nil {
-		t.Errorf("opened_at = %q after the owner's own look, want none", *meta.OpenedAt)
+	if meta := decodeMetadata(t, getMetadata(t, h, publicID, token)); meta.Opened {
+		t.Error("opened = true after the owner's own look, want false")
 	}
 
 	startTestRetrievalSession(t, h, publicID, token)
-	meta := decodeMetadata(t, getMetadata(t, h, publicID, token))
-	if meta.OpenedAt == nil {
-		t.Fatal("opened_at missing after a recipient opened the secret")
-	}
-	if _, err := time.Parse(time.RFC3339, *meta.OpenedAt); err != nil {
-		t.Errorf("opened_at = %q, want RFC 3339", *meta.OpenedAt)
+	if meta := decodeMetadata(t, getMetadata(t, h, publicID, token)); !meta.Opened {
+		t.Error("opened = false after a recipient opened the secret, want true")
 	}
 }
 

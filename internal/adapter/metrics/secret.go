@@ -4,7 +4,7 @@ import "github.com/prometheus/client_golang/prometheus"
 
 type SecretMetrics struct {
 	SecretsCreated prometheus.Counter
-	SecretsCleaned prometheus.Counter
+	ObjectsDeleted prometheus.Counter
 	CleanupErrors  prometheus.Counter
 }
 
@@ -17,11 +17,11 @@ func NewSecretMetrics(reg *prometheus.Registry) *SecretMetrics {
 				Help:      "Total number of secrets created.",
 			},
 		),
-		SecretsCleaned: prometheus.NewCounter(
+		ObjectsDeleted: prometheus.NewCounter(
 			prometheus.CounterOpts{
 				Namespace: namespace,
-				Name:      "secrets_cleaned_total",
-				Help:      "Total number of secrets the cleanup removed. Every secret ends there exactly once, whether it expired, was opened once or was deleted.",
+				Name:      "objects_deleted_total",
+				Help:      "Total number of objects the cleanup deleted from storage: those of expired, opened one-time and deleted secrets, and of abandoned uploads.",
 			},
 		),
 		CleanupErrors: prometheus.NewCounter(
@@ -32,6 +32,6 @@ func NewSecretMetrics(reg *prometheus.Registry) *SecretMetrics {
 			},
 		),
 	}
-	reg.MustRegister(m.SecretsCreated, m.SecretsCleaned, m.CleanupErrors)
+	reg.MustRegister(m.SecretsCreated, m.ObjectsDeleted, m.CleanupErrors)
 	return m
 }

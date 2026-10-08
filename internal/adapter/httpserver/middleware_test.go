@@ -432,18 +432,61 @@ func TestRequestLoggerKeepsErrorLevelForServerFaults(t *testing.T) {
 		if entry["msg"] != "request" {
 			continue
 		}
-		path, _ := entry["path"].(string)
-		expected, ok := want[path]
+		// These routes have no parameters, so the route is the path.
+		route, _ := entry["route"].(string)
+		expected, ok := want[route]
 		if !ok {
 			continue
 		}
 		_, hasError := entry["error"]
 		if entry["level"] != expected.level || hasError != expected.hasError {
-			t.Errorf("%s: level %v, error logged %v; want %s, %v", path, entry["level"], hasError, expected.level, expected.hasError)
+			t.Errorf("%s: level %v, error logged %v; want %s, %v", route, entry["level"], hasError, expected.level, expected.hasError)
 		}
-		delete(want, path)
+		delete(want, route)
 	}
 	if len(want) > 0 {
 		t.Errorf("no request log for %v", want)
+	}
+}
+
+func TestRequestLoggerNamesTheRouteNotThePath(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	e := echo.New()
+	e.HTTPErrorHandler = httpErrorHandler
+	e.Use(requestLogger())
+	e.GET("/api/v1/secrets/:publicID/meta", func(c echo.Context) error { return c.NoContent(http.StatusOK) })
+	publicID := testPublicID("logged route")
+
+	tests := []struct {
+		path  string
+		route string
+	}{
+		{path: "/api/v1/secrets/" + publicID + "/meta", route: "/api/v1/secrets/:publicID/meta"},
+		// A path no route matches still names no secret.
+		{path: "/api/v1/unknown/" + publicID, route: "/*"},
+	}
+	for _, tt := range tests {
+		logs.Reset()
+		e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, tt.path, nil))
+
+		line := strings.TrimSpace(logs.String())
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("decode log line %q: %v", line, err)
+		}
+		if entry["route"] != tt.route {
+			t.Errorf("%s: route = %v, want %q", tt.path, entry["route"], tt.route)
+		}
+		if _, ok := entry["path"]; ok {
+			t.Errorf("%s: log has a path: %s", tt.path, line)
+		}
+		// The log must not tell which secret was asked for when.
+		if strings.Contains(line, publicID) {
+			t.Errorf("%s: log line names the public id: %s", tt.path, line)
+		}
 	}
 }

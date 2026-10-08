@@ -8,10 +8,11 @@ The server cannot read what it stores. Keys are derived and used only by the cli
 
 - **Uploads:** a secret arrives as a multipart upload session. Parts of up to 32 MiB are streamed into S3-compatible storage and assembled when the session completes, so no request ever carries the whole secret.
 - **Retrieval:** the link's metadata token unlocks the encrypted metadata. Its blob token opens a 15-minute retrieval session that reads the bundle by byte range. Opening a one-time secret ends it.
-- **Owner status:** after a secret is gone, its tombstone keeps for a week whether it was opened and when, expired, or was deleted, for whoever holds its link.
-- **Deletion:** the owner link's deletion token removes a secret at once.
+- **Owner status:** a link can tell whether a reusable secret has been opened, and after a one-time secret was opened or any secret was deleted, which of the two, until the secret's expiry. Never when. Once it expires, nothing about it is kept: an expired link gets the same 404 as one that never existed.
+- **Deletion:** the owner link's deletion token ends a secret at once; its object leaves storage within a minute.
 - **Short-code hand-off:** a relay through which two devices pass a link after a password-authenticated key exchange. The server only sees public key-exchange shares and ciphertext.
-- **Cleanup:** a worker removes expired, consumed and deleted secrets every minute.
+- **Cleanup:** a worker runs every minute. It forgets secrets past their expiry and abandons uploads that ran out of time, and it is the only code that deletes from storage: every object is on file from before it is written until after it is deleted, so storage never holds one the database has forgotten.
+- **Logs:** a request is logged by its route, not its path, so the logs don't say which secret was asked for.
 
 ### Endpoints
 
@@ -21,7 +22,7 @@ The server cannot read what it stores. Keys are derived and used only by the cli
 | `PUT /api/v1/secrets/uploads/{session}/parts/{n}` | upload one part |
 | `POST /api/v1/secrets/uploads/{session}/complete` | turn the parts into the secret |
 | `DELETE /api/v1/secrets/uploads/{session}` | abandon an upload |
-| `GET /api/v1/secrets/{id}/meta` | the encrypted metadata, or 410 with what became of a gone secret |
+| `GET /api/v1/secrets/{id}/meta` | the encrypted metadata, or 410 with how an ended secret ended (`opened` or `deleted`) |
 | `POST /api/v1/secrets/{id}/retrieval-session` | open the secret for reading |
 | `GET /api/v1/secrets/{id}/blob` | read a byte range within a retrieval session |
 | `DELETE /api/v1/secrets/{id}` | delete, with the owner's deletion token |
@@ -61,7 +62,7 @@ Environment variables; see [`.env.example`](.env.example).
 | `S3_ACCESS_KEY` / `S3_SECRET_KEY` | S3 credentials | — |
 | `S3_REGION` | region for request signing | `us-east-1` |
 | `MAX_FILE_SIZE` | encrypted upload limit in bytes | `1073741824` (1 GiB) |
-| `CLEANUP_INTERVAL` | how often expired secrets are removed | `1m` |
+| `CLEANUP_INTERVAL` | how often the cleanup runs | `1m` |
 | `ALLOWED_ORIGINS` | CORS origins, only needed when the web app is served from another origin | — |
 | `METRICS_TOKEN` | bearer token required for `/metrics` | — |
 | `TRUSTED_PROXIES` | IPs or CIDRs of reverse proxies whose `X-Forwarded-For` is trusted for rate limiting | — |
@@ -81,7 +82,7 @@ make lint
 make vuln
 ```
 
-The API test (`apitest/`) checks a running server through its HTTP API alone, with no client and no format library: uploads in one and several parts, the upload rules, metadata, retrieval and byte ranges, one-time and reusable secrets, tombstones for the token holder only, deletion, and the short-code relay. The server never decrypts anything, so random bytes stand in for ciphertext. It sends more requests than the rate limits allow from one address, so the server under test needs raised limits:
+The API test (`apitest/`) checks a running server through its HTTP API alone, with no client and no format library: uploads in one and several parts, the upload rules, metadata, retrieval and byte ranges, one-time and reusable secrets, how an ended secret ended for the token holder only, deletion, and the short-code relay. The server never decrypts anything, so random bytes stand in for ciphertext. It sends more requests than the rate limits allow from one address, so the server under test needs raised limits:
 
 ```bash
 make build && RATE_LIMIT_MULTIPLIER=100 ./bin/secretli   # with DATABASE_URL and S3_* set

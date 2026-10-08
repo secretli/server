@@ -76,18 +76,24 @@ func correlationMiddleware() echo.MiddlewareFunc {
 	}
 }
 
+// requestLogger logs one line per request. It names the route, not the
+// path: a path holds the secret's public id, and the log should not tell
+// which secret was asked for when.
 func requestLogger() echo.MiddlewareFunc {
 	return middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
 		LogMethod:   true,
-		LogURIPath:  true,
 		LogStatus:   true,
 		LogLatency:  true,
 		LogError:    true,
 		HandleError: true,
 		LogValuesFunc: func(c echo.Context, v middleware.RequestLoggerValues) error {
+			route := c.Path()
+			if route == "" {
+				route = "/*"
+			}
 			attrs := []any{
 				"method", v.Method,
-				"path", v.URIPath,
+				"route", route,
 				"status", v.Status,
 				"duration_ms", v.Latency.Milliseconds(),
 			}

@@ -2,46 +2,26 @@ package httpserver
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/labstack/echo/v4"
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/secretli/server/internal/domain"
 	"github.com/secretli/server/internal/platform/config"
 )
 
 // fullMockRepo satisfies domain.Repo so the complete route table, including
-// multipart uploads and transfers, is registered.
+// multipart uploads and transfers, is registered. The secret and upload mocks
+// keep separate rows: these tests drive uploads, not reads of their secrets.
 type fullMockRepo struct {
 	*mockSecretRepo
 	*uploadMockRepo
 	*transferMockRepo
-}
-
-func (fullMockRepo) AbortExpiredUploadSessions(
-	_ context.Context,
-	_ time.Time,
-	_ int,
-	_ func(*domain.UploadSession) error,
-) (domain.CleanupBatch, error) {
-	return domain.CleanupBatch{}, nil
-}
-
-func (fullMockRepo) PurgeFinishedUploadSessions(
-	_ context.Context,
-	_ time.Time,
-	_ int,
-	_ func(*domain.UploadSession) error,
-) (domain.CleanupBatch, error) {
-	return domain.CleanupBatch{}, nil
 }
 
 func newTestApp(t *testing.T, cfg config.Config) *App {

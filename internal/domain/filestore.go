@@ -24,4 +24,7 @@ type MultipartFileStore interface {
 	UploadPart(ctx context.Context, key, uploadID string, partNumber int, reader io.Reader, size int64) (etag string, err error)
 	CompleteMultipartUpload(ctx context.Context, key, uploadID string, parts []CompletedPart) error
 	AbortMultipartUpload(ctx context.Context, key, uploadID string) error
+	// AbortMultipartUploads aborts every multipart upload in progress under
+	// key, without needing an upload id.
+	AbortMultipartUploads(ctx context.Context, key string) error
 }

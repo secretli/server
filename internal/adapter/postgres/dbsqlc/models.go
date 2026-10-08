@@ -23,38 +23,43 @@ type CodeTransfer struct {
 	ClosedAt           pgtype.Timestamptz
 }
 
+type Object struct {
+	StorageKey string
+	State      string
+	S3UploadID pgtype.Text
+	CreatedAt  pgtype.Timestamptz
+	DoomedAt   pgtype.Timestamptz
+}
+
 type RetrievalSession struct {
-	ID               int64
-	PublicID         string
 	SessionTokenHash string
+	PublicID         string
 	ExpiresAt        pgtype.Timestamptz
-	CreatedAt        pgtype.Timestamptz
 }
 
 type Secret struct {
 	PublicID          string
+	State             string
+	StorageKey        pgtype.Text
 	MetadataTokenHash string
-	BlobTokenHash     string
-	DeletionTokenHash string
-	EncryptedMeta     string
+	BlobTokenHash     pgtype.Text
+	DeletionTokenHash pgtype.Text
+	EncryptedMeta     pgtype.Text
 	BlobSize          int64
 	BurnAfterRead     bool
 	ExpiresAt         pgtype.Timestamptz
 	CreatedAt         pgtype.Timestamptz
-	RetrievedAt       pgtype.Timestamptz
-	StorageKey        string
+	Opened            bool
+	Outcome           pgtype.Text
 }
 
-type SecretTombstone struct {
-	PublicID          string
-	MetadataTokenHash string
-	DeletionTokenHash string
-	Outcome           string
-	BurnAfterRead     bool
-	EndedAt           pgtype.Timestamptz
-	FirstOpenedAt     pgtype.Timestamptz
-	OpenedByOwner     bool
-	KeepUntil         pgtype.Timestamptz
+type Upload struct {
+	SessionID       string
+	PublicID        pgtype.Text
+	UploadTokenHash string
+	State           string
+	ExpiresAt       pgtype.Timestamptz
+	FinishedAt      pgtype.Timestamptz
 }
 
 type UploadPart struct {
@@ -65,24 +70,4 @@ type UploadPart struct {
 	PartSha256 string
 	Etag       string
 	CreatedAt  pgtype.Timestamptz
-}
-
-type UploadSession struct {
-	SessionID         string
-	PublicID          string
-	UploadTokenHash   string
-	MetadataTokenHash pgtype.Text
-	BlobTokenHash     pgtype.Text
-	DeletionTokenHash pgtype.Text
-	S3UploadID        string
-	BlobSize          int64
-	EncryptedMeta     pgtype.Text
-	BurnAfterRead     bool
-	SecretExpiresAt   pgtype.Timestamptz
-	UploadExpiresAt   pgtype.Timestamptz
-	State             string
-	CreatedAt         pgtype.Timestamptz
-	CompletedAt       pgtype.Timestamptz
-	AbortedAt         pgtype.Timestamptz
-	StorageKey        string
 }
