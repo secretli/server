@@ -25,7 +25,7 @@ services:
       SERVER_PORT: "8080"
 
   postgres:
-    image: postgres:18-alpine
+    image: public.ecr.aws/docker/library/postgres:18-alpine
     ports:
       - "5432:5432"
     environment:
@@ -52,7 +52,7 @@ services:
       - seaweedfs_data:/data
 
   createbucket:
-    image: curlimages/curl:8.22.0
+    image: quay.io/curl/curl:8.22.0
     depends_on:
       - seaweedfs
     entrypoint: >
