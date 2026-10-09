@@ -1,6 +1,7 @@
 package apitest
 
 import (
+	"bytes"
 	"fmt"
 	"net/http"
 	"strings"
@@ -303,5 +304,46 @@ func TestTimesAreKeptToTheMinute(t *testing.T) {
 				t.Errorf("created_at = %v, want the minute the upload completed in, at about %v", created, before)
 			}
 		})
+	}
+}
+
+// TestAGoneSecretsLinkCannotBeReused plays someone who intercepted a link:
+// they can derive everything a secret under it needs, so after opening a
+// one-time secret, or after its owner deleted it, they try to upload their
+// own content under the same link for its recipient to read. The id stays
+// taken until the secret's expiry, so that is refused like any id in use,
+// and the link still finds nothing.
+func TestAGoneSecretsLinkCannotBeReused(t *testing.T) {
+	a := server(t)
+
+	// What an upload under an id in use is told.
+	inUse := newSecret(t, 1, false)
+	var session uploadSession
+	a.startUpload(inUse).expect(t, "an upload", http.StatusCreated, &session)
+	duplicate := newSecret(t, 1, false)
+	duplicate.publicID = inUse.publicID
+	taken := a.startUpload(duplicate)
+	taken.expect(t, "an upload under an id in use", http.StatusConflict, nil)
+	a.abortUpload(session).expect(t, "abort the upload", http.StatusNoContent, nil)
+
+	for _, end := range []string{"opened", "deleted"} {
+		s := newSecret(t, 512, true)
+		a.upload(s)
+		switch end {
+		case "opened":
+			a.startRetrieval(s, s.blobToken, "").expect(t, "the interceptor opens it", http.StatusCreated, nil)
+		case "deleted":
+			a.deleteSecret(s, s.deletionToken).expect(t, "the owner deletes it", http.StatusNoContent, nil)
+		}
+
+		// Everything but the owner's deletion token comes from the link.
+		fake := newSecret(t, 512, true)
+		fake.publicID, fake.metadataToken, fake.blobToken = s.publicID, s.metadataToken, s.blobToken
+		r := a.startUpload(fake)
+		r.expect(t, "an upload under the link of a secret that was "+end, http.StatusConflict, nil)
+		if !bytes.Equal(r.body, taken.body) {
+			t.Errorf("reusing the link of a secret that was %s answers %s; an id in use gets %s", end, r.body, taken.body)
+		}
+		a.expectNotThere(s, "after the reuse was refused, "+end)
 	}
 }

@@ -60,12 +60,12 @@ SET opened = TRUE
 WHERE public_id = $1;
 
 -- name: DeleteUploadingSecrets :many
--- An abandoned upload's secret never existed: its row goes, which frees the
--- public id. Returns the keys of the objects to doom.
+-- An abandoned upload's secret never existed: its row goes. Returns its id,
+-- to free, and the key of the object to doom.
 DELETE FROM secrets
 WHERE public_id = ANY(sqlc.arg(public_ids)::text[])
   AND state = 'uploading'
-RETURNING storage_key;
+RETURNING public_id, storage_key;
 
 -- name: ListDrainedSecretsForUpdate :many
 -- Closing secrets whose last download session has ended.
@@ -94,8 +94,9 @@ LIMIT sqlc.arg(batch_size)
 FOR UPDATE SKIP LOCKED;
 
 -- name: DeleteSecretsByPublicIDs :execrows
--- Nothing about a deleted secret is kept, and its retrieval sessions go with
--- it. The caller dooms the objects in the same transaction.
+-- Nothing about a deleted secret is kept but its id, which stays reserved
+-- until the expiry, and its retrieval sessions go with it. The caller dooms
+-- the objects in the same transaction.
 DELETE FROM secrets
 WHERE public_id = ANY(sqlc.arg(public_ids)::text[]);
 

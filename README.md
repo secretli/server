@@ -10,8 +10,9 @@ The server cannot read what it stores. Keys are derived and used only by the cli
 - **Retrieval:** the link's metadata token unlocks the encrypted metadata. Its blob token opens a 15-minute retrieval session that reads the bundle by byte range. Opening a one-time secret closes it: nobody can open it again, and only the download that opened it can still read it, until that session ends.
 - **Owner status:** a link can tell whether a recipient has opened a reusable secret. Never when. Once a secret is deleted, expires or, being one-time, has been opened, nothing about it is told: its link gets the same 404 as one that never existed.
 - **Deletion:** the owner link's deletion token removes a secret at once; its object leaves storage within a minute.
+- **Reserved links:** a public id stays taken until the expiry of the secret that took it, also after the secret was opened or deleted, so nobody holding the link can put other content under it (see [SECURITY.md](SECURITY.md)).
 - **Short-code hand-off:** a relay through which two devices pass a link after a password-authenticated key exchange. The server only sees public key-exchange shares and ciphertext.
-- **Cleanup:** a worker runs every minute. It forgets secrets past their expiry and opened one-time secrets whose download ended, abandons uploads that ran out of time, and is the only code that deletes from storage: every object is on file from before it is written until after it is deleted, so storage never holds one the database has forgotten.
+- **Cleanup:** a worker runs every minute. It forgets secrets past their expiry and opened one-time secrets whose download ended, frees public ids past their expiry, abandons uploads that ran out of time, and is the only code that deletes from storage: every object is on file from before it is written until after it is deleted, so storage never holds one the database has forgotten.
 - **Logs:** a request is logged by its route, not its path, so the logs don't say which secret was asked for.
 
 ### Endpoints

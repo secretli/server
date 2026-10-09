@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	pgadapter "github.com/secretli/server/internal/adapter/postgres"
 	"github.com/secretli/server/internal/domain"
 	tokencrypto "github.com/secretli/server/internal/platform/crypto"
@@ -344,6 +345,93 @@ func TestCleanupRepo_DeleteExpiredSecrets(t *testing.T) {
 	}
 }
 
+func TestCleanupRepo_DeleteExpiredPublicIDs(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	ctx := context.Background()
+	now := moment(time.Now())
+	expired := now.Add(-time.Minute)
+
+	// The id of a secret that was deleted, past and before its expiry.
+	for _, s := range []struct {
+		id        string
+		expiresAt time.Time
+	}{{"deleted-expired", expired}, {"deleted", now.Add(time.Hour)}} {
+		mustCreate(t, repo, newTestSecret(s.id, s.expiresAt))
+		if err := repo.Delete(ctx, s.id, expired.Add(-time.Hour)); err != nil {
+			t.Fatalf("delete %s: %v", s.id, err)
+		}
+	}
+	// A secret past its expiry that the secrets' sweep has not reached yet
+	// keeps its id until it goes.
+	mustCreate(t, repo, newTestSecret("live-expired", expired))
+	// An upload under way keeps its id past the provisional expiry.
+	mustStartUpload(t, repo, "up-slow", newTestSecret("slow", expired), now.Add(time.Hour))
+
+	n, err := repo.DeleteExpiredPublicIDs(ctx, now, testBatchSize)
+	if err != nil {
+		t.Fatalf("delete expired public ids: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("freed %d ids, want 1", n)
+	}
+	ids := func() []string {
+		t.Helper()
+		rows, err := pool.Query(ctx, "SELECT public_id FROM public_ids ORDER BY public_id")
+		if err != nil {
+			t.Fatalf("query public ids: %v", err)
+		}
+		got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			t.Fatalf("collect public ids: %v", err)
+		}
+		return got
+	}
+	if got, want := ids(), []string{"deleted", "live-expired", "slow"}; !slices.Equal(got, want) {
+		t.Errorf("ids left = %v, want %v", got, want)
+	}
+
+	// Once the secrets' sweep forgot the expired secret, its id goes too.
+	if _, err := repo.DeleteExpiredSecrets(ctx, now, testBatchSize); err != nil {
+		t.Fatalf("delete expired secrets: %v", err)
+	}
+	if n, err := repo.DeleteExpiredPublicIDs(ctx, now, testBatchSize); err != nil || n != 1 {
+		t.Errorf("second sweep = %d, %v; want the expired secret's id freed", n, err)
+	}
+	if got, want := ids(), []string{"deleted", "slow"}; !slices.Equal(got, want) {
+		t.Errorf("ids left = %v, want %v", got, want)
+	}
+}
+
+func TestCleanupRepo_DeleteExpiredPublicIDsInBatchesOldestFirst(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	ctx := context.Background()
+	now := moment(time.Now())
+	for _, tc := range []struct {
+		id  string
+		ago time.Duration
+	}{{"1h", time.Hour}, {"3h", 3 * time.Hour}, {"2h", 2 * time.Hour}} {
+		mustCreate(t, repo, newTestSecret(tc.id, now.Add(time.Hour)))
+		if err := repo.Delete(ctx, tc.id, now); err != nil {
+			t.Fatalf("delete %s: %v", tc.id, err)
+		}
+		if _, err := pool.Exec(ctx, "UPDATE public_ids SET expires_at = $2 WHERE public_id = $1", tc.id, now.Add(-tc.ago)); err != nil {
+			t.Fatalf("set expiry: %v", err)
+		}
+	}
+
+	if n, err := repo.DeleteExpiredPublicIDs(ctx, now, 2); err != nil || n != 2 {
+		t.Fatalf("first batch = %d, %v; want 2", n, err)
+	}
+	if n := countRows(t, pool, "SELECT count(*) FROM public_ids WHERE public_id = '1h'"); n != 1 {
+		t.Error("the first batch freed the youngest id, want the oldest two")
+	}
+	if n, err := repo.DeleteExpiredPublicIDs(ctx, now, 2); err != nil || n != 1 {
+		t.Errorf("second batch = %d, %v; want 1", n, err)
+	}
+}
+
 func TestCleanupRepo_DeleteExpiredSecretsInBatchesOldestFirst(t *testing.T) {
 	pool := setupTestDB(t)
 	repo := pgadapter.NewSecretRepo(pool)
@@ -658,6 +746,7 @@ func TestCleanupRepo_NothingOutlivesASecret(t *testing.T) {
 				{"finished uploads", func() error { _, err := repo.DeleteFinishedUploads(ctx, later.Add(-time.Hour)); return err }},
 				{"drained secrets", func() error { _, err := repo.DeleteDrainedSecrets(ctx, later, testBatchSize); return err }},
 				{"expired secrets", func() error { _, err := repo.DeleteExpiredSecrets(ctx, later, testBatchSize); return err }},
+				{"expired public ids", func() error { _, err := repo.DeleteExpiredPublicIDs(ctx, later, testBatchSize); return err }},
 				{"doomed objects", func() error {
 					_, err := repo.DeleteDoomedObjects(ctx, testBatchSize, removeAll(&removed))
 					return err
@@ -678,7 +767,7 @@ func TestCleanupRepo_NothingOutlivesASecret(t *testing.T) {
 			if !slices.Equal(removed, []string{"blobs/up-whole"}) {
 				t.Errorf("removed from storage %v, want blobs/up-whole exactly once", removed)
 			}
-			for _, table := range []string{"objects", "secrets", "uploads", "upload_parts", "retrieval_sessions"} {
+			for _, table := range []string{"objects", "public_ids", "secrets", "uploads", "upload_parts", "retrieval_sessions"} {
 				if n := countRows(t, pool, "SELECT count(*) FROM "+table); n != 0 {
 					t.Errorf("%s keeps %d rows", table, n)
 				}

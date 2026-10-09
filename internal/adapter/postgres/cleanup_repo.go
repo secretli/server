@@ -132,9 +132,24 @@ func (r *SecretRepo) DeleteExpiredSecrets(ctx context.Context, now time.Time, li
 	return int(deleted), nil
 }
 
+// DeleteExpiredPublicIDs frees one batch of at most limit public ids past
+// their expiry whose secret is gone, oldest first, and returns how many it
+// freed. It runs after DeleteExpiredSecrets, so a secret's id goes in the
+// cycle its secret does.
+func (r *SecretRepo) DeleteExpiredPublicIDs(ctx context.Context, now time.Time, limit int) (int, error) {
+	n, err := r.q.DeleteExpiredPublicIDs(ctx, dbsqlc.DeleteExpiredPublicIDsParams{
+		NowAt:     timestamptz(now),
+		BatchSize: int32(limit), //nolint:gosec // small constant chosen by the caller
+	})
+	if err != nil {
+		return 0, fmt.Errorf("delete expired public ids: %w", err)
+	}
+	return int(n), nil
+}
+
 // deleteSecrets dooms the objects of secrets whose rows the caller has
 // locked and deletes the rows, their retrieval sessions with them, and
-// returns how many it deleted.
+// returns how many it deleted. Their ids stay reserved until the expiry.
 func deleteSecrets(ctx context.Context, qtx *dbsqlc.Queries, publicIDs, storageKeys []string) (int64, error) {
 	if err := qtx.DoomObjects(ctx, storageKeys); err != nil {
 		return 0, fmt.Errorf("doom objects: %w", err)

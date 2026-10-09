@@ -77,6 +77,7 @@ type mockRepo struct {
 	endedTransfers    sqlStep
 	drainedSecrets    sqlBacklog
 	expiredSecrets    sqlBacklog
+	expiredPublicIDs  sqlBacklog
 
 	// doomed is the doomed objects, oldest first. A batch takes up to limit of
 	// them from the front, and those whose removal fails stay there, as their
@@ -100,6 +101,7 @@ var allSweeps = []string{
 	"DeleteEndedTransfers",
 	"DeleteDrainedSecrets",
 	"DeleteExpiredSecrets",
+	"DeleteExpiredPublicIDs",
 	"DeleteDoomedObjects",
 }
 
@@ -131,6 +133,11 @@ func (m *mockRepo) DeleteDrainedSecrets(ctx context.Context, now time.Time, limi
 func (m *mockRepo) DeleteExpiredSecrets(ctx context.Context, now time.Time, limit int) (int, error) {
 	m.called(ctx, "DeleteExpiredSecrets")
 	return m.expiredSecrets.run(now, limit)
+}
+
+func (m *mockRepo) DeleteExpiredPublicIDs(ctx context.Context, now time.Time, limit int) (int, error) {
+	m.called(ctx, "DeleteExpiredPublicIDs")
+	return m.expiredPublicIDs.run(now, limit)
 }
 
 func (m *mockRepo) DeleteEndedTransfers(ctx context.Context, endedBefore time.Time) (int64, error) {
@@ -230,6 +237,7 @@ var batchedSweeps = []struct {
 	{"expired uploads", func(r *mockRepo) *sqlBacklog { return &r.abandonedUploads }},
 	{"drained secrets", func(r *mockRepo) *sqlBacklog { return &r.drainedSecrets }},
 	{"expired secrets", func(r *mockRepo) *sqlBacklog { return &r.expiredSecrets }},
+	{"expired public ids", func(r *mockRepo) *sqlBacklog { return &r.expiredPublicIDs }},
 }
 
 func writing(key string) *domain.Object {
@@ -285,6 +293,7 @@ func TestRunCycle_RunsEverySweepWithItsCutoff(t *testing.T) {
 		{"ended transfers", repo.endedTransfers.cutoff, endedTransferRetention},
 		{"drained secrets", repo.drainedSecrets.cutoff, 0},
 		{"expired secrets", repo.expiredSecrets.cutoff, 0},
+		{"expired public ids", repo.expiredPublicIDs.cutoff, 0},
 	} {
 		if earliest, latest := before.Add(-c.retention), after.Add(-c.retention); c.cutoff.Before(earliest) || c.cutoff.After(latest) {
 			t.Errorf("%s: cutoff %v, want the cycle's start less %v, between %v and %v", c.sweep, c.cutoff, c.retention, earliest, latest)
@@ -299,6 +308,7 @@ func TestRunCycle_RunsEverySweepWithItsCutoff(t *testing.T) {
 		{"expired uploads", repo.abandonedUploads.limits},
 		{"drained secrets", repo.drainedSecrets.limits},
 		{"expired secrets", repo.expiredSecrets.limits},
+		{"expired public ids", repo.expiredPublicIDs.limits},
 		{"doomed objects", repo.doomedLimits},
 	} {
 		if !slices.Equal(c.limits, []int{batchSize}) {
@@ -323,6 +333,18 @@ func TestRunCycle_RemovesObjectsAfterEverythingThatDoomsThem(t *testing.T) {
 	last := len(repo.order) - 1
 	if repo.order[last] != "DeleteDoomedObjects" || slices.Contains(repo.order[:last], "DeleteDoomedObjects") {
 		t.Errorf("sweeps ran in the order %v, want the object sweep once, and last", repo.order)
+	}
+}
+
+func TestRunCycle_FreesPublicIDsAfterForgettingTheirSecrets(t *testing.T) {
+	repo := &mockRepo{}
+	w := NewWorker(time.Minute, repo, &mockFileStore{}, testMetrics())
+	w.runCycle(context.Background())
+
+	// A secret that expires is forgotten and its id freed in the same cycle.
+	secrets, ids := slices.Index(repo.order, "DeleteExpiredSecrets"), slices.Index(repo.order, "DeleteExpiredPublicIDs")
+	if secrets < 0 || ids < secrets {
+		t.Errorf("sweeps ran in the order %v, want the public ids after the expired secrets", repo.order)
 	}
 }
 
@@ -728,6 +750,7 @@ func TestRunCycle_AFailingStepDoesNotStopTheOthers(t *testing.T) {
 		{"DeleteEndedTransfers", func(r *mockRepo) { r.endedTransfers.err = boom }},
 		{"DeleteDrainedSecrets", func(r *mockRepo) { r.drainedSecrets.err = boom }},
 		{"DeleteExpiredSecrets", func(r *mockRepo) { r.expiredSecrets.err = boom }},
+		{"DeleteExpiredPublicIDs", func(r *mockRepo) { r.expiredPublicIDs.err = boom }},
 		{"DeleteDoomedObjects", func(r *mockRepo) { r.doomedErr = boom }},
 	} {
 		t.Run(step.sweep, func(t *testing.T) {
@@ -763,6 +786,7 @@ func TestRunCycle_CountsEveryFailedStep(t *testing.T) {
 	repo.endedTransfers.err = boom
 	repo.drainedSecrets = sqlBacklog{due: 2 * batchSize, err: boom}
 	repo.expiredSecrets = sqlBacklog{due: 2 * batchSize, err: boom}
+	repo.expiredPublicIDs = sqlBacklog{due: 2 * batchSize, err: boom}
 	m := testMetrics()
 
 	w := NewWorker(time.Minute, repo, &mockFileStore{}, m)

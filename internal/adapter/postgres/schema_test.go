@@ -58,7 +58,13 @@ func (c secretColumns) closing() secretColumns {
 	return c
 }
 
+// execSecret registers the public id, as every upload does first, and
+// inserts the secret.
 func execSecret(pool *pgxpool.Pool, publicID string, c secretColumns, now time.Time) error {
+	if _, err := pool.Exec(context.Background(),
+		"INSERT INTO public_ids (public_id, expires_at) VALUES ($1, $2) ON CONFLICT DO NOTHING", publicID, now.Add(time.Hour)); err != nil {
+		return err
+	}
 	_, err := pool.Exec(context.Background(), insertSecret, publicID, c.state, c.storageKey, c.metaHash, c.blobHash, c.deleteHash,
 		c.meta, c.blobSize, c.burnAfterRead, now.Add(time.Hour), c.createdAt, c.opened)
 	return err
@@ -211,6 +217,15 @@ func TestSchema_SecretsAndObjectsReferToEachOther(t *testing.T) {
 	// A secret's object is in the ledger before it is written.
 	err := execSecret(pool, "no-object", liveColumns("blobs/unknown", now), now)
 	assertPgError(t, err, foreignKeyViolation, "secret pointing at an unknown object")
+
+	// And its id is registered, so that it stays taken after the secret.
+	if _, err := pool.Exec(ctx, "INSERT INTO objects (storage_key, state) VALUES ('blobs/unregistered', 'stored')"); err != nil {
+		t.Fatalf("insert object: %v", err)
+	}
+	c := liveColumns("blobs/unregistered", now)
+	_, err = pool.Exec(ctx, insertSecret, "unregistered", c.state, c.storageKey, c.metaHash, c.blobHash, c.deleteHash,
+		c.meta, c.blobSize, c.burnAfterRead, now.Add(time.Hour), c.createdAt, c.opened)
+	assertPgError(t, err, foreignKeyViolation, "secret under an unregistered id")
 
 	if _, err := pool.Exec(ctx, "INSERT INTO objects (storage_key, state) VALUES ('blobs/held', 'stored')"); err != nil {
 		t.Fatalf("insert object: %v", err)

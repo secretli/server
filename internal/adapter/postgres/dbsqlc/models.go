@@ -31,6 +31,11 @@ type Object struct {
 	FailedRemovals int32
 }
 
+type PublicID struct {
+	PublicID  string
+	ExpiresAt pgtype.Timestamptz
+}
+
 type RetrievalSession struct {
 	SessionTokenHash string
 	PublicID         string
