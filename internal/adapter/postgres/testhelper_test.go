@@ -76,7 +76,7 @@ func startTestDB() {
 	ctx := context.Background()
 
 	pgContainer, err := tcpostgres.Run(ctx,
-		"postgres:18-alpine",
+		"public.ecr.aws/docker/library/postgres:18-alpine",
 		tcpostgres.WithDatabase("secretli_test"),
 		tcpostgres.WithUsername("test"),
 		tcpostgres.WithPassword("test"),

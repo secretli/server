@@ -14,7 +14,7 @@
         "/^internal/.+_test\\.go$/"
       ],
       "matchStrings": [
-        "\"(?<depName>chrislusf/seaweedfs|postgres):(?<currentValue>[^\"]+)\""
+        "\"(?<depName>chrislusf/seaweedfs|public\\.ecr\\.aws/docker/library/postgres):(?<currentValue>[^\"]+)\""
       ],
       "datasourceTemplate": "docker"
     }
@@ -29,7 +29,7 @@
     },
     {
       "matchPackageNames": [
-        "postgres"
+        "public.ecr.aws/docker/library/postgres"
       ],
       "groupName": "Postgres"
     }
