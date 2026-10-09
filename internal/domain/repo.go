@@ -46,8 +46,9 @@ type SecretRepo interface {
 type UploadRepo interface {
 	// StartUpload files the secret as uploading, the upload that creates it
 	// and the object it is written to, in one transaction, before anything
-	// reaches storage. It returns ErrDuplicate if the public id is taken,
-	// whatever state that secret is in, and ErrStorageFull if storage is
+	// reaches storage. It returns ErrDuplicate if the public id is taken: by a
+	// secret in any state, or, until its expiry, by one that was opened or
+	// deleted. It returns ErrStorageFull if storage is
 	// capped and the secret would take it past the cap. When the upload
 	// started is not kept.
 	StartUpload(ctx context.Context, secret *Secret, upload *Upload) error

@@ -82,8 +82,9 @@ DELETE FROM secrets
 WHERE public_id = ANY($1::text[])
 `
 
-// Nothing about a deleted secret is kept, and its retrieval sessions go with
-// it. The caller dooms the objects in the same transaction.
+// Nothing about a deleted secret is kept but its id, which stays reserved
+// until the expiry, and its retrieval sessions go with it. The caller dooms
+// the objects in the same transaction.
 func (q *Queries) DeleteSecretsByPublicIDs(ctx context.Context, publicIds []string) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteSecretsByPublicIDs, publicIds)
 	if err != nil {
@@ -96,24 +97,29 @@ const deleteUploadingSecrets = `-- name: DeleteUploadingSecrets :many
 DELETE FROM secrets
 WHERE public_id = ANY($1::text[])
   AND state = 'uploading'
-RETURNING storage_key
+RETURNING public_id, storage_key
 `
 
-// An abandoned upload's secret never existed: its row goes, which frees the
-// public id. Returns the keys of the objects to doom.
-func (q *Queries) DeleteUploadingSecrets(ctx context.Context, publicIds []string) ([]string, error) {
+type DeleteUploadingSecretsRow struct {
+	PublicID   string
+	StorageKey string
+}
+
+// An abandoned upload's secret never existed: its row goes. Returns its id,
+// to free, and the key of the object to doom.
+func (q *Queries) DeleteUploadingSecrets(ctx context.Context, publicIds []string) ([]DeleteUploadingSecretsRow, error) {
 	rows, err := q.db.Query(ctx, deleteUploadingSecrets, publicIds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []string{}
+	items := []DeleteUploadingSecretsRow{}
 	for rows.Next() {
-		var storage_key string
-		if err := rows.Scan(&storage_key); err != nil {
+		var i DeleteUploadingSecretsRow
+		if err := rows.Scan(&i.PublicID, &i.StorageKey); err != nil {
 			return nil, err
 		}
-		items = append(items, storage_key)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

@@ -101,15 +101,30 @@ func TestUploadRepo_StartUploadFilesTheSecretTheUploadAndTheObject(t *testing.T)
 	}
 }
 
+// assertRefusedAsTaken starts an upload under publicID and checks that it is
+// refused as a taken id, and that nothing of it was written.
+func assertRefusedAsTaken(t *testing.T, repo *pgadapter.SecretRepo, publicID, sessionID string, now time.Time) {
+	t.Helper()
+	ctx := context.Background()
+	secret := newTestSecret(publicID, now.Add(time.Hour))
+	if err := repo.StartUpload(ctx, secret, newTestUpload(sessionID, secret, now.Add(time.Hour))); !errors.Is(err, domain.ErrDuplicate) {
+		t.Errorf("%s: err = %v, want ErrDuplicate", publicID, err)
+	}
+	if getObject(t, testDBPool, domain.UploadStorageKey(sessionID)) != nil {
+		t.Errorf("%s: the refused upload's object is in the ledger", publicID)
+	}
+	if _, _, err := repo.GetUpload(ctx, sessionID); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("%s: refused upload: err = %v, want ErrNotFound", publicID, err)
+	}
+}
+
 func TestUploadRepo_StartUploadRefusesATakenPublicID(t *testing.T) {
 	pool := setupTestDB(t)
 	repo := pgadapter.NewSecretRepo(pool)
-	ctx := context.Background()
 	now := moment(time.Now())
 
 	mustStartUpload(t, repo, "up-taken-uploading", newTestSecret("taken-uploading", now.Add(time.Hour)), now.Add(time.Hour))
 	mustCreate(t, repo, newTestSecret("taken-live", now.Add(time.Hour)))
-	// An opened one-time secret holds its id while its download drains.
 	burned := newTestSecret("taken-opened", now.Add(time.Hour))
 	burned.BurnAfterRead = true
 	mustCreate(t, repo, burned)
@@ -118,27 +133,109 @@ func TestUploadRepo_StartUploadRefusesATakenPublicID(t *testing.T) {
 	mustCreate(t, repo, newTestSecret("taken-expired", now.Add(-time.Minute)))
 
 	for _, id := range []string{"taken-uploading", "taken-live", "taken-opened", "taken-expired"} {
-		sessionID := "up-again-" + id
-		secret := newTestSecret(id, now.Add(time.Hour))
-		err := repo.StartUpload(ctx, secret, newTestUpload(sessionID, secret, now.Add(time.Hour)))
-		if !errors.Is(err, domain.ErrDuplicate) {
-			t.Errorf("%s: err = %v, want ErrDuplicate", id, err)
-		}
-		// Nothing of the refused upload was written.
-		if getObject(t, pool, domain.UploadStorageKey(sessionID)) != nil {
-			t.Errorf("%s: the refused upload's object is in the ledger", id)
-		}
-		if _, _, err := repo.GetUpload(ctx, sessionID); !errors.Is(err, domain.ErrNotFound) {
-			t.Errorf("%s: refused upload: err = %v, want ErrNotFound", id, err)
-		}
+		assertRefusedAsTaken(t, repo, id, "up-again-"+id, now)
 	}
+}
 
-	// Nothing of a deleted secret is kept, not even its id.
-	mustCreate(t, repo, newTestSecret("deleted", now.Add(time.Hour)))
-	if err := repo.Delete(ctx, "deleted", now); err != nil {
-		t.Fatalf("delete: %v", err)
+// TestUploadRepo_AGoneSecretsIDStaysTakenUntilItsExpiry ends secrets in the
+// ways that delete their rows early, and checks that their links cannot be
+// reused for other content until the expiry: not by an upload under the same
+// id, which anyone holding the link could make.
+func TestUploadRepo_AGoneSecretsIDStaysTakenUntilItsExpiry(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		burnAfterRead bool
+		end           func(t *testing.T, repo *pgadapter.SecretRepo, id string, now time.Time)
+	}{
+		{"deleted by its owner", false, func(t *testing.T, repo *pgadapter.SecretRepo, id string, now time.Time) {
+			if err := repo.Delete(context.Background(), id, now); err != nil {
+				t.Fatalf("delete: %v", err)
+			}
+		}},
+		{"opened and drained", true, func(t *testing.T, repo *pgadapter.SecretRepo, id string, now time.Time) {
+			mustOpen(t, repo, id, "opener", false, now.Add(-time.Hour))
+			if n, err := repo.DeleteDrainedSecrets(context.Background(), now, testBatchSize); err != nil || n != 1 {
+				t.Fatalf("delete drained secrets = %d, %v; want 1", n, err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := setupTestDB(t)
+			repo := pgadapter.NewSecretRepo(pool)
+			ctx := context.Background()
+			now := moment(time.Now())
+			expiresAt := now.Add(2 * time.Hour)
+			secret := newTestSecret("gone", expiresAt)
+			secret.BurnAfterRead = tc.burnAfterRead
+			mustCreate(t, repo, secret)
+			tc.end(t, repo, "gone", now)
+			assertSecretGone(t, repo, "gone")
+
+			// The id alone is kept, with the expiry, and nothing else.
+			var reservedUntil time.Time
+			if err := pool.QueryRow(ctx, "SELECT expires_at FROM public_ids WHERE public_id = 'gone'").Scan(&reservedUntil); err != nil {
+				t.Fatalf("read the reservation: %v", err)
+			}
+			if !reservedUntil.Equal(expiresAt) {
+				t.Errorf("reserved until %v, want the secret's expiry %v", reservedUntil, expiresAt)
+			}
+
+			assertRefusedAsTaken(t, repo, "gone", "up-reuse", now)
+			// The sweep leaves it until the expiry.
+			if n, err := repo.DeleteExpiredPublicIDs(ctx, expiresAt.Add(-time.Second), testBatchSize); err != nil || n != 0 {
+				t.Errorf("sweep before the expiry = %d, %v; want nothing freed", n, err)
+			}
+			assertRefusedAsTaken(t, repo, "gone", "up-reuse-later", now)
+
+			// From the expiry on, the id is free again.
+			if n, err := repo.DeleteExpiredPublicIDs(ctx, expiresAt, testBatchSize); err != nil || n != 1 {
+				t.Fatalf("sweep at the expiry = %d, %v; want the id freed", n, err)
+			}
+			if n := countRows(t, pool, "SELECT count(*) FROM public_ids"); n != 0 {
+				t.Errorf("public ids left = %d, want none", n)
+			}
+			mustStartUpload(t, repo, "up-after-expiry", newTestSecret("gone", expiresAt.Add(time.Hour)), expiresAt.Add(time.Hour))
+		})
 	}
-	mustStartUpload(t, repo, "up-again-deleted", newTestSecret("deleted", now.Add(time.Hour)), now.Add(time.Hour))
+}
+
+// TestUploadRepo_ADeleteRacingAnUploadStartNeverFreesTheID deletes secrets
+// while uploads under the same ids start. Whichever comes first, the id is
+// never free: the upload is refused.
+func TestUploadRepo_ADeleteRacingAnUploadStartNeverFreesTheID(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	ctx := context.Background()
+	now := moment(time.Now())
+
+	const rounds = 20
+	for i := range rounds {
+		mustCreate(t, repo, newTestSecret(fmt.Sprintf("race-%d", i), now.Add(time.Hour)))
+	}
+	errs := make([]error, rounds)
+	var wg sync.WaitGroup
+	for i := range rounds {
+		id := fmt.Sprintf("race-%d", i)
+		wg.Go(func() {
+			if err := repo.Delete(ctx, id, now); err != nil {
+				t.Errorf("delete %s: %v", id, err)
+			}
+		})
+		wg.Go(func() {
+			secret := newTestSecret(id, now.Add(time.Hour))
+			errs[i] = repo.StartUpload(ctx, secret, newTestUpload("up-"+id, secret, now.Add(time.Hour)))
+		})
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if !errors.Is(err, domain.ErrDuplicate) {
+			t.Errorf("upload %d: err = %v, want ErrDuplicate", i, err)
+		}
+	}
+	if n := countRows(t, pool, "SELECT count(*) FROM secrets"); n != 0 {
+		t.Errorf("secrets left = %d, want none: every one was deleted and no upload got through", n)
+	}
 }
 
 func TestUploadRepo_StartUploadRefusesPastTheStorageCap(t *testing.T) {

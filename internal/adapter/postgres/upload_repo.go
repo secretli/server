@@ -33,6 +33,19 @@ func (r *SecretRepo) StartUpload(ctx context.Context, secret *domain.Secret, upl
 		}
 	}
 
+	// The id is taken first. It stays taken until the secret's expiry, also
+	// once the secret was opened or deleted, so a link cannot be reused for
+	// other content; the primary key decides, whatever runs concurrently.
+	err = qtx.RegisterPublicID(ctx, dbsqlc.RegisterPublicIDParams{
+		PublicID:  secret.PublicID,
+		ExpiresAt: timestamptz(secret.ExpiresAt),
+	})
+	if err != nil && isDuplicateKeyError(err) {
+		return domain.ErrDuplicate
+	}
+	if err != nil {
+		return fmt.Errorf("register public id: %w", err)
+	}
 	// The object is known before anything is written under its key.
 	if err := qtx.CreateObject(ctx, secret.StorageKey); err != nil {
 		return fmt.Errorf("insert object: %w", err)
@@ -205,6 +218,12 @@ func (r *SecretRepo) CompleteUpload(ctx context.Context, sessionID string, now t
 	if n != 1 {
 		return nil, fmt.Errorf("make secret live: secret %q of upload %q is not uploading", upload.PublicID, sessionID)
 	}
+	if err := qtx.SetPublicIDExpiry(ctx, dbsqlc.SetPublicIDExpiryParams{
+		ExpiresAt: timestamptz(expiresAt),
+		PublicID:  upload.PublicID,
+	}); err != nil {
+		return nil, fmt.Errorf("set public id expiry: %w", err)
+	}
 	if err := qtx.MarkObjectStored(ctx, upload.StorageKey); err != nil {
 		return nil, fmt.Errorf("mark object stored: %w", err)
 	}
@@ -262,10 +281,10 @@ func (r *SecretRepo) AbortUpload(ctx context.Context, sessionID string, now time
 }
 
 // abandonUploads ends uploads under way whose rows the caller has locked:
-// each is marked abandoned, its secret's row goes, which frees the public id,
-// and its object is doomed. The uploads are marked first, because deleting
-// the secret clears the upload's public id, which only a finished upload may
-// lack.
+// each is marked abandoned, its secret's row goes and its public id is free
+// again, since the secret never existed, and its object is doomed. The
+// uploads are marked first, because deleting the secret clears the upload's
+// public id, which only a finished upload may lack.
 func abandonUploads(ctx context.Context, qtx *dbsqlc.Queries, sessionIDs []string, now time.Time) error {
 	publicIDs, err := qtx.MarkUploadsAbandoned(ctx, dbsqlc.MarkUploadsAbandonedParams{
 		FinishedAt: timestamptz(domain.KeptTime(now)),
@@ -274,12 +293,21 @@ func abandonUploads(ctx context.Context, qtx *dbsqlc.Queries, sessionIDs []strin
 	if err != nil {
 		return fmt.Errorf("mark uploads abandoned: %w", err)
 	}
-	storageKeys, err := qtx.DeleteUploadingSecrets(ctx, validTexts(publicIDs))
+	rows, err := qtx.DeleteUploadingSecrets(ctx, validTexts(publicIDs))
 	if err != nil {
 		return fmt.Errorf("delete abandoned uploads' secrets: %w", err)
 	}
+	freed := make([]string, 0, len(rows))
+	storageKeys := make([]string, 0, len(rows))
+	for _, row := range rows {
+		freed = append(freed, row.PublicID)
+		storageKeys = append(storageKeys, row.StorageKey)
+	}
 	if err := qtx.DoomObjects(ctx, storageKeys); err != nil {
 		return fmt.Errorf("doom abandoned uploads' objects: %w", err)
+	}
+	if err := qtx.DeletePublicIDs(ctx, freed); err != nil {
+		return fmt.Errorf("free abandoned uploads' public ids: %w", err)
 	}
 	return nil
 }

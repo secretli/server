@@ -36,6 +36,7 @@ type Repo interface {
 	DeleteFinishedUploads(ctx context.Context, finishedBefore time.Time) (int64, error)
 	DeleteDrainedSecrets(ctx context.Context, now time.Time, limit int) (int, error)
 	DeleteExpiredSecrets(ctx context.Context, now time.Time, limit int) (int, error)
+	DeleteExpiredPublicIDs(ctx context.Context, now time.Time, limit int) (int, error)
 	DeleteDoomedObjects(ctx context.Context, limit int, remove func(object *domain.Object) error) (domain.CleanupBatch, error)
 	DeleteEndedTransfers(ctx context.Context, endedBefore time.Time) (int64, error)
 }
@@ -98,6 +99,11 @@ func (w *Worker) runCycle(ctx context.Context) {
 	})
 	w.sweep(ctx, "expired secrets", func() (int64, error) {
 		return drainSQL(ctx, func() (int, error) { return w.repo.DeleteExpiredSecrets(ctx, now, batchSize) })
+	})
+	// After the secrets: a secret's id is freed in the cycle that forgets it,
+	// and a gone secret's id once its expiry has passed.
+	w.sweep(ctx, "expired public ids", func() (int64, error) {
+		return drainSQL(ctx, func() (int, error) { return w.repo.DeleteExpiredPublicIDs(ctx, now, batchSize) })
 	})
 
 	removed, err := drainBatches(ctx, func() (domain.CleanupBatch, error) {

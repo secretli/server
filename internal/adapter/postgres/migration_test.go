@@ -53,7 +53,7 @@ func migrationDatabase(t *testing.T) (*pgx.Conn, *migrate.Migrator) {
 func TestMigration_AppliesRollsBackAndAppliesAgain(t *testing.T) {
 	conn, migrator := migrationDatabase(t)
 	ctx := context.Background()
-	tables := []string{"objects", "secrets", "uploads", "upload_parts", "retrieval_sessions", "code_transfers"}
+	tables := []string{"objects", "public_ids", "secrets", "uploads", "upload_parts", "retrieval_sessions", "code_transfers"}
 	exists := func(kind, name string) bool {
 		t.Helper()
 		var found bool
@@ -82,7 +82,7 @@ func TestMigration_AppliesRollsBackAndAppliesAgain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current version: %v", err)
 	}
-	if version != 4 {
+	if version != 5 {
 		t.Errorf("version = %d, want every migration", version)
 	}
 	assertSchema(true, "migrating up")
@@ -354,6 +354,90 @@ func TestMigration_004KeepsOnlySecretsThatCanStillBeRead(t *testing.T) {
 		t.Fatalf("migrate up again: %v", err)
 	}
 	assertV4("migrating up again")
+}
+
+// TestMigration_005ReservesEveryIDInUse runs migration 005 up, down and up
+// again over a secret in every state there is since 004.
+func TestMigration_005ReservesEveryIDInUse(t *testing.T) {
+	conn, migrator := migrationDatabase(t)
+	ctx := context.Background()
+	if err := migrator.MigrateTo(ctx, 4); err != nil {
+		t.Fatalf("migrate to 4: %v", err)
+	}
+	expiresAt := time.Date(2026, 10, 9, 13, 1, 0, 0, time.UTC)
+	createdAt := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	for _, s := range []struct {
+		id, state string
+		oneTime   bool
+	}{{"uploading", "uploading", false}, {"live", "live", false}, {"closing", "closing", true}} {
+		if _, err := conn.Exec(ctx, "INSERT INTO objects (storage_key, state) VALUES ($1, 'stored')", "blobs/"+s.id); err != nil {
+			t.Fatalf("insert object: %v", err)
+		}
+		var hash, meta *string
+		var created *time.Time
+		if s.state != "closing" {
+			hash, meta = ptr("h"), ptr("v2$meta")
+		}
+		if s.state == "live" {
+			created = &createdAt
+		}
+		if _, err := conn.Exec(ctx, `INSERT INTO secrets (public_id, state, storage_key, metadata_token_hash, blob_token_hash,
+				deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at)
+			VALUES ($1, $2, $3, $4, $4, $4, $5, 1, $6, $7, $8)`,
+			s.id, s.state, "blobs/"+s.id, hash, meta, s.oneTime, expiresAt, created); err != nil {
+			t.Fatalf("insert %s: %v", s.id, err)
+		}
+	}
+	reserved := func() []string {
+		t.Helper()
+		rows, err := conn.Query(ctx, "SELECT public_id FROM public_ids WHERE expires_at = $1 ORDER BY public_id", expiresAt)
+		if err != nil {
+			t.Fatalf("query public ids: %v", err)
+		}
+		ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			t.Fatalf("collect public ids: %v", err)
+		}
+		return ids
+	}
+	registered := func() bool {
+		t.Helper()
+		var found bool
+		if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'secrets_public_id_registered')").Scan(&found); err != nil {
+			t.Fatalf("query constraint: %v", err)
+		}
+		return found
+	}
+
+	for _, step := range []struct {
+		name string
+		run  func() error
+	}{
+		{"migrating up", func() error { return migrator.MigrateTo(ctx, 5) }},
+		{"rolling back", func() error { return migrator.MigrateTo(ctx, 4) }},
+		{"migrating up again", func() error { return migrator.MigrateTo(ctx, 5) }},
+	} {
+		if err := step.run(); err != nil {
+			t.Fatalf("%s: %v", step.name, err)
+		}
+		if step.name == "rolling back" {
+			var table *string
+			if err := conn.QueryRow(ctx, "SELECT to_regclass('public_ids')::text").Scan(&table); err != nil {
+				t.Fatalf("look up public_ids: %v", err)
+			}
+			if table != nil || registered() {
+				t.Errorf("after %s: public_ids or its foreign key is still there", step.name)
+			}
+			continue
+		}
+		// Every secret's id, with its expiry, and a secret cannot be without one.
+		if got, want := reserved(), []string{"closing", "live", "uploading"}; !slices.Equal(got, want) {
+			t.Errorf("after %s: reserved ids = %v, want %v", step.name, got, want)
+		}
+		if !registered() {
+			t.Errorf("after %s: secrets_public_id_registered is missing", step.name)
+		}
+	}
 }
 
 func equalPtr[T comparable](a, b *T) bool {

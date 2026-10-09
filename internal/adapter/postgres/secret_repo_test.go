@@ -80,9 +80,18 @@ func mustCreate(t *testing.T, repo *pgadapter.SecretRepo, secret *domain.Secret)
 	sessionID := uploadSessionOf(secret.PublicID)
 	mustStartUpload(t, repo, sessionID, secret, now.Add(time.Hour))
 	mustComplete(t, repo, sessionID, now)
-	if _, err := testDBPool.Exec(context.Background(),
-		"UPDATE secrets SET expires_at = $2 WHERE public_id = $1", secret.PublicID, secret.ExpiresAt); err != nil {
-		t.Fatalf("set expiry of %s: %v", secret.PublicID, err)
+	setExpiry(t, secret.PublicID, secret.ExpiresAt)
+}
+
+// setExpiry moves a secret's expiry, and its id's with it, as completing the
+// upload would have set it.
+func setExpiry(t *testing.T, publicID string, expiresAt time.Time) {
+	t.Helper()
+	for _, table := range []string{"secrets", "public_ids"} {
+		if _, err := testDBPool.Exec(context.Background(),
+			"UPDATE "+table+" SET expires_at = $2 WHERE public_id = $1", publicID, expiresAt); err != nil {
+			t.Fatalf("set expiry of %s in %s: %v", publicID, table, err)
+		}
 	}
 }
 
