@@ -5,5 +5,33 @@
   ],
   "postUpdateOptions": [
     "gomodUpdateImportPaths"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Images the integration tests start with testcontainers, which Renovate does not find in Go code by itself",
+      "managerFilePatterns": [
+        "/^internal/.+_test\\.go$/"
+      ],
+      "matchStrings": [
+        "\"(?<depName>chrislusf/seaweedfs|postgres):(?<currentValue>[^\"]+)\""
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "The tests and docker/docker-compose.yml run the same SeaweedFS and Postgres, so each moves in one pull request",
+      "matchPackageNames": [
+        "chrislusf/seaweedfs"
+      ],
+      "groupName": "SeaweedFS"
+    },
+    {
+      "matchPackageNames": [
+        "postgres"
+      ],
+      "groupName": "Postgres"
+    }
   ]
 }
