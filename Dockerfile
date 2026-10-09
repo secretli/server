@@ -2,7 +2,9 @@
 # the target; running the Go compiler under QEMU emulation for arm64 makes
 # the publish job many times slower for no benefit.
 
-FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
+# mirror.gcr.io is Google's mirror of Docker Hub: the same images, without the
+# limit Docker Hub puts on anonymous pulls from shared CI runners.
+FROM --platform=$BUILDPLATFORM mirror.gcr.io/library/golang:1.27-alpine AS build
 ARG VERSION=dev
 ARG TARGETOS
 ARG TARGETARCH
