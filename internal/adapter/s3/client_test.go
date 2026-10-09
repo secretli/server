@@ -91,7 +91,7 @@ func startSeaweedFS() {
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
 			// The version docker/docker-compose.yml runs.
-			Image:        "chrislusf/seaweedfs:4.21",
+			Image:        "mirror.gcr.io/chrislusf/seaweedfs:4.21",
 			ExposedPorts: []string{"8333/tcp"},
 			Cmd:          []string{"server", "-s3", "-dir=/data"},
 			WaitingFor: wait.ForListeningPort("8333/tcp").
