@@ -17,10 +17,11 @@ INSERT INTO uploads (
     public_id,
     upload_token_hash,
     state,
-    expires_at
+    expires_at,
+    lifetime
 )
 VALUES (
-    $1, $2, $3, 'uploading', $4
+    $1, $2, $3, 'uploading', $4, $5
 )
 `
 
@@ -29,6 +30,7 @@ type CreateUploadParams struct {
 	PublicID        pgtype.Text
 	UploadTokenHash string
 	ExpiresAt       pgtype.Timestamptz
+	Lifetime        pgtype.Interval
 }
 
 func (q *Queries) CreateUpload(ctx context.Context, arg CreateUploadParams) error {
@@ -37,6 +39,7 @@ func (q *Queries) CreateUpload(ctx context.Context, arg CreateUploadParams) erro
 		arg.PublicID,
 		arg.UploadTokenHash,
 		arg.ExpiresAt,
+		arg.Lifetime,
 	)
 	return err
 }
@@ -120,6 +123,7 @@ SELECT
     u.state,
     u.expires_at,
     u.finished_at,
+    u.lifetime,
     s.storage_key,
     s.blob_size,
     s.expires_at AS secret_expires_at,
@@ -137,6 +141,7 @@ type GetUploadRow struct {
 	State           string
 	ExpiresAt       pgtype.Timestamptz
 	FinishedAt      pgtype.Timestamptz
+	Lifetime        pgtype.Interval
 	StorageKey      pgtype.Text
 	BlobSize        pgtype.Int8
 	SecretExpiresAt pgtype.Timestamptz
@@ -144,7 +149,7 @@ type GetUploadRow struct {
 }
 
 // The upload with what it needs of its secret and object, while the secret
-// has them.
+// has them. Until the upload completes, the secret's expiry is provisional.
 func (q *Queries) GetUpload(ctx context.Context, sessionID string) (GetUploadRow, error) {
 	row := q.db.QueryRow(ctx, getUpload, sessionID)
 	var i GetUploadRow
@@ -155,6 +160,7 @@ func (q *Queries) GetUpload(ctx context.Context, sessionID string) (GetUploadRow
 		&i.State,
 		&i.ExpiresAt,
 		&i.FinishedAt,
+		&i.Lifetime,
 		&i.StorageKey,
 		&i.BlobSize,
 		&i.SecretExpiresAt,
@@ -171,6 +177,7 @@ SELECT
     u.state,
     u.expires_at,
     u.finished_at,
+    u.lifetime,
     s.storage_key,
     s.blob_size,
     s.expires_at AS secret_expires_at,
@@ -189,12 +196,14 @@ type GetUploadForUpdateRow struct {
 	State           string
 	ExpiresAt       pgtype.Timestamptz
 	FinishedAt      pgtype.Timestamptz
+	Lifetime        pgtype.Interval
 	StorageKey      pgtype.Text
 	BlobSize        pgtype.Int8
 	SecretExpiresAt pgtype.Timestamptz
 	S3UploadID      pgtype.Text
 }
 
+// The upload as GetUpload returns it, locked for completing or abandoning it.
 func (q *Queries) GetUploadForUpdate(ctx context.Context, sessionID string) (GetUploadForUpdateRow, error) {
 	row := q.db.QueryRow(ctx, getUploadForUpdate, sessionID)
 	var i GetUploadForUpdateRow
@@ -205,6 +214,7 @@ func (q *Queries) GetUploadForUpdate(ctx context.Context, sessionID string) (Get
 		&i.State,
 		&i.ExpiresAt,
 		&i.FinishedAt,
+		&i.Lifetime,
 		&i.StorageKey,
 		&i.BlobSize,
 		&i.SecretExpiresAt,
@@ -312,38 +322,41 @@ func (q *Queries) ListUploadParts(ctx context.Context, sessionID string) ([]Uplo
 const markUploadCompleted = `-- name: MarkUploadCompleted :exec
 UPDATE uploads
 SET state = 'completed',
-    finished_at = $1
+    finished_at = $1,
+    lifetime = NULL
 WHERE session_id = $2
   AND state = 'uploading'
 `
 
 type MarkUploadCompletedParams struct {
-	NowAt     pgtype.Timestamptz
-	SessionID string
+	FinishedAt pgtype.Timestamptz
+	SessionID  string
 }
 
+// The secret has its expiry now, so the lifetime goes.
 func (q *Queries) MarkUploadCompleted(ctx context.Context, arg MarkUploadCompletedParams) error {
-	_, err := q.db.Exec(ctx, markUploadCompleted, arg.NowAt, arg.SessionID)
+	_, err := q.db.Exec(ctx, markUploadCompleted, arg.FinishedAt, arg.SessionID)
 	return err
 }
 
 const markUploadsAbandoned = `-- name: MarkUploadsAbandoned :many
 UPDATE uploads
 SET state = 'abandoned',
-    finished_at = $1
+    finished_at = $1,
+    lifetime = NULL
 WHERE session_id = ANY($2::text[])
   AND state = 'uploading'
 RETURNING public_id
 `
 
 type MarkUploadsAbandonedParams struct {
-	NowAt      pgtype.Timestamptz
+	FinishedAt pgtype.Timestamptz
 	SessionIds []string
 }
 
 // Returns the public ids of the abandoned uploads' secrets.
 func (q *Queries) MarkUploadsAbandoned(ctx context.Context, arg MarkUploadsAbandonedParams) ([]pgtype.Text, error) {
-	rows, err := q.db.Query(ctx, markUploadsAbandoned, arg.NowAt, arg.SessionIds)
+	rows, err := q.db.Query(ctx, markUploadsAbandoned, arg.FinishedAt, arg.SessionIds)
 	if err != nil {
 		return nil, err
 	}

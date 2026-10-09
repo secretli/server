@@ -91,16 +91,16 @@ func (r *SecretRepo) StartRetrievalSession(ctx context.Context, publicID, blobTo
 		return nil, domain.ErrForbidden
 	}
 	// The owner opening their own reusable secret is not a recipient getting
-	// it. A one-time secret ends whoever opens it.
+	// it. A one-time secret closes whoever opens it.
 	byOwner := deletionTokenHash != "" && tokencrypto.TokensEqual(deletionTokenHash, secret.DeletionTokenHash)
 
 	switch {
 	case secret.BurnAfterRead:
-		if err := qtx.EndSecretOpened(ctx, publicID); err != nil {
-			return nil, fmt.Errorf("end opened one-time secret: %w", err)
+		// The answer still carries what the opener needs to read it.
+		if err := qtx.CloseSecret(ctx, publicID); err != nil {
+			return nil, fmt.Errorf("close opened one-time secret: %w", err)
 		}
-		secret.State = domain.SecretEnded
-		secret.Outcome = domain.OutcomeOpened
+		secret.State = domain.SecretClosing
 	case !byOwner && !secret.Opened:
 		if err := qtx.MarkSecretOpened(ctx, publicID); err != nil {
 			return nil, fmt.Errorf("mark secret opened: %w", err)
@@ -155,13 +155,11 @@ func (r *SecretRepo) Delete(ctx context.Context, publicID string, now time.Time)
 	if err != nil {
 		return fmt.Errorf("query secret for delete: %w", err)
 	}
-	if err := qtx.EndSecretDeleted(ctx, publicID); err != nil {
-		return fmt.Errorf("end deleted secret: %w", err)
-	}
 	// The cleanup removes the object from storage within a cycle; from now on
-	// nothing reads it.
-	if err := qtx.DoomObjects(ctx, validTexts([]pgtype.Text{row.StorageKey})); err != nil {
-		return fmt.Errorf("doom deleted secret's object: %w", err)
+	// nothing reads it. The row goes, its retrieval sessions with it, and
+	// nothing about the secret is kept.
+	if _, err := deleteSecrets(ctx, qtx, []string{publicID}, []string{row.StorageKey}); err != nil {
+		return fmt.Errorf("deleted secret: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit delete secret: %w", err)
@@ -173,8 +171,8 @@ func secretFromRow(row dbsqlc.Secret) *domain.Secret {
 	return &domain.Secret{
 		PublicID:          row.PublicID,
 		State:             domain.SecretState(row.State),
-		StorageKey:        row.StorageKey.String,
-		MetadataTokenHash: row.MetadataTokenHash,
+		StorageKey:        row.StorageKey,
+		MetadataTokenHash: row.MetadataTokenHash.String,
 		BlobTokenHash:     row.BlobTokenHash.String,
 		DeletionTokenHash: row.DeletionTokenHash.String,
 		EncryptedMeta:     row.EncryptedMeta.String,
@@ -183,7 +181,6 @@ func secretFromRow(row dbsqlc.Secret) *domain.Secret {
 		ExpiresAt:         row.ExpiresAt.Time,
 		CreatedAt:         pointerFromTimestamp(row.CreatedAt),
 		Opened:            row.Opened,
-		Outcome:           domain.Outcome(row.Outcome.String),
 	}
 }
 
@@ -211,6 +208,20 @@ func timestamptz(t time.Time) pgtype.Timestamptz {
 
 func text(s string) pgtype.Text {
 	return pgtype.Text{String: s, Valid: true}
+}
+
+func interval(d time.Duration) pgtype.Interval {
+	return pgtype.Interval{Microseconds: d.Microseconds(), Valid: true}
+}
+
+// durationFromInterval reads an interval as a duration, a day as 24 hours.
+// The server writes intervals in microseconds only; one Postgres computed
+// may carry days, and none carries months. NULL is 0.
+func durationFromInterval(iv pgtype.Interval) time.Duration {
+	if !iv.Valid {
+		return 0
+	}
+	return time.Duration(iv.Microseconds)*time.Microsecond + time.Duration(iv.Days)*24*time.Hour
 }
 
 func isDuplicateKeyError(err error) bool {

@@ -44,7 +44,7 @@ type mockSecretRepo struct {
 	mu       sync.Mutex
 	secrets  map[string]*domain.Secret
 	sessions map[string]mockRetrievalSession
-	// doomed lists the objects Delete gave up to the cleanup.
+	// doomed lists the objects of the secrets Delete removed.
 	doomed    []string
 	deleteErr error
 }
@@ -90,15 +90,15 @@ func (m *mockSecretRepo) StartRetrievalSession(_ context.Context, publicID, blob
 	read := *s
 	switch {
 	case s.BurnAfterRead:
-		// A one-time secret ends whoever opens it. Its object stays for the
-		// download that opened it.
-		s.State = domain.SecretEnded
-		s.Outcome = domain.OutcomeOpened
+		// A one-time secret closes whoever opens it: it keeps only its
+		// object, for the download that opened it.
+		s.State = domain.SecretClosing
+		s.CreatedAt = nil
+		s.MetadataTokenHash = ""
 		s.EncryptedMeta = ""
 		s.BlobTokenHash = ""
 		s.DeletionTokenHash = ""
 		read.State = s.State
-		read.Outcome = s.Outcome
 	case !byOwner && !s.Opened:
 		s.Opened = true
 		read.Opened = true
@@ -116,9 +116,9 @@ func (m *mockSecretRepo) GetByRetrievalSession(_ context.Context, publicID, sess
 		return nil, domain.ErrForbidden
 	}
 	// Not the state: the session that opened a one-time secret still reads
-	// it. A doomed object is what ends a download.
+	// it. Deleting the secret, which dooms its object, ends a download.
 	s, ok := m.secrets[publicID]
-	if !ok || !s.ExpiresAt.After(now) || s.StorageKey == "" {
+	if !ok || !s.ExpiresAt.After(now) {
 		return nil, domain.ErrForbidden
 	}
 	secret := *s
@@ -136,13 +136,14 @@ func (m *mockSecretRepo) Delete(_ context.Context, publicID string, now time.Tim
 	if !ok || !s.Readable(now) {
 		return domain.ErrNotFound
 	}
+	// The row goes, and its sessions with it.
 	m.doomed = append(m.doomed, s.StorageKey)
-	s.State = domain.SecretEnded
-	s.Outcome = domain.OutcomeDeleted
-	s.StorageKey = ""
-	s.EncryptedMeta = ""
-	s.BlobTokenHash = ""
-	s.DeletionTokenHash = ""
+	delete(m.secrets, publicID)
+	for token, session := range m.sessions {
+		if session.publicID == publicID {
+			delete(m.sessions, token)
+		}
+	}
 	return nil
 }
 
@@ -338,8 +339,8 @@ func TestStartRetrievalSession_BurnAfterReadClaimsOnce(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
-	if got := repo.secrets[publicID]; got.State != domain.SecretEnded || got.Outcome != domain.OutcomeOpened {
-		t.Fatalf("state = %q, outcome = %q; opening a one-time secret should end it as opened", got.State, got.Outcome)
+	if got := repo.secrets[publicID]; got.State != domain.SecretClosing {
+		t.Fatalf("state = %q; opening a one-time secret should close it", got.State)
 	}
 	if repo.secrets[publicID].StorageKey == "" {
 		t.Fatal("the object must stay for the download that opened the secret")
@@ -470,7 +471,7 @@ func TestRetrieveSecretRange_OpenedOneTimeSecretStillDownloads(t *testing.T) {
 	blobToken := testToken("range one-time blob")
 	seedSecret(repo, fs, publicID, blobToken, testToken("range one-time deletion"), true)
 
-	// Opening ends the secret, but the session that opened it must still
+	// Opening closes the secret, but the session that opened it must still
 	// get the whole blob.
 	sessionToken := startTestRetrievalSession(t, h, publicID, blobToken)
 
@@ -505,7 +506,9 @@ func TestStartRetrievalSession_UnreadableSecretIsNotFound(t *testing.T) {
 	}{
 		{name: "uploading", change: func(s *domain.Secret) { s.State = domain.SecretUploading; s.CreatedAt = nil }},
 		{name: "expired", change: func(s *domain.Secret) { s.ExpiresAt = time.Now().Add(-time.Minute) }},
-		{name: "deleted", change: func(s *domain.Secret) { s.State = domain.SecretEnded; s.Outcome = domain.OutcomeDeleted }},
+		{name: "closing", change: func(s *domain.Secret) {
+			s.State, s.CreatedAt, s.BurnAfterRead = domain.SecretClosing, nil, true
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -680,9 +683,9 @@ func TestSecretMetadata_BurnAfterRead_AlreadyRetrieved(t *testing.T) {
 
 	callHandler(c, h.SecretMetadata)
 
-	// The link is told the secret is gone, and nothing of what it held.
-	if rec.Code != http.StatusGone {
-		t.Errorf("status = %d, want %d", rec.Code, http.StatusGone)
+	// The link is told nothing, not even that the secret was there.
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want %d", rec.Code, http.StatusNotFound)
 	}
 	if bytes.Contains(rec.Body.Bytes(), []byte("encrypted_meta")) {
 		t.Errorf("body = %s, want no metadata of an opened one-time secret", rec.Body.String())
@@ -892,26 +895,19 @@ func TestDeleteSecret_Success(t *testing.T) {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusNoContent)
 	}
 
-	// The secret ends at once; its object is doomed and left to the cleanup.
+	// The secret goes at once; its object is doomed and left to the cleanup.
 	assertDeleted(t, repo, publicID)
 	if _, ok := fs.objects[testStorageKey(publicID)]; !ok {
 		t.Error("the delete must not touch storage; the cleanup removes the object")
 	}
 }
 
-// assertDeleted checks that a secret ended as deleted and gave its object up
-// to the cleanup.
+// assertDeleted checks that a secret is gone and gave its object up to the
+// cleanup.
 func assertDeleted(t *testing.T, repo *mockSecretRepo, publicID string) {
 	t.Helper()
-	secret, err := repo.GetSecret(context.Background(), publicID)
-	if err != nil {
-		t.Fatalf("secret after delete: %v", err)
-	}
-	if secret.State != domain.SecretEnded || secret.Outcome != domain.OutcomeDeleted {
-		t.Errorf("state = %q, outcome = %q; want ended as deleted", secret.State, secret.Outcome)
-	}
-	if secret.StorageKey != "" || secret.EncryptedMeta != "" || secret.BlobTokenHash != "" || secret.DeletionTokenHash != "" {
-		t.Errorf("deleted secret still holds %+v, want only how it ended", secret)
+	if secret, err := repo.GetSecret(context.Background(), publicID); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("secret after delete = %+v, %v; want it gone", secret, err)
 	}
 	if len(repo.doomed) != 1 || repo.doomed[0] != testStorageKey(publicID) {
 		t.Errorf("doomed objects = %v, want the secret's own %q", repo.doomed, testStorageKey(publicID))

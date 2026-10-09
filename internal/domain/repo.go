@@ -28,18 +28,18 @@ type SecretRepo interface {
 	// ErrNotFound.
 	GetSecret(ctx context.Context, publicID string) (*Secret, error)
 	// StartRetrievalSession checks the blob token of a readable secret and
-	// opens a session to read its object. Opening a one-time secret ends it;
-	// a recipient opening a reusable one marks it opened. deletionTokenHash,
+	// opens a session to read its object. Opening a one-time secret closes
+	// it; a recipient opening a reusable one marks it opened. deletionTokenHash,
 	// when the caller has one, marks the owner, whose opening of a reusable
 	// secret does not count. It returns ErrNotFound unless the secret is
 	// readable and ErrForbidden for a wrong blob token.
 	StartRetrievalSession(ctx context.Context, publicID, blobTokenHash, deletionTokenHash, sessionTokenHash string, expiresAt, now time.Time) (*Secret, error)
 	// GetByRetrievalSession returns the secret a valid session may still
-	// download, or ErrForbidden.
+	// download, live or closing, or ErrForbidden.
 	GetByRetrievalSession(ctx context.Context, publicID, sessionTokenHash string, now time.Time) (*Secret, error)
-	// Delete ends a readable secret as deleted and dooms its object, in one
-	// transaction. It returns ErrNotFound if the secret is not readable (any
-	// more).
+	// Delete deletes a readable secret and dooms its object, in one
+	// transaction; nothing about the secret is kept. It returns ErrNotFound
+	// if the secret is not readable (any more).
 	Delete(ctx context.Context, publicID string, now time.Time) error
 }
 
@@ -48,8 +48,9 @@ type UploadRepo interface {
 	// and the object it is written to, in one transaction, before anything
 	// reaches storage. It returns ErrDuplicate if the public id is taken,
 	// whatever state that secret is in, and ErrStorageFull if storage is
-	// capped and the secret would take it past the cap.
-	StartUpload(ctx context.Context, secret *Secret, upload *Upload, now time.Time) error
+	// capped and the secret would take it past the cap. When the upload
+	// started is not kept.
+	StartUpload(ctx context.Context, secret *Secret, upload *Upload) error
 	// RecordS3UploadID notes the provider's multipart upload for an object
 	// that is being written.
 	RecordS3UploadID(ctx context.Context, storageKey, s3UploadID string) error

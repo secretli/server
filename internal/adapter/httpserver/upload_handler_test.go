@@ -48,7 +48,7 @@ func newUploadMockRepo() *uploadMockRepo {
 	}
 }
 
-func (m *uploadMockRepo) StartUpload(_ context.Context, secret *domain.Secret, upload *domain.Upload, now time.Time) error {
+func (m *uploadMockRepo) StartUpload(_ context.Context, secret *domain.Secret, upload *domain.Upload) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -58,7 +58,7 @@ func (m *uploadMockRepo) StartUpload(_ context.Context, secret *domain.Secret, u
 	if _, taken := m.secrets[secret.PublicID]; taken {
 		return domain.ErrDuplicate
 	}
-	m.objects[secret.StorageKey] = &domain.Object{StorageKey: secret.StorageKey, State: domain.ObjectWriting, CreatedAt: now}
+	m.objects[secret.StorageKey] = &domain.Object{StorageKey: secret.StorageKey, State: domain.ObjectWriting}
 	s := *secret
 	s.State = domain.SecretUploading
 	m.secrets[secret.PublicID] = &s
@@ -68,6 +68,7 @@ func (m *uploadMockRepo) StartUpload(_ context.Context, secret *domain.Secret, u
 		UploadTokenHash: upload.UploadTokenHash,
 		State:           domain.UploadUploading,
 		ExpiresAt:       upload.ExpiresAt,
+		Lifetime:        upload.Lifetime,
 	}
 	return nil
 }
@@ -175,11 +176,16 @@ func (m *uploadMockRepo) CompleteUpload(_ context.Context, sessionID string, now
 	if !ok || secret.State != domain.SecretUploading {
 		return nil, fmt.Errorf("secret %q of upload %q is not uploading", upload.PublicID, sessionID)
 	}
+	// The lifetime counts from now, and the times are kept to the minute.
+	createdAt, expiresAt := domain.SecretTimes(now, upload.Lifetime)
 	secret.State = domain.SecretLive
-	secret.CreatedAt = &now
+	secret.CreatedAt = &createdAt
+	secret.ExpiresAt = expiresAt
 	m.objects[secret.StorageKey].State = domain.ObjectStored
+	finishedAt := domain.KeptTime(now)
 	upload.State = domain.UploadCompleted
-	upload.FinishedAt = &now
+	upload.FinishedAt = &finishedAt
+	upload.Lifetime = 0
 	delete(m.parts, sessionID)
 	return m.joined(upload), nil
 }
@@ -200,8 +206,10 @@ func (m *uploadMockRepo) AbortUpload(_ context.Context, sessionID string, now ti
 		return nil
 	}
 
+	finishedAt := domain.KeptTime(now)
 	upload.State = domain.UploadAbandoned
-	upload.FinishedAt = &now
+	upload.FinishedAt = &finishedAt
+	upload.Lifetime = 0
 	// The secret's row goes, which frees the public id, and its object is
 	// doomed for the cleanup to remove.
 	if secret, ok := m.secrets[upload.PublicID]; ok && secret.State == domain.SecretUploading {
@@ -375,16 +383,20 @@ func TestUploadSession_CreateSuccess(t *testing.T) {
 	store := newUploadMockStore()
 	h := NewUploadHandler(repo, store, 100*1024*1024, testMetrics())
 
+	before := time.Now()
 	rec := callCreate(t, h, createUploadBody("multipart-create"))
+	after := time.Now()
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
 	var body struct {
-		SessionID   string `json:"session_id"`
-		UploadToken string `json:"upload_token"`
-		PartSize    int64  `json:"part_size"`
-		State       string `json:"state"`
+		SessionID       string    `json:"session_id"`
+		UploadToken     string    `json:"upload_token"`
+		PartSize        int64     `json:"part_size"`
+		State           string    `json:"state"`
+		ExpiresAt       time.Time `json:"expires_at"`
+		UploadExpiresAt time.Time `json:"upload_expires_at"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
@@ -410,10 +422,36 @@ func TestUploadSession_CreateSuccess(t *testing.T) {
 	if secret == nil || secret.State != domain.SecretUploading {
 		t.Fatalf("secret = %+v, want one in state %q", secret, domain.SecretUploading)
 	}
+	// The upload keeps the lifetime for the secret. Until it completes, the
+	// secret's expiry is the one completing now would give; both expiries
+	// are to the minute.
+	if upload.Lifetime != 24*time.Hour {
+		t.Errorf("lifetime = %v, want the chosen 1d", upload.Lifetime)
+	}
+	if !secret.ExpiresAt.Equal(body.ExpiresAt) || !upload.ExpiresAt.Equal(body.UploadExpiresAt) {
+		t.Errorf("answered expiries %v and %v, stored %v and %v", body.ExpiresAt, body.UploadExpiresAt, secret.ExpiresAt, upload.ExpiresAt)
+	}
+	assertProvisionalExpiry(t, body.ExpiresAt, before, after, 24*time.Hour)
+	if got := body.UploadExpiresAt; !got.Equal(got.Truncate(time.Minute)) ||
+		got.Before(before.Add(uploadSessionTTL-time.Minute)) || got.After(after.Add(uploadSessionTTL)) {
+		t.Errorf("upload_expires_at = %v, want a day after %v, to the minute", got, before)
+	}
+}
+
+// assertProvisionalExpiry checks that expiresAt is what a secret with lifetime
+// whose upload completed between from and to would get: lifetime and a
+// minute after the minute it completed in.
+func assertProvisionalExpiry(t *testing.T, expiresAt, from, to time.Time, lifetime time.Duration) {
+	t.Helper()
+	earliest := from.Truncate(time.Minute).Add(lifetime + time.Minute)
+	latest := to.Truncate(time.Minute).Add(lifetime + time.Minute)
+	if !expiresAt.Equal(expiresAt.Truncate(time.Minute)) || expiresAt.Before(earliest) || expiresAt.After(latest) {
+		t.Errorf("expires_at = %v, want between %v and %v, to the minute", expiresAt, earliest, latest)
+	}
 }
 
 func TestUploadSession_CreateRefusesATakenPublicIDBeforeStorage(t *testing.T) {
-	for _, state := range []domain.SecretState{domain.SecretUploading, domain.SecretLive, domain.SecretEnded} {
+	for _, state := range []domain.SecretState{domain.SecretUploading, domain.SecretLive, domain.SecretClosing} {
 		t.Run(string(state), func(t *testing.T) {
 			repo := newUploadMockRepo()
 			store := newUploadMockStore()
@@ -606,23 +644,31 @@ func TestCompleteUploadSession_CreatesSecret(t *testing.T) {
 	c := newEchoContext(req, rec)
 	c.SetParamNames("sessionID")
 	c.SetParamValues(session.SessionID)
+	before := time.Now()
 	callHandler(c, h.CompleteUploadSession)
+	after := time.Now()
 
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
 	var body struct {
-		ExpiresAt string `json:"expires_at"`
+		ExpiresAt time.Time `json:"expires_at"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if want := session.SecretExpiresAt.UTC().Format(time.RFC3339); body.ExpiresAt != want {
-		t.Errorf("expires_at = %q, want the secret's expiry %q", body.ExpiresAt, want)
-	}
+	// The lifetime counts from completing, and the answer is the expiry the
+	// secret got.
 	secret := repo.secrets[session.PublicID]
 	if secret == nil || secret.State != domain.SecretLive || secret.CreatedAt == nil {
 		t.Fatalf("secret = %+v, want it live with a creation time", secret)
+	}
+	if !body.ExpiresAt.Equal(secret.ExpiresAt) {
+		t.Errorf("expires_at = %v, want the secret's expiry %v", body.ExpiresAt, secret.ExpiresAt)
+	}
+	assertProvisionalExpiry(t, secret.ExpiresAt, before, after, time.Hour)
+	if span := secret.ExpiresAt.Sub(*secret.CreatedAt); span != time.Hour+time.Minute {
+		t.Errorf("expires_at - created_at = %v, want the lifetime and a minute", span)
 	}
 	if got := repo.objects[session.StorageKey].State; got != domain.ObjectStored {
 		t.Errorf("object state = %q, want %q", got, domain.ObjectStored)
@@ -817,6 +863,36 @@ func TestCompleteUploadSession_ConcurrentCompletesKeepObject(t *testing.T) {
 	}
 	if secret := repo.secrets[upload.PublicID]; secret == nil || secret.State != domain.SecretLive {
 		t.Fatalf("secret = %+v, want it live", secret)
+	}
+}
+
+// TestCompleteUploadSession_AfterTheProvisionalExpiry completes an upload that
+// took longer than the secret's lifetime. Only the session's own expiry bounds
+// an upload: the secret goes live with its whole lifetime ahead of it.
+func TestCompleteUploadSession_AfterTheProvisionalExpiry(t *testing.T) {
+	repo := newUploadMockRepo()
+	store := newUploadMockStore()
+	uploadToken := testToken("complete slow token")
+	upload := seedSinglePartUploadSession(repo, uploadToken)
+	repo.secrets[upload.PublicID].ExpiresAt = time.Now().Add(-time.Minute)
+	h := NewUploadHandler(repo, store, 100*1024*1024, testMetrics())
+
+	before := time.Now()
+	rec := callComplete(h, upload.SessionID, uploadToken)
+	after := time.Now()
+
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var body struct {
+		ExpiresAt time.Time `json:"expires_at"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	assertProvisionalExpiry(t, body.ExpiresAt, before, after, time.Hour)
+	if secret := repo.secrets[upload.PublicID]; !secret.Readable(after) || !secret.ExpiresAt.Equal(body.ExpiresAt) {
+		t.Errorf("secret = %+v, want it readable until %v", secret, body.ExpiresAt)
 	}
 }
 
@@ -1024,6 +1100,7 @@ func callUploadPart(h *UploadHandler, sessionID, uploadToken string, payload []b
 func seedUploadSession(repo *uploadMockRepo, uploadToken string, blobSize int64) *domain.Upload {
 	sessionID := testToken("session " + uploadToken)
 	now := time.Now()
+	_, provisional := domain.SecretTimes(now, time.Hour)
 	secret := &domain.Secret{
 		PublicID:          testPublicID("session " + uploadToken),
 		StorageKey:        domain.UploadStorageKey(sessionID),
@@ -1032,15 +1109,16 @@ func seedUploadSession(repo *uploadMockRepo, uploadToken string, blobSize int64)
 		DeletionTokenHash: tokencrypto.TokenHash(testToken("delete " + uploadToken)),
 		EncryptedMeta:     testEncryptedMeta(),
 		BlobSize:          blobSize,
-		ExpiresAt:         now.Add(time.Hour),
+		ExpiresAt:         provisional,
 	}
 	upload := &domain.Upload{
 		SessionID:       sessionID,
 		UploadTokenHash: tokencrypto.TokenHash(uploadToken),
 		ExpiresAt:       now.Add(time.Hour),
+		Lifetime:        time.Hour,
 	}
 	ctx := context.Background()
-	if err := repo.StartUpload(ctx, secret, upload, now); err != nil {
+	if err := repo.StartUpload(ctx, secret, upload); err != nil {
 		panic(err)
 	}
 	if err := repo.RecordS3UploadID(ctx, secret.StorageKey, "s3-upload-id"); err != nil {

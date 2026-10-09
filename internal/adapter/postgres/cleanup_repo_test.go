@@ -65,12 +65,12 @@ func TestCleanupRepo_AbandonExpiredUploads(t *testing.T) {
 	ctx := context.Background()
 	now := moment(time.Now())
 
-	mustStartUpload(t, repo, "up-ran-out", newTestSecret("ran-out", now.Add(time.Hour)), now.Add(-time.Minute), now.Add(-time.Hour))
+	mustStartUpload(t, repo, "up-ran-out", newTestSecret("ran-out", now.Add(time.Hour)), now.Add(-time.Minute))
 	mustRecordPart(t, repo, newTestUploadPart("up-ran-out", 1, 0, 1024))
-	mustStartUpload(t, repo, "up-running", newTestSecret("running", now.Add(time.Hour)), now.Add(time.Minute), now)
+	mustStartUpload(t, repo, "up-running", newTestSecret("running", now.Add(time.Hour)), now.Add(time.Minute))
 	// A completed upload's expiry no longer matters.
 	finished := newTestSecret("finished", now.Add(time.Hour))
-	mustStartUpload(t, repo, "up-finished", finished, now.Add(-time.Minute), now.Add(-time.Hour))
+	mustStartUpload(t, repo, "up-finished", finished, now.Add(-time.Minute))
 	mustComplete(t, repo, "up-finished", now.Add(-time.Hour))
 
 	n, err := repo.AbandonExpiredUploads(ctx, now, testBatchSize)
@@ -82,8 +82,9 @@ func TestCleanupRepo_AbandonExpiredUploads(t *testing.T) {
 	}
 
 	upload, _ := mustGetUpload(t, repo, "up-ran-out")
-	if upload.State != domain.UploadAbandoned || upload.FinishedAt == nil || !upload.FinishedAt.Equal(now) || upload.PublicID != "" {
-		t.Errorf("expired upload = %+v, want abandoned at %v without its secret", upload, now)
+	if finishedAt := now.Truncate(time.Minute); upload.State != domain.UploadAbandoned || upload.FinishedAt == nil ||
+		!upload.FinishedAt.Equal(finishedAt) || upload.PublicID != "" || upload.Lifetime != 0 {
+		t.Errorf("expired upload = %+v, want abandoned at %v without its secret and lifetime", upload, finishedAt)
 	}
 	assertSecretGone(t, repo, "ran-out")
 	assertDoomed(t, pool, "blobs/up-ran-out")
@@ -96,7 +97,7 @@ func TestCleanupRepo_AbandonExpiredUploads(t *testing.T) {
 	}
 
 	// The expired upload's public id is free again.
-	mustStartUpload(t, repo, "up-ran-out-again", newTestSecret("ran-out", now.Add(time.Hour)), now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-ran-out-again", newTestSecret("ran-out", now.Add(time.Hour)), now.Add(time.Hour))
 
 	if n, err := repo.AbandonExpiredUploads(ctx, now, testBatchSize); err != nil || n != 0 {
 		t.Errorf("second run = %d, %v; want nothing left", n, err)
@@ -112,7 +113,7 @@ func TestCleanupRepo_AbandonExpiredUploadsInBatchesOldestFirst(t *testing.T) {
 		id  string
 		ago time.Duration
 	}{{"1h", time.Hour}, {"3h", 3 * time.Hour}, {"2h", 2 * time.Hour}} {
-		mustStartUpload(t, repo, "up-"+tc.id, newTestSecret(tc.id, now.Add(time.Hour)), now.Add(-tc.ago), now.Add(-4*time.Hour))
+		mustStartUpload(t, repo, "up-"+tc.id, newTestSecret(tc.id, now.Add(time.Hour)), now.Add(-tc.ago))
 	}
 
 	first, err := repo.AbandonExpiredUploads(ctx, now, 2)
@@ -141,7 +142,7 @@ func TestCleanupRepo_AbandonExpiredUploadsSkipsLockedRows(t *testing.T) {
 	repo := pgadapter.NewSecretRepo(pool)
 	now := moment(time.Now())
 	for _, id := range []string{"locked", "free"} {
-		mustStartUpload(t, repo, "up-"+id, newTestSecret(id, now.Add(time.Hour)), now.Add(-time.Minute), now.Add(-time.Hour))
+		mustStartUpload(t, repo, "up-"+id, newTestSecret(id, now.Add(time.Hour)), now.Add(-time.Minute))
 	}
 
 	// A complete holds the upload's row lock while finalize runs.
@@ -166,7 +167,7 @@ func TestCleanupRepo_DeleteFinishedUploads(t *testing.T) {
 	longAgo := now.Add(-2 * time.Hour)
 
 	for _, id := range []string{"old-done", "old-abandoned", "new-done", "new-abandoned", "stuck"} {
-		mustStartUpload(t, repo, "up-"+id, newTestSecret(id, now.Add(time.Hour)), longAgo, longAgo)
+		mustStartUpload(t, repo, "up-"+id, newTestSecret(id, now.Add(time.Hour)), longAgo)
 	}
 	mustComplete(t, repo, "up-old-done", longAgo)
 	// Aborting keeps the parts; they go with the upload.
@@ -206,62 +207,65 @@ func TestCleanupRepo_DeleteFinishedUploads(t *testing.T) {
 	}
 }
 
-func TestCleanupRepo_ReleaseDrainedSecrets(t *testing.T) {
+func TestCleanupRepo_DeleteDrainedSecrets(t *testing.T) {
 	pool := setupTestDB(t)
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
 	now := moment(time.Now())
 
+	secrets := map[string]*domain.Secret{}
 	for _, id := range []string{"drained", "draining"} {
 		secret := newTestSecret(id, now.Add(time.Hour))
 		secret.BurnAfterRead = true
 		mustCreate(t, repo, secret)
+		secrets[id] = secret
 	}
 	// openAs gives sessions 15 minutes: one ended, one still runs.
 	mustOpen(t, repo, "drained", "drained-opener", false, now.Add(-time.Hour))
 	mustOpen(t, repo, "draining", "draining-opener", false, now)
-	// A reusable secret's sessions do not matter; it is not ended.
+	// A reusable secret's sessions do not matter; it stays live.
 	mustCreate(t, repo, newTestSecret("reusable", now.Add(time.Hour)))
 	mustOpen(t, repo, "reusable", "recipient", false, now.Add(-time.Hour))
-	// A deleted secret has nothing left to release.
-	mustCreate(t, repo, newTestSecret("deleted", now.Add(time.Hour)))
-	if err := repo.Delete(ctx, "deleted", now.Add(-time.Hour)); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
 
-	n, err := repo.ReleaseDrainedSecrets(ctx, now, testBatchSize)
+	n, err := repo.DeleteDrainedSecrets(ctx, now, testBatchSize)
 	if err != nil {
-		t.Fatalf("release drained secrets: %v", err)
+		t.Fatalf("delete drained secrets: %v", err)
 	}
 	if n != 1 {
-		t.Errorf("released %d secrets, want 1", n)
+		t.Errorf("deleted %d secrets, want 1", n)
 	}
-	drained := mustGetSecret(t, repo, "drained")
-	assertEnded(t, drained, domain.OutcomeOpened)
-	if drained.StorageKey != "" {
-		t.Errorf("drained secret keeps storage key %q", drained.StorageKey)
-	}
+	// The drained secret and its object go together, its ended session with
+	// them.
+	assertSecretGone(t, repo, "drained")
 	assertDoomed(t, pool, domain.UploadStorageKey(uploadSessionOf("drained")))
-
-	draining := mustGetSecret(t, repo, "draining")
-	if draining.StorageKey == "" {
-		t.Error("a secret with a running download lost its object")
+	if left := countRows(t, pool, "SELECT count(*) FROM retrieval_sessions WHERE public_id = 'drained'"); left != 0 {
+		t.Errorf("the drained secret left %d retrieval sessions", left)
 	}
-	assertNotDoomed(t, pool, draining.StorageKey)
+
+	// The one still downloading keeps its object, and reads go on.
+	assertClosing(t, repo, secrets["draining"])
+	assertNotDoomed(t, pool, secrets["draining"].StorageKey)
+	if _, err := download(repo, "draining", "draining-opener", now); err != nil {
+		t.Errorf("running download: %v", err)
+	}
+	if got := mustGetSecret(t, repo, "reusable"); got.State != domain.SecretLive {
+		t.Errorf("reusable secret state = %q, want live", got.State)
+	}
 	assertNotDoomed(t, pool, domain.UploadStorageKey(uploadSessionOf("reusable")))
 
-	// Once the last session ends, the object goes and so does the download.
+	// Once the last session ends, the secret goes with its object.
 	later := now.Add(15 * time.Minute)
-	if n, err := repo.ReleaseDrainedSecrets(ctx, later, testBatchSize); err != nil || n != 1 {
-		t.Errorf("release after the session ended = %d, %v; want 1", n, err)
+	if n, err := repo.DeleteDrainedSecrets(ctx, later, testBatchSize); err != nil || n != 1 {
+		t.Errorf("delete after the session ended = %d, %v; want 1", n, err)
 	}
-	assertDoomed(t, pool, draining.StorageKey)
+	assertSecretGone(t, repo, "draining")
+	assertDoomed(t, pool, secrets["draining"].StorageKey)
 	if _, err := download(repo, "draining", "draining-opener", now); !errors.Is(err, domain.ErrForbidden) {
-		t.Errorf("download after release: err = %v, want ErrForbidden", err)
+		t.Errorf("download after the secret went: err = %v, want ErrForbidden", err)
 	}
 }
 
-func TestCleanupRepo_ReleaseDrainedSecretsInBatches(t *testing.T) {
+func TestCleanupRepo_DeleteDrainedSecretsInBatches(t *testing.T) {
 	pool := setupTestDB(t)
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
@@ -273,13 +277,13 @@ func TestCleanupRepo_ReleaseDrainedSecretsInBatches(t *testing.T) {
 		mustOpen(t, repo, id, "opener-"+id, false, now.Add(-time.Hour))
 	}
 
-	if n, err := repo.ReleaseDrainedSecrets(ctx, now, 2); err != nil || n != 2 {
+	if n, err := repo.DeleteDrainedSecrets(ctx, now, 2); err != nil || n != 2 {
 		t.Errorf("first batch = %d, %v; want 2", n, err)
 	}
-	if n, err := repo.ReleaseDrainedSecrets(ctx, now, 2); err != nil || n != 1 {
+	if n, err := repo.DeleteDrainedSecrets(ctx, now, 2); err != nil || n != 1 {
 		t.Errorf("second batch = %d, %v; want 1", n, err)
 	}
-	if n, err := repo.ReleaseDrainedSecrets(ctx, now, 2); err != nil || n != 0 {
+	if n, err := repo.DeleteDrainedSecrets(ctx, now, 2); err != nil || n != 0 {
 		t.Errorf("third batch = %d, %v; want 0", n, err)
 	}
 }
@@ -294,10 +298,7 @@ func TestCleanupRepo_DeleteExpiredSecrets(t *testing.T) {
 
 	mustCreate(t, repo, newTestSecret("live-expired", expired))
 	mustOpen(t, repo, "live-expired", "recipient", false, expired.Add(-time.Hour))
-	mustCreate(t, repo, newTestSecret("deleted-expired", expired))
-	if err := repo.Delete(ctx, "deleted-expired", expired.Add(-time.Hour)); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
+	// A closing secret whose download outlasts its expiry goes all the same.
 	opened := newTestSecret("opened-expired", expired)
 	opened.BurnAfterRead = true
 	mustCreate(t, repo, opened)
@@ -306,27 +307,26 @@ func TestCleanupRepo_DeleteExpiredSecrets(t *testing.T) {
 	mustCreate(t, repo, newTestSecret("at-expiry", now))
 	mustCreate(t, repo, newTestSecret("live", now.Add(time.Hour)))
 	// An upload under way is left to the upload's own expiry.
-	mustStartUpload(t, repo, "up-uploading-expired", newTestSecret("uploading-expired", expired), now.Add(time.Hour), expired.Add(-time.Hour))
+	mustStartUpload(t, repo, "up-uploading-expired", newTestSecret("uploading-expired", expired), now.Add(time.Hour))
 
 	n, err := repo.DeleteExpiredSecrets(ctx, now, testBatchSize)
 	if err != nil {
 		t.Fatalf("delete expired secrets: %v", err)
 	}
-	if n != 4 {
-		t.Errorf("deleted %d secrets, want 4", n)
+	if n != 3 {
+		t.Errorf("deleted %d secrets, want 3", n)
 	}
-	for _, id := range []string{"live-expired", "deleted-expired", "opened-expired", "at-expiry"} {
+	for _, id := range []string{"live-expired", "opened-expired", "at-expiry"} {
 		assertSecretGone(t, repo, id)
 	}
 	// Nothing about them is kept, their sessions included.
 	if sessions := countRows(t, pool, "SELECT count(*) FROM retrieval_sessions"); sessions != 0 {
 		t.Errorf("expired secrets left %d retrieval sessions", sessions)
 	}
-	// Objects they still held are doomed now; the deleted one's was already.
+	// Their objects are doomed with them.
 	for _, id := range []string{"live-expired", "opened-expired", "at-expiry"} {
 		assertDoomed(t, pool, keyOf(id))
 	}
-	assertDoomed(t, pool, keyOf("deleted-expired"))
 
 	if got := mustGetSecret(t, repo, "live"); got.State != domain.SecretLive {
 		t.Errorf("unexpired secret: state = %q, want live", got.State)
@@ -397,19 +397,20 @@ func TestCleanupRepo_DeleteDoomedObjects(t *testing.T) {
 	ctx := context.Background()
 	now := moment(time.Now())
 
-	// Doomed in three ways; filed at distinct moments, so the order is known.
-	mustCreate(t, repo, newTestSecret("deleted", now.Add(time.Hour)))
-	if err := repo.Delete(ctx, "deleted", now.Add(-2*time.Minute)); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
-	mustStartUpload(t, repo, "up-aborted", newTestSecret("aborted", now.Add(time.Hour)), now.Add(time.Hour), now.Add(-time.Hour))
-	if err := repo.RecordS3UploadID(ctx, "blobs/up-aborted", "s3-aborted"); err != nil {
+	// Doomed in three ways, under keys that tell the order: by key, since
+	// none has failed yet.
+	mustStartUpload(t, repo, "upload-a-aborted", newTestSecret("a-aborted", now.Add(time.Hour)), now.Add(time.Hour))
+	if err := repo.RecordS3UploadID(ctx, "blobs/upload-a-aborted", "s3-aborted"); err != nil {
 		t.Fatalf("record s3 upload id: %v", err)
 	}
-	if err := repo.AbortUpload(ctx, "up-aborted", now.Add(-3*time.Minute)); err != nil {
+	if err := repo.AbortUpload(ctx, "upload-a-aborted", now.Add(-3*time.Minute)); err != nil {
 		t.Fatalf("abort: %v", err)
 	}
-	mustCreate(t, repo, newTestSecret("expired", now.Add(-time.Hour)))
+	mustCreate(t, repo, newTestSecret("b-deleted", now.Add(time.Hour)))
+	if err := repo.Delete(ctx, "b-deleted", now.Add(-2*time.Minute)); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	mustCreate(t, repo, newTestSecret("c-expired", now.Add(-time.Hour)))
 	if _, err := repo.DeleteExpiredSecrets(ctx, now.Add(-time.Minute), testBatchSize); err != nil {
 		t.Fatalf("delete expired secrets: %v", err)
 	}
@@ -430,9 +431,9 @@ func TestCleanupRepo_DeleteDoomedObjects(t *testing.T) {
 	for _, o := range got {
 		keys = append(keys, o.StorageKey)
 	}
-	want := []string{"blobs/up-aborted", domain.UploadStorageKey(uploadSessionOf("deleted")), domain.UploadStorageKey(uploadSessionOf("expired"))}
+	want := []string{"blobs/upload-a-aborted", domain.UploadStorageKey(uploadSessionOf("b-deleted")), domain.UploadStorageKey(uploadSessionOf("c-expired"))}
 	if !slices.Equal(keys, want) {
-		t.Errorf("removed %v, want the oldest first: %v", keys, want)
+		t.Errorf("removed %v, want them by key: %v", keys, want)
 	}
 	// remove gets what storage needs to delete the object, an open multipart
 	// upload included.
@@ -506,8 +507,8 @@ func TestCleanupRepo_DeleteDoomedObjectsTriesUntriedOnesFirst(t *testing.T) {
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
 	now := moment(time.Now())
-	// Filed oldest first: stuck, then next, then last.
-	for _, id := range []string{"stuck", "next", "last"} {
+	// By key: stuck, then next, then last.
+	for _, id := range []string{"a-stuck", "b-next", "c-last"} {
 		mustCreate(t, repo, newTestSecret(id, now.Add(time.Hour)))
 		if err := repo.Delete(ctx, id, now); err != nil {
 			t.Fatalf("delete %s: %v", id, err)
@@ -515,13 +516,13 @@ func TestCleanupRepo_DeleteDoomedObjectsTriesUntriedOnesFirst(t *testing.T) {
 	}
 	key := func(id string) string { return domain.UploadStorageKey(uploadSessionOf(id)) }
 	refuse := func(object *domain.Object) error {
-		if object.StorageKey == key("stuck") {
+		if object.StorageKey == key("a-stuck") {
 			return errors.New("storage refuses this one")
 		}
 		return nil
 	}
 
-	// One object per batch: the oldest fails, and the next batches take the
+	// One object per batch: the first fails, and the next batches take the
 	// ones not tried yet before trying it again, so an object storage keeps
 	// refusing cannot hold up the rest.
 	var order []string
@@ -533,7 +534,7 @@ func TestCleanupRepo_DeleteDoomedObjectsTriesUntriedOnesFirst(t *testing.T) {
 			t.Fatalf("delete doomed objects: %v", err)
 		}
 	}
-	if want := []string{key("stuck"), key("next"), key("last"), key("stuck")}; !slices.Equal(order, want) {
+	if want := []string{key("a-stuck"), key("b-next"), key("c-last"), key("a-stuck")}; !slices.Equal(order, want) {
 		t.Errorf("tried %v, want %v", order, want)
 	}
 	if left := countRows(t, pool, "SELECT count(*) FROM objects"); left != 1 {
@@ -628,7 +629,7 @@ func TestCleanupRepo_NothingOutlivesASecret(t *testing.T) {
 
 			secret := newTestSecret("whole", now.Add(time.Hour))
 			secret.BurnAfterRead = tc.name == "opened one-time"
-			mustStartUpload(t, repo, "up-whole", secret, now.Add(10*time.Minute), now)
+			mustStartUpload(t, repo, "up-whole", secret, now.Add(10*time.Minute))
 			if err := repo.RecordS3UploadID(ctx, "blobs/up-whole", "s3-whole"); err != nil {
 				t.Fatalf("record s3 upload id: %v", err)
 			}
@@ -655,7 +656,7 @@ func TestCleanupRepo_NothingOutlivesASecret(t *testing.T) {
 				{"retrieval sessions", func() error { _, err := repo.DeleteExpiredRetrievalSessions(ctx, later); return err }},
 				{"expired uploads", func() error { _, err := repo.AbandonExpiredUploads(ctx, later, testBatchSize); return err }},
 				{"finished uploads", func() error { _, err := repo.DeleteFinishedUploads(ctx, later.Add(-time.Hour)); return err }},
-				{"drained secrets", func() error { _, err := repo.ReleaseDrainedSecrets(ctx, later, testBatchSize); return err }},
+				{"drained secrets", func() error { _, err := repo.DeleteDrainedSecrets(ctx, later, testBatchSize); return err }},
 				{"expired secrets", func() error { _, err := repo.DeleteExpiredSecrets(ctx, later, testBatchSize); return err }},
 				{"doomed objects", func() error {
 					_, err := repo.DeleteDoomedObjects(ctx, testBatchSize, removeAll(&removed))
@@ -685,7 +686,7 @@ func TestCleanupRepo_NothingOutlivesASecret(t *testing.T) {
 			// And the public id can be used again.
 			fresh := newTestSecret("whole", later.Add(time.Hour))
 			fresh.MetadataTokenHash = tokencrypto.TokenHash("a new link")
-			mustStartUpload(t, repo, "up-whole-again", fresh, later.Add(time.Hour), later)
+			mustStartUpload(t, repo, "up-whole-again", fresh, later.Add(time.Hour))
 		})
 	}
 }

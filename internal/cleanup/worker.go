@@ -34,7 +34,7 @@ type Repo interface {
 	DeleteExpiredRetrievalSessions(ctx context.Context, now time.Time) (int64, error)
 	AbandonExpiredUploads(ctx context.Context, now time.Time, limit int) (int, error)
 	DeleteFinishedUploads(ctx context.Context, finishedBefore time.Time) (int64, error)
-	ReleaseDrainedSecrets(ctx context.Context, now time.Time, limit int) (int, error)
+	DeleteDrainedSecrets(ctx context.Context, now time.Time, limit int) (int, error)
 	DeleteExpiredSecrets(ctx context.Context, now time.Time, limit int) (int, error)
 	DeleteDoomedObjects(ctx context.Context, limit int, remove func(object *domain.Object) error) (domain.CleanupBatch, error)
 	DeleteEndedTransfers(ctx context.Context, endedBefore time.Time) (int64, error)
@@ -94,7 +94,7 @@ func (w *Worker) runCycle(ctx context.Context) {
 		return w.repo.DeleteEndedTransfers(ctx, now.Add(-endedTransferRetention))
 	})
 	w.sweep(ctx, "drained one-time secrets", func() (int64, error) {
-		return drainSQL(ctx, func() (int, error) { return w.repo.ReleaseDrainedSecrets(ctx, now, batchSize) })
+		return drainSQL(ctx, func() (int, error) { return w.repo.DeleteDrainedSecrets(ctx, now, batchSize) })
 	})
 	w.sweep(ctx, "expired secrets", func() (int64, error) {
 		return drainSQL(ctx, func() (int, error) { return w.repo.DeleteExpiredSecrets(ctx, now, batchSize) })

@@ -1,7 +1,5 @@
 package domain
 
-import "time"
-
 // ObjectState is how far an object got in storage.
 type ObjectState string
 
@@ -20,7 +18,6 @@ type Object struct {
 	State      ObjectState
 	// S3UploadID is the provider's multipart upload, once it is recorded.
 	S3UploadID string
-	CreatedAt  time.Time
 	// Doomed is set once nothing may read the object any more.
 	Doomed bool
 	// FailedRemovals counts how often the cleanup failed to remove it.

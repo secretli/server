@@ -25,8 +25,12 @@ type Upload struct {
 	State           UploadState
 	ExpiresAt       time.Time
 	FinishedAt      *time.Time
+	// Lifetime is how long the secret lives once the upload completes. It is
+	// kept only while the upload runs.
+	Lifetime time.Duration
 
-	// Of the secret and its object, while the secret has them.
+	// Of the secret and its object, while the secret has them. The secret's
+	// expiry is provisional until the upload completes.
 	StorageKey      string
 	S3UploadID      string
 	BlobSize        int64

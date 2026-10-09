@@ -11,14 +11,22 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const clearStorageKeys = `-- name: ClearStorageKeys :exec
+const closeSecret = `-- name: CloseSecret :exec
 UPDATE secrets
-SET storage_key = NULL
-WHERE public_id = ANY($1::text[])
+SET state = 'closing',
+    created_at = NULL,
+    metadata_token_hash = NULL,
+    encrypted_meta = NULL,
+    blob_token_hash = NULL,
+    deletion_token_hash = NULL
+WHERE public_id = $1
 `
 
-func (q *Queries) ClearStorageKeys(ctx context.Context, publicIds []string) error {
-	_, err := q.db.Exec(ctx, clearStorageKeys, publicIds)
+// Opening a one-time secret closes it, whoever opens it. Its row keeps only
+// what the download that opened it needs, the object, its size and the
+// expiry, until that download has ended.
+func (q *Queries) CloseSecret(ctx context.Context, publicID string) error {
+	_, err := q.db.Exec(ctx, closeSecret, publicID)
 	return err
 }
 
@@ -42,8 +50,8 @@ VALUES (
 
 type CreateSecretParams struct {
 	PublicID          string
-	StorageKey        pgtype.Text
-	MetadataTokenHash string
+	StorageKey        string
+	MetadataTokenHash pgtype.Text
 	BlobTokenHash     pgtype.Text
 	DeletionTokenHash pgtype.Text
 	EncryptedMeta     pgtype.Text
@@ -53,7 +61,7 @@ type CreateSecretParams struct {
 }
 
 // A secret is filed when its upload starts, so its public id is taken from
-// then on.
+// then on. Its expiry is provisional until the upload completes.
 func (q *Queries) CreateSecret(ctx context.Context, arg CreateSecretParams) error {
 	_, err := q.db.Exec(ctx, createSecret,
 		arg.PublicID,
@@ -74,6 +82,8 @@ DELETE FROM secrets
 WHERE public_id = ANY($1::text[])
 `
 
+// Nothing about a deleted secret is kept, and its retrieval sessions go with
+// it. The caller dooms the objects in the same transaction.
 func (q *Queries) DeleteSecretsByPublicIDs(ctx context.Context, publicIds []string) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteSecretsByPublicIDs, publicIds)
 	if err != nil {
@@ -91,15 +101,15 @@ RETURNING storage_key
 
 // An abandoned upload's secret never existed: its row goes, which frees the
 // public id. Returns the keys of the objects to doom.
-func (q *Queries) DeleteUploadingSecrets(ctx context.Context, publicIds []string) ([]pgtype.Text, error) {
+func (q *Queries) DeleteUploadingSecrets(ctx context.Context, publicIds []string) ([]string, error) {
 	rows, err := q.db.Query(ctx, deleteUploadingSecrets, publicIds)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []pgtype.Text{}
+	items := []string{}
 	for rows.Next() {
-		var storage_key pgtype.Text
+		var storage_key string
 		if err := rows.Scan(&storage_key); err != nil {
 			return nil, err
 		}
@@ -111,43 +121,8 @@ func (q *Queries) DeleteUploadingSecrets(ctx context.Context, publicIds []string
 	return items, nil
 }
 
-const endSecretDeleted = `-- name: EndSecretDeleted :exec
-UPDATE secrets
-SET state = 'ended',
-    outcome = 'deleted',
-    storage_key = NULL,
-    encrypted_meta = NULL,
-    blob_token_hash = NULL,
-    deletion_token_hash = NULL
-WHERE public_id = $1
-`
-
-// Deleting ends the secret; the caller dooms its object in the same
-// transaction.
-func (q *Queries) EndSecretDeleted(ctx context.Context, publicID string) error {
-	_, err := q.db.Exec(ctx, endSecretDeleted, publicID)
-	return err
-}
-
-const endSecretOpened = `-- name: EndSecretOpened :exec
-UPDATE secrets
-SET state = 'ended',
-    outcome = 'opened',
-    encrypted_meta = NULL,
-    blob_token_hash = NULL,
-    deletion_token_hash = NULL
-WHERE public_id = $1
-`
-
-// Opening a one-time secret ends it. Its object stays until the download
-// that opened it has ended.
-func (q *Queries) EndSecretOpened(ctx context.Context, publicID string) error {
-	_, err := q.db.Exec(ctx, endSecretOpened, publicID)
-	return err
-}
-
 const getReadableSecretForUpdate = `-- name: GetReadableSecretForUpdate :one
-SELECT public_id, state, storage_key, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at, opened, outcome
+SELECT public_id, state, storage_key, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at, opened
 FROM secrets
 WHERE public_id = $1
   AND state = 'live'
@@ -176,13 +151,12 @@ func (q *Queries) GetReadableSecretForUpdate(ctx context.Context, arg GetReadabl
 		&i.ExpiresAt,
 		&i.CreatedAt,
 		&i.Opened,
-		&i.Outcome,
 	)
 	return i, err
 }
 
 const getSecret = `-- name: GetSecret :one
-SELECT public_id, state, storage_key, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at, opened, outcome
+SELECT public_id, state, storage_key, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at, opened
 FROM secrets
 WHERE public_id = $1
 `
@@ -203,7 +177,6 @@ func (q *Queries) GetSecret(ctx context.Context, publicID string) (Secret, error
 		&i.ExpiresAt,
 		&i.CreatedAt,
 		&i.Opened,
-		&i.Outcome,
 	)
 	return i, err
 }
@@ -211,8 +184,7 @@ func (q *Queries) GetSecret(ctx context.Context, publicID string) (Secret, error
 const listDrainedSecretsForUpdate = `-- name: ListDrainedSecretsForUpdate :many
 SELECT s.public_id, s.storage_key
 FROM secrets AS s
-WHERE s.state = 'ended'
-  AND s.storage_key IS NOT NULL
+WHERE s.state = 'closing'
   AND NOT EXISTS (
       SELECT 1
       FROM retrieval_sessions AS rs
@@ -231,10 +203,10 @@ type ListDrainedSecretsForUpdateParams struct {
 
 type ListDrainedSecretsForUpdateRow struct {
 	PublicID   string
-	StorageKey pgtype.Text
+	StorageKey string
 }
 
-// Opened one-time secrets whose last download session has ended.
+// Closing secrets whose last download session has ended.
 func (q *Queries) ListDrainedSecretsForUpdate(ctx context.Context, arg ListDrainedSecretsForUpdateParams) ([]ListDrainedSecretsForUpdateRow, error) {
 	rows, err := q.db.Query(ctx, listDrainedSecretsForUpdate, arg.NowAt, arg.BatchSize)
 	if err != nil {
@@ -272,10 +244,10 @@ type ListExpiredSecretsForUpdateParams struct {
 
 type ListExpiredSecretsForUpdateRow struct {
 	PublicID   string
-	StorageKey pgtype.Text
+	StorageKey string
 }
 
-// Live and ended secrets past their expiry, oldest first. An upload under
+// Live and closing secrets past their expiry, oldest first. An upload under
 // way is left to its own expiry.
 func (q *Queries) ListExpiredSecretsForUpdate(ctx context.Context, arg ListExpiredSecretsForUpdateParams) ([]ListExpiredSecretsForUpdateRow, error) {
 	rows, err := q.db.Query(ctx, listExpiredSecretsForUpdate, arg.NowAt, arg.BatchSize)
@@ -311,18 +283,22 @@ func (q *Queries) LockUploadStarts(ctx context.Context) error {
 const makeSecretLive = `-- name: MakeSecretLive :execrows
 UPDATE secrets
 SET state = 'live',
-    created_at = $1
-WHERE public_id = $2
+    created_at = $1,
+    expires_at = $2
+WHERE public_id = $3
   AND state = 'uploading'
 `
 
 type MakeSecretLiveParams struct {
-	NowAt    pgtype.Timestamptz
-	PublicID string
+	CreatedAt pgtype.Timestamptz
+	ExpiresAt pgtype.Timestamptz
+	PublicID  string
 }
 
+// The completed upload sets both times, to the minute: the secret's lifetime
+// counts from here, and nothing kept tells how long the upload took.
 func (q *Queries) MakeSecretLive(ctx context.Context, arg MakeSecretLiveParams) (int64, error) {
-	result, err := q.db.Exec(ctx, makeSecretLive, arg.NowAt, arg.PublicID)
+	result, err := q.db.Exec(ctx, makeSecretLive, arg.CreatedAt, arg.ExpiresAt, arg.PublicID)
 	if err != nil {
 		return 0, err
 	}
@@ -335,7 +311,7 @@ SET opened = TRUE
 WHERE public_id = $1
 `
 
-// Someone other than the owner opened a reusable secret.
+// A recipient, not the owner, opened a reusable secret.
 func (q *Queries) MarkSecretOpened(ctx context.Context, publicID string) error {
 	_, err := q.db.Exec(ctx, markSecretOpened, publicID)
 	return err
@@ -344,7 +320,7 @@ func (q *Queries) MarkSecretOpened(ctx context.Context, publicID string) error {
 const storageStats = `-- name: StorageStats :one
 SELECT
     (SELECT count(*) FROM secrets AS l WHERE l.state = 'live' AND l.expires_at > $1)::bigint AS live_secrets,
-    (SELECT COALESCE(SUM(h.blob_size), 0) FROM secrets AS h WHERE h.storage_key IS NOT NULL)::bigint AS stored_bytes,
+    (SELECT COALESCE(SUM(h.blob_size), 0) FROM secrets AS h)::bigint AS stored_bytes,
     (SELECT count(*) FROM objects AS o WHERE o.doomed)::bigint AS doomed_objects
 `
 
@@ -365,11 +341,11 @@ func (q *Queries) StorageStats(ctx context.Context, nowAt pgtype.Timestamptz) (S
 const storedBytes = `-- name: StoredBytes :one
 SELECT COALESCE(SUM(blob_size), 0)::bigint AS stored_bytes
 FROM secrets
-WHERE storage_key IS NOT NULL
 `
 
-// What the secrets that hold an object take up in storage, uploads under way
-// included. Doomed objects are left out: they are gone within a minute.
+// What the secrets take up in storage, uploads under way and downloads that
+// drain included. Every secret holds its object; doomed objects are left
+// out, since they are gone within a minute.
 func (q *Queries) StoredBytes(ctx context.Context) (int64, error) {
 	row := q.db.QueryRow(ctx, storedBytes)
 	var stored_bytes int64

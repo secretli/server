@@ -36,6 +36,9 @@ func newTestSecret(publicID string, expiresAt time.Time) *domain.Secret {
 	}
 }
 
+// testLifetime is the lifetime of the secrets the tests upload.
+const testLifetime = time.Hour
+
 // newTestUpload returns the upload under sessionID that creates secret, and
 // points the secret at the session's own object, as the service does.
 func newTestUpload(sessionID string, secret *domain.Secret, expiresAt time.Time) *domain.Upload {
@@ -44,6 +47,7 @@ func newTestUpload(sessionID string, secret *domain.Secret, expiresAt time.Time)
 		SessionID:       sessionID,
 		UploadTokenHash: tokencrypto.TokenHash("upload-token-" + sessionID),
 		ExpiresAt:       expiresAt,
+		Lifetime:        testLifetime,
 	}
 }
 
@@ -52,9 +56,9 @@ func uploadSessionOf(publicID string) string {
 	return "upload-" + publicID
 }
 
-func mustStartUpload(t *testing.T, repo *pgadapter.SecretRepo, sessionID string, secret *domain.Secret, uploadExpiresAt, now time.Time) {
+func mustStartUpload(t *testing.T, repo *pgadapter.SecretRepo, sessionID string, secret *domain.Secret, uploadExpiresAt time.Time) {
 	t.Helper()
-	if err := repo.StartUpload(context.Background(), secret, newTestUpload(sessionID, secret, uploadExpiresAt), now); err != nil {
+	if err := repo.StartUpload(context.Background(), secret, newTestUpload(sessionID, secret, uploadExpiresAt)); err != nil {
 		t.Fatalf("start upload %s for %s: %v", sessionID, secret.PublicID, err)
 	}
 }
@@ -66,14 +70,20 @@ func mustComplete(t *testing.T, repo *pgadapter.SecretRepo, sessionID string, no
 	}
 }
 
-// mustCreate uploads a live secret. Neither step looks at the secret's
-// expiry, so it also makes secrets that have already expired.
+// mustCreate uploads a live secret that expires at secret.ExpiresAt.
+// Completing gives a secret its expiry from its lifetime, which the upload
+// tests check; here the expiry is then moved to where the test wants it,
+// into the past too.
 func mustCreate(t *testing.T, repo *pgadapter.SecretRepo, secret *domain.Secret) {
 	t.Helper()
 	now := time.Now()
 	sessionID := uploadSessionOf(secret.PublicID)
-	mustStartUpload(t, repo, sessionID, secret, now.Add(time.Hour), now)
+	mustStartUpload(t, repo, sessionID, secret, now.Add(time.Hour))
 	mustComplete(t, repo, sessionID, now)
+	if _, err := testDBPool.Exec(context.Background(),
+		"UPDATE secrets SET expires_at = $2 WHERE public_id = $1", secret.PublicID, secret.ExpiresAt); err != nil {
+		t.Fatalf("set expiry of %s: %v", secret.PublicID, err)
+	}
 }
 
 // openAs starts a retrieval session on a secret made by newTestSecret, as a
@@ -123,27 +133,47 @@ func assertSecretGone(t *testing.T, repo *pgadapter.SecretRepo, publicID string)
 	}
 }
 
-// assertEnded checks that an ended secret keeps nothing but its metadata
-// token hash and how it ended.
-func assertEnded(t *testing.T, secret *domain.Secret, outcome domain.Outcome) {
+// assertClosing checks that an opened one-time secret is closing and keeps
+// nothing but what the download that opened it needs: its object, the
+// object's size and the expiry. No content, no token hash, no creation time.
+func assertClosing(t *testing.T, repo *pgadapter.SecretRepo, original *domain.Secret) {
 	t.Helper()
-	if secret.State != domain.SecretEnded || secret.Outcome != outcome {
-		t.Errorf("%s: state = %q, outcome = %q; want ended, %q", secret.PublicID, secret.State, secret.Outcome, outcome)
+	got := mustGetSecret(t, repo, original.PublicID)
+	want := domain.Secret{
+		PublicID:      original.PublicID,
+		State:         domain.SecretClosing,
+		StorageKey:    original.StorageKey,
+		BlobSize:      original.BlobSize,
+		BurnAfterRead: true,
+		ExpiresAt:     got.ExpiresAt,
 	}
-	if secret.EncryptedMeta != "" || secret.BlobTokenHash != "" || secret.DeletionTokenHash != "" {
-		t.Errorf("%s: ended secret keeps content: meta %q, blob hash %q, deletion hash %q",
-			secret.PublicID, secret.EncryptedMeta, secret.BlobTokenHash, secret.DeletionTokenHash)
+	if *got != want {
+		t.Errorf("closing secret = %+v, want only %+v", *got, want)
 	}
-	if secret.MetadataTokenHash != tokencrypto.TokenHash("metadata-token-"+secret.PublicID) {
-		t.Errorf("%s: metadata token hash = %q, want it kept to answer how the secret ended", secret.PublicID, secret.MetadataTokenHash)
+}
+
+// secretRow is what a secret's row holds of its times, read past the
+// repository.
+type secretRow struct {
+	CreatedAt *time.Time
+	ExpiresAt time.Time
+}
+
+func mustGetSecretRow(t *testing.T, pool *pgxpool.Pool, publicID string) secretRow {
+	t.Helper()
+	var r secretRow
+	if err := pool.QueryRow(context.Background(),
+		"SELECT created_at, expires_at FROM secrets WHERE public_id = $1", publicID,
+	).Scan(&r.CreatedAt, &r.ExpiresAt); err != nil {
+		t.Fatalf("query secret %s: %v", publicID, err)
 	}
+	return r
 }
 
 // objectRow is an object's row as the ledger holds it.
 type objectRow struct {
 	State          string
 	S3UploadID     *string
-	CreatedAt      time.Time
 	Doomed         bool
 	FailedRemovals int
 }
@@ -153,8 +183,8 @@ func getObject(t *testing.T, pool *pgxpool.Pool, storageKey string) *objectRow {
 	t.Helper()
 	var o objectRow
 	err := pool.QueryRow(context.Background(),
-		"SELECT state, s3_upload_id, created_at, doomed, failed_removals FROM objects WHERE storage_key = $1", storageKey,
-	).Scan(&o.State, &o.S3UploadID, &o.CreatedAt, &o.Doomed, &o.FailedRemovals)
+		"SELECT state, s3_upload_id, doomed, failed_removals FROM objects WHERE storage_key = $1", storageKey,
+	).Scan(&o.State, &o.S3UploadID, &o.Doomed, &o.FailedRemovals)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
@@ -207,21 +237,37 @@ func TestSecretRepo_StorageStatsCountTotalsOnly(t *testing.T) {
 	mustCreate(t, repo, live)
 	uploading := newTestSecret("uploading", now.Add(time.Hour))
 	uploading.BlobSize = 50
-	mustStartUpload(t, repo, "up-uploading", uploading, now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-uploading", uploading, now.Add(time.Hour))
 	deleted := newTestSecret("deleted", now.Add(time.Hour))
 	deleted.BlobSize = 1000
 	mustCreate(t, repo, deleted)
 	if err := repo.Delete(ctx, "deleted", now); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
+	// Opened one-time secrets: one still drains, the other let go of its
+	// object once its download ended.
+	for _, s := range []struct {
+		id       string
+		size     int64
+		openedAt time.Time
+	}{{"draining", 7, now}, {"drained", 3000, now.Add(-time.Hour)}} {
+		secret := newTestSecret(s.id, now.Add(time.Hour))
+		secret.BlobSize, secret.BurnAfterRead = s.size, true
+		mustCreate(t, repo, secret)
+		mustOpen(t, repo, s.id, "opener-"+s.id, false, s.openedAt)
+	}
+	if n, err := repo.DeleteDrainedSecrets(ctx, now, testBatchSize); err != nil || n != 1 {
+		t.Fatalf("release drained secrets = %d, %v; want 1", n, err)
+	}
 
-	// One secret can be opened; storage holds it and the upload under way;
-	// the deleted secret's object waits for the cleanup and no longer counts.
+	// One secret can be opened; storage holds it, the upload under way and
+	// the download that drains; the deleted and drained secrets' objects wait
+	// for the cleanup and no longer count.
 	stats, err := repo.StorageStats(ctx, now)
 	if err != nil {
 		t.Fatalf("storage stats: %v", err)
 	}
-	if want := (domain.StorageStats{LiveSecrets: 1, StoredBytes: 150, DoomedObjects: 1}); stats != want {
+	if want := (domain.StorageStats{LiveSecrets: 1, StoredBytes: 157, DoomedObjects: 2}); stats != want {
 		t.Errorf("stats = %+v, want %+v", stats, want)
 	}
 }
@@ -235,7 +281,7 @@ func TestSecretRepo_GetSecretReturnsASecretInAnyState(t *testing.T) {
 
 	secret := newTestSecret("get-any", expiresAt)
 	secret.BurnAfterRead = true
-	mustStartUpload(t, repo, "upload-get-any", secret, now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "upload-get-any", secret, now.Add(time.Hour))
 
 	// A secret is filed when its upload starts, already with all its fields.
 	got := mustGetSecret(t, repo, "get-any")
@@ -261,8 +307,8 @@ func TestSecretRepo_GetSecretReturnsASecretInAnyState(t *testing.T) {
 	if got.CreatedAt != nil {
 		t.Errorf("created_at = %v, want none while uploading", *got.CreatedAt)
 	}
-	if got.Readable(now) || got.Ended(now) {
-		t.Error("an uploading secret is neither readable nor ended")
+	if got.Readable(now) {
+		t.Error("an uploading secret is readable")
 	}
 
 	// Expired secrets are returned until the cleanup deletes them.
@@ -276,13 +322,14 @@ func TestSecretRepo_GetSecretReturnsASecretInAnyState(t *testing.T) {
 	}
 }
 
-func TestSecretRepo_OpeningAOneTimeSecretEndsIt(t *testing.T) {
+func TestSecretRepo_OpeningAOneTimeSecretClosesIt(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		asOwner bool
 	}{
 		{name: "by a recipient"},
-		// There is no owner's preview of a one-time secret: opening it ends it.
+		// There is no owner's preview of a one-time secret: opening it closes
+		// it.
 		{name: "by the owner", asOwner: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -296,29 +343,25 @@ func TestSecretRepo_OpeningAOneTimeSecretEndsIt(t *testing.T) {
 			opened := mustOpen(t, repo, "one-time", "opener", tc.asOwner, now)
 
 			// The answer still carries what the opener needs to read it.
-			if opened.State != domain.SecretEnded || opened.Outcome != domain.OutcomeOpened {
-				t.Errorf("returned state = %q, outcome = %q; want ended, opened", opened.State, opened.Outcome)
+			if opened.State != domain.SecretClosing {
+				t.Errorf("returned state = %q, want closing", opened.State)
 			}
-			if opened.EncryptedMeta != "v2$nonce$meta-one-time" || opened.StorageKey != secret.StorageKey {
-				t.Errorf("returned meta = %q, storage key = %q; want the secret's", opened.EncryptedMeta, opened.StorageKey)
+			if opened.EncryptedMeta != "v2$nonce$meta-one-time" || opened.StorageKey != secret.StorageKey || opened.BlobSize != secret.BlobSize {
+				t.Errorf("returned meta = %q, storage key = %q, blob size %d; want the secret's", opened.EncryptedMeta, opened.StorageKey, opened.BlobSize)
 			}
 
-			stored := mustGetSecret(t, repo, "one-time")
-			assertEnded(t, stored, domain.OutcomeOpened)
-			if stored.Opened {
-				t.Error("opened flag set on a one-time secret; it ends instead")
-			}
-			if !stored.Ended(now) || stored.Readable(now) {
-				t.Errorf("ended = %v, readable = %v; want ended and not readable", stored.Ended(now), stored.Readable(now))
-			}
-			// The object stays for the download that opened it.
-			if stored.StorageKey != secret.StorageKey {
-				t.Errorf("storage key = %q, want %q kept until drained", stored.StorageKey, secret.StorageKey)
+			// Whoever opened it, it keeps only what the download needs.
+			assertClosing(t, repo, secret)
+			if mustGetSecret(t, repo, "one-time").Readable(now) {
+				t.Error("a closing secret is readable")
 			}
 			assertNotDoomed(t, pool, secret.StorageKey)
 
-			if _, err := download(repo, "one-time", "opener", now); err != nil {
+			got, err := download(repo, "one-time", "opener", now)
+			if err != nil {
 				t.Errorf("opener's download: %v, want it allowed until the session ends", err)
+			} else if got.BlobSize != secret.BlobSize {
+				t.Errorf("download blob size = %d, want %d for the range reads", got.BlobSize, secret.BlobSize)
 			}
 			if _, err := openAs(repo, "one-time", "second", false, now); !errors.Is(err, domain.ErrNotFound) {
 				t.Errorf("second open: err = %v, want ErrNotFound", err)
@@ -400,7 +443,7 @@ func TestSecretRepo_StartRetrievalSessionNeedsAReadableSecret(t *testing.T) {
 	now := moment(time.Now())
 
 	uploading := newTestSecret("not-yet", now.Add(time.Hour))
-	mustStartUpload(t, repo, "upload-not-yet", uploading, now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "upload-not-yet", uploading, now.Add(time.Hour))
 	mustCreate(t, repo, newTestSecret("expired", now.Add(-time.Second)))
 	mustCreate(t, repo, newTestSecret("deleted", now.Add(time.Hour)))
 	if err := repo.Delete(context.Background(), "deleted", now); err != nil {
@@ -502,7 +545,7 @@ func TestSecretRepo_GetByRetrievalSession(t *testing.T) {
 	}
 }
 
-func TestSecretRepo_DeleteEndsTheSecretAndDoomsItsObject(t *testing.T) {
+func TestSecretRepo_DeleteRemovesTheSecretAndDoomsItsObject(t *testing.T) {
 	pool := setupTestDB(t)
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
@@ -516,14 +559,10 @@ func TestSecretRepo_DeleteEndsTheSecretAndDoomsItsObject(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 
-	stored := mustGetSecret(t, repo, "doomed")
-	assertEnded(t, stored, domain.OutcomeDeleted)
-	if stored.StorageKey != "" {
-		t.Errorf("storage key = %q, want it cleared", stored.StorageKey)
-	}
-	// Whether a recipient had opened it is still worth telling the owner.
-	if !stored.Opened {
-		t.Error("deleting cleared the opened flag")
+	// Nothing of it is kept, its sessions included; its object is doomed.
+	assertSecretGone(t, repo, "doomed")
+	if n := countRows(t, pool, "SELECT count(*) FROM retrieval_sessions WHERE public_id = 'doomed'"); n != 0 {
+		t.Errorf("the deleted secret left %d retrieval sessions", n)
 	}
 	assertDoomed(t, pool, secret.StorageKey)
 
@@ -546,7 +585,7 @@ func TestSecretRepo_DeleteNeedsAReadableSecret(t *testing.T) {
 	now := moment(time.Now())
 
 	uploading := newTestSecret("not-yet", now.Add(time.Hour))
-	mustStartUpload(t, repo, "upload-not-yet", uploading, now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "upload-not-yet", uploading, now.Add(time.Hour))
 	expired := newTestSecret("expired", now.Add(-time.Second))
 	mustCreate(t, repo, expired)
 	burned := newTestSecret("burned", now.Add(time.Hour))
@@ -564,9 +603,7 @@ func TestSecretRepo_DeleteNeedsAReadableSecret(t *testing.T) {
 	if got := mustGetSecret(t, repo, "not-yet"); got.State != domain.SecretUploading {
 		t.Errorf("uploading secret state = %q, want uploading", got.State)
 	}
-	if got := mustGetSecret(t, repo, "burned"); got.Outcome != domain.OutcomeOpened || got.StorageKey != burned.StorageKey {
-		t.Errorf("opened secret: outcome = %q, storage key = %q; want opened and kept", got.Outcome, got.StorageKey)
-	}
+	assertClosing(t, repo, burned)
 	for _, key := range []string{uploading.StorageKey, expired.StorageKey, burned.StorageKey} {
 		assertNotDoomed(t, pool, key)
 	}
