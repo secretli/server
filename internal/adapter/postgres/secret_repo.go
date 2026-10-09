@@ -43,16 +43,21 @@ func NewSecretRepo(pool *pgxpool.Pool, opts ...Option) *SecretRepo {
 	return r
 }
 
-// StorageStats returns the totals the metrics report.
-func (r *SecretRepo) StorageStats(ctx context.Context, now time.Time) (domain.StorageStats, error) {
-	row, err := r.q.StorageStats(ctx, timestamptz(now))
+// MetricsStats returns the totals the metrics report.
+func (r *SecretRepo) MetricsStats(ctx context.Context, now time.Time) (domain.MetricsStats, error) {
+	row, err := r.q.MetricsStats(ctx, timestamptz(now))
 	if err != nil {
-		return domain.StorageStats{}, fmt.Errorf("query storage stats: %w", err)
+		return domain.MetricsStats{}, fmt.Errorf("query metrics stats: %w", err)
 	}
-	return domain.StorageStats{
-		LiveSecrets:   row.LiveSecrets,
-		StoredBytes:   row.StoredBytes,
-		DoomedObjects: row.DoomedObjects,
+	return domain.MetricsStats{
+		LiveOneTime:          row.LiveOneTime,
+		LiveReusable:         row.LiveReusable,
+		StoredBytes:          row.StoredBytes,
+		OverdueSecrets:       row.OverdueSecrets,
+		DoomedObjects:        row.DoomedObjects,
+		RemovalFailedObjects: row.RemovalFailedObjects,
+		StuckUploads:         row.StuckUploads,
+		ReservedPublicIDs:    row.ReservedPublicIds,
 	}, nil
 }
 

@@ -74,6 +74,39 @@ Behind a reverse proxy, set `TRUSTED_PROXIES` to the proxy's address so rate lim
 
 Rate limits apply per client address, and an end-to-end suite sends far more requests from one address than a visitor would. Test environments set `RATE_LIMIT_MULTIPLIER` (for example to `100`) instead of waiting out the limits. It is read once at startup and never from a request, anything but a whole number of at least 1 stops the server from starting, and a server with raised limits logs a warning. Production leaves it unset.
 
+### Metrics
+
+`GET /metrics` serves Prometheus metrics: Go runtime and process metrics, and these.
+
+| Metric | Type | What it counts |
+|---|---|---|
+| `secretli_http_requests_total` | counter | requests, by method, route and status code |
+| `secretli_http_request_duration_seconds` | histogram | request durations, by method, route and status code |
+| `secretli_http_in_flight_requests` | gauge | requests being answered now |
+| `secretli_secrets_created_total` | counter | secrets created |
+| `secretli_objects_deleted_total` | counter | objects the cleanup deleted from storage |
+| `secretli_cleanup_errors_total` | counter | errors of the cleanup worker, database or storage |
+| `secretli_secrets_live` | gauge | secrets that can be opened now, by `kind`: `one_time` or `reusable`, which add up to the total |
+| `secretli_stored_bytes` | gauge | bytes the secrets holding an object take up in storage, uploads under way included |
+| `secretli_stored_bytes_limit` | gauge | `MAX_STORED_BYTES`, when set |
+| `secretli_secrets_overdue` | gauge | secrets past their expiry that the cleanup has not forgotten yet; normally 0 |
+| `secretli_objects_doomed` | gauge | objects waiting for the cleanup to delete them from storage; normally near 0 |
+| `secretli_objects_removal_failed` | gauge | doomed objects that storage has refused to delete at least once; normally 0 |
+| `secretli_uploads_stuck` | gauge | uploads still under way past their own expiry, which the cleanup should have abandoned; normally 0 |
+| `secretli_public_ids_reserved` | gauge | links of secrets that are gone, kept reserved until their expiry |
+
+The gauges from `secretli_secrets_live` on are read from the database at every scrape, so every replica reports the same values: across replicas, take one of them with `max`, not `sum`. For example, all live secrets are `sum(max by (kind) (secretli_secrets_live))`. They are totals of the current state: no secret is told apart, and nothing is stored for them. Uploads and downloads under way, one-time secrets whose download is still running and open short-code transfers are not counted on purpose: each lasts only while one person acts, and a count of them, scraped every minute into a monitoring store, would record when someone uploaded, downloaded or handed over a secret.
+
+Suggested alerts:
+
+| Alert | PromQL | For |
+|---|---|---|
+| The cleanup is not forgetting expired secrets | `max(secretli_secrets_overdue) > 0` | 10m |
+| Storage keeps refusing to delete objects | `max(secretli_objects_removal_failed) > 0` | 30m |
+| The cleanup is not abandoning expired uploads | `max(secretli_uploads_stuck) > 0` | 30m |
+| Storage is nearly full | `max(secretli_stored_bytes) / max(secretli_stored_bytes_limit) > 0.8` | |
+| The cleanup fails | `increase(secretli_cleanup_errors_total[30m]) > 0` | |
+
 ## Development
 
 ```bash

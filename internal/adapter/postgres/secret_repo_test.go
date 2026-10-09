@@ -235,26 +235,47 @@ func countRows(t *testing.T, pool *pgxpool.Pool, query string, args ...any) int 
 	return n
 }
 
-func TestSecretRepo_StorageStatsCountTotalsOnly(t *testing.T) {
+func TestSecretRepo_MetricsStatsCountTotalsOnly(t *testing.T) {
 	pool := setupTestDB(t)
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
 	now := moment(time.Now())
+	past := now.Add(-time.Minute)
 
-	live := newTestSecret("live", now.Add(time.Hour))
-	live.BlobSize = 100
-	mustCreate(t, repo, live)
-	uploading := newTestSecret("uploading", now.Add(time.Hour))
+	// Live secrets of both kinds. The reusable one's upload completed after
+	// its own expiry, which leaves it completed, not stuck.
+	reusable := newTestSecret("reusable", now.Add(time.Hour))
+	reusable.BlobSize = 100
+	mustStartUpload(t, repo, "up-reusable", reusable, past)
+	mustComplete(t, repo, "up-reusable", now)
+	oneTime := newTestSecret("one-time", now.Add(time.Hour))
+	oneTime.BlobSize, oneTime.BurnAfterRead = 200, true
+	mustCreate(t, repo, oneTime)
+
+	// Uploads under way: one within its time, whose secret's provisional
+	// expiry has passed, which makes it neither overdue nor stuck; one past
+	// its own expiry, which the abandon sweep would end.
+	uploading := newTestSecret("uploading", past)
 	uploading.BlobSize = 50
 	mustStartUpload(t, repo, "up-uploading", uploading, now.Add(time.Hour))
-	deleted := newTestSecret("deleted", now.Add(time.Hour))
-	deleted.BlobSize = 1000
-	mustCreate(t, repo, deleted)
-	if err := repo.Delete(ctx, "deleted", now); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
+	stuck := newTestSecret("stuck", now.Add(time.Hour))
+	stuck.BlobSize = 30
+	mustStartUpload(t, repo, "up-stuck", stuck, past)
+
+	// Secrets past their expiry that the cleanup has not forgotten yet, a
+	// live one and a closing one.
+	expired := newTestSecret("expired", now.Add(time.Hour))
+	expired.BlobSize = 400
+	mustCreate(t, repo, expired)
+	setExpiry(t, "expired", past)
+	expiredClosing := newTestSecret("expired-closing", now.Add(time.Hour))
+	expiredClosing.BlobSize, expiredClosing.BurnAfterRead = 800, true
+	mustCreate(t, repo, expiredClosing)
+	mustOpen(t, repo, "expired-closing", "opener-expired-closing", false, now)
+	setExpiry(t, "expired-closing", past)
+
 	// Opened one-time secrets: one still drains, the other let go of its
-	// object once its download ended.
+	// object once its download ended, and its link stays reserved.
 	for _, s := range []struct {
 		id       string
 		size     int64
@@ -269,14 +290,52 @@ func TestSecretRepo_StorageStatsCountTotalsOnly(t *testing.T) {
 		t.Fatalf("release drained secrets = %d, %v; want 1", n, err)
 	}
 
-	// One secret can be opened; storage holds it, the upload under way and
-	// the download that drains; the deleted and drained secrets' objects wait
-	// for the cleanup and no longer count.
-	stats, err := repo.StorageStats(ctx, now)
-	if err != nil {
-		t.Fatalf("storage stats: %v", err)
+	// A deleted secret: its link stays reserved too.
+	deleted := newTestSecret("deleted", now.Add(time.Hour))
+	deleted.BlobSize = 1000
+	mustCreate(t, repo, deleted)
+	if err := repo.Delete(ctx, "deleted", now); err != nil {
+		t.Fatalf("delete: %v", err)
 	}
-	if want := (domain.StorageStats{LiveSecrets: 1, StoredBytes: 157, DoomedObjects: 2}); stats != want {
+
+	// Storage refuses the deleted secret's object and removes the drained
+	// one's, so one doomed object has failed to go.
+	refusedKey := domain.UploadStorageKey(uploadSessionOf("deleted"))
+	if _, err := repo.DeleteDoomedObjects(ctx, testBatchSize, func(object *domain.Object) error {
+		if object.StorageKey == refusedKey {
+			return errors.New("storage unavailable")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("delete doomed objects: %v", err)
+	}
+
+	// An abandoned upload, past its own expiry: not stuck, its object doomed
+	// and its link free.
+	abandoned := newTestSecret("abandoned", now.Add(time.Hour))
+	mustStartUpload(t, repo, "up-abandoned", abandoned, past)
+	if err := repo.AbortUpload(ctx, "up-abandoned", now); err != nil {
+		t.Fatalf("abort upload: %v", err)
+	}
+
+	stats, err := repo.MetricsStats(ctx, now)
+	if err != nil {
+		t.Fatalf("metrics stats: %v", err)
+	}
+	want := domain.MetricsStats{
+		LiveOneTime:  1,
+		LiveReusable: 1,
+		// Every secret that holds its object: live, uploading, past its
+		// expiry and draining. The deleted, drained and abandoned ones'
+		// objects wait for the cleanup and no longer count.
+		StoredBytes:          100 + 200 + 50 + 30 + 400 + 800 + 7,
+		OverdueSecrets:       2,
+		DoomedObjects:        2,
+		RemovalFailedObjects: 1,
+		StuckUploads:         1,
+		ReservedPublicIDs:    2,
+	}
+	if stats != want {
 		t.Errorf("stats = %+v, want %+v", stats, want)
 	}
 }
