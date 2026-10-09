@@ -1,7 +1,6 @@
 package metrics
 
 import (
-	"net/http"
 	"strconv"
 	"time"
 
@@ -48,7 +47,7 @@ func NewHTTPMetrics(reg *prometheus.Registry) *HTTPMetrics {
 
 func (m *HTTPMetrics) Middleware() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			// Don't record metrics for the metrics endpoint itself.
 			if c.Request().URL.Path == "/metrics" {
 				return next(c)
@@ -66,10 +65,10 @@ func (m *HTTPMetrics) Middleware() echo.MiddlewareFunc {
 				route = "/*"
 			}
 
-			status := c.Response().Status
-			if status == 0 {
-				status = http.StatusOK
-			}
+			// The request logger, inside this middleware, has handed any
+			// error to the error handler, so the response is written and
+			// this is the status the client got.
+			_, status := echo.ResolveResponseStatus(c.Response(), err)
 
 			labels := prometheus.Labels{
 				"method":      c.Request().Method,

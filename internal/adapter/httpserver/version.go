@@ -13,7 +13,7 @@ type versionResponse struct {
 // VersionHandler reports the commit the running binary was built from, so the
 // page can show which build is live.
 func VersionHandler(version string) echo.HandlerFunc {
-	return func(c echo.Context) error {
+	return func(c *echo.Context) error {
 		return c.JSON(http.StatusOK, versionResponse{Version: version})
 	}
 }

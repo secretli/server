@@ -11,31 +11,33 @@ import (
 
 	"github.com/labstack/echo/v5"
 	"github.com/labstack/echo/v5/middleware"
-	"golang.org/x/time/rate"
 
 	"github.com/secretli/server/internal/platform/correlation"
 	"github.com/secretli/server/internal/platform/crypto"
 	apperrors "github.com/secretli/server/internal/platform/errors"
 )
 
-func httpErrorHandler(err error, c echo.Context) {
-	if c.Response().Committed {
+func httpErrorHandler(c *echo.Context, err error) {
+	if resp, unwrapErr := echo.UnwrapResponse(c.Response()); unwrapErr == nil && resp.Committed {
 		return
 	}
 
 	// Errors raised by Echo itself (body limit, router, method not allowed)
-	// carry their own status; do not collapse them into 500s.
-	if httpErr, ok := errors.AsType[*echo.HTTPError](err); ok {
-		status := httpErr.Code
-		message := http.StatusText(status)
-		if status >= http.StatusInternalServerError {
-			slog.ErrorContext(c.Request().Context(), "unhandled http error", "status", status, "error", httpErr)
-			message = "internal server error"
-		} else if text, ok := httpErr.Message.(string); ok && text != "" {
-			message = text
+	// carry their own status; do not collapse them into 500s. Echo's
+	// predefined errors are not *echo.HTTPError, so ask for the status. The
+	// handlers' own errors are left to the branch below.
+	if _, isAppErr := errors.AsType[*apperrors.Error](err); !isAppErr {
+		if status := echo.StatusCode(err); status != 0 {
+			message := http.StatusText(status)
+			if status >= http.StatusInternalServerError {
+				slog.ErrorContext(c.Request().Context(), "unhandled http error", "status", status, "error", err)
+				message = "internal server error"
+			} else if httpErr, ok := errors.AsType[*echo.HTTPError](err); ok && httpErr.Message != "" {
+				message = httpErr.Message
+			}
+			_ = c.JSON(status, apperrors.ErrorResponse{Error: message})
+			return
 		}
-		_ = c.JSON(status, apperrors.ErrorResponse{Error: message})
-		return
 	}
 
 	appErr := apperrors.AsAppError(err)
@@ -65,7 +67,7 @@ func parseOrigins(origins string) []string {
 
 func correlationMiddleware() echo.MiddlewareFunc {
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			id := c.Response().Header().Get(echo.HeaderXRequestID)
 			if id != "" {
 				ctx := correlation.WithRequestID(c.Request().Context(), id)
@@ -84,9 +86,8 @@ func requestLogger() echo.MiddlewareFunc {
 		LogMethod:   true,
 		LogStatus:   true,
 		LogLatency:  true,
-		LogError:    true,
 		HandleError: true,
-		LogValuesFunc: func(c echo.Context, v middleware.RequestLoggerValues) error {
+		LogValuesFunc: func(c *echo.Context, v middleware.RequestLoggerValues) error {
 			route := c.Path()
 			if route == "" {
 				route = "/*"
@@ -132,29 +133,31 @@ func securityHeaders() echo.MiddlewareFunc {
 	// Echo's SecureConfig has no Permissions-Policy field.
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		handler := secure(next)
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			c.Response().Header().Set("Permissions-Policy", permissionsPolicy)
 			return handler(c)
 		}
 	}
 }
 
-func corsMiddleware(origins []string) echo.MiddlewareFunc {
-	return middleware.CORSWithConfig(middleware.CORSConfig{
+// corsMiddleware fails for an origin that is not a bare scheme://host[:port];
+// Echo v5 checks them when the middleware is built.
+func corsMiddleware(origins []string) (echo.MiddlewareFunc, error) {
+	return middleware.CORSConfig{
 		AllowOrigins:     origins,
 		AllowMethods:     []string{http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodOptions},
 		AllowHeaders:     []string{"Content-Type", echo.HeaderAuthorization, echo.HeaderXRequestID, "Range", HeaderMetadataToken, HeaderBlobToken, HeaderDeletionToken, HeaderPartOffset, HeaderPartSize, HeaderPartSHA256},
 		ExposeHeaders:    []string{echo.HeaderXRequestID, "Accept-Ranges", "Content-Range", "Content-Length"},
 		AllowCredentials: true,
 		MaxAge:           86400,
-	})
+	}.ToMiddleware()
 }
 
 func metricsAuth(token string) echo.MiddlewareFunc {
 	const prefix = "Bearer "
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
-		return func(c echo.Context) error {
+		return func(c *echo.Context) error {
 			auth := c.Request().Header.Get(echo.HeaderAuthorization)
 			if !strings.HasPrefix(auth, prefix) || !crypto.TokensEqual(strings.TrimPrefix(auth, prefix), token) {
 				c.Response().Header().Set(echo.HeaderWWWAuthenticate, `Bearer realm="metrics"`)
@@ -216,19 +219,31 @@ func (a *App) limited(limit int, window time.Duration) echo.MiddlewareFunc {
 	return rateLimiter(limit*max(a.cfg.RateLimitMultiplier, 1), window)
 }
 
+// allowOnlyStore exposes only Allow of the store it wraps. Echo's memory store
+// also offers AllowContext, which the middleware prefers and which adds
+// X-RateLimit-Limit and X-RateLimit-Remaining to every limited response;
+// the API has never sent those.
+type allowOnlyStore struct {
+	store middleware.RateLimiterStore
+}
+
+func (s allowOnlyStore) Allow(identifier string) (bool, error) {
+	return s.store.Allow(identifier)
+}
+
 func rateLimiter(limit int, window time.Duration) echo.MiddlewareFunc {
 	return middleware.RateLimiterWithConfig(middleware.RateLimiterConfig{
-		Store: middleware.NewRateLimiterMemoryStoreWithConfig(
+		Store: allowOnlyStore{store: middleware.NewRateLimiterMemoryStoreWithConfig(
 			middleware.RateLimiterMemoryStoreConfig{
-				Rate:      rate.Limit(float64(limit) / window.Seconds()),
+				Rate:      float64(limit) / window.Seconds(),
 				Burst:     limit,
 				ExpiresIn: 3 * time.Minute,
 			},
-		),
-		IdentifierExtractor: func(c echo.Context) (string, error) {
+		)},
+		IdentifierExtractor: func(c *echo.Context) (string, error) {
 			return c.RealIP(), nil
 		},
-		DenyHandler: func(c echo.Context, identifier string, err error) error {
+		DenyHandler: func(c *echo.Context, identifier string, err error) error {
 			c.Response().Header().Set("Retry-After", "60")
 			return c.JSON(http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
 		},

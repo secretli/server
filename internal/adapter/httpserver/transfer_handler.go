@@ -87,7 +87,7 @@ func NewTransferHandler(repo domain.TransferRepo, events TransferEvents) *Transf
 
 // CreateTransfer opens a transfer with the sender's offer. The sender picks
 // the transfer id, because its PAKE share depends on it.
-func (h *TransferHandler) CreateTransfer(c echo.Context) error {
+func (h *TransferHandler) CreateTransfer(c *echo.Context) error {
 	var req createTransferRequest
 	if err := c.Bind(&req); err != nil {
 		return apperrors.BadRequestError("invalid request body")
@@ -132,7 +132,7 @@ func (h *TransferHandler) CreateTransfer(c echo.Context) error {
 
 // ClaimTransfer joins the transfer under a nameplate and returns the offer
 // the receiver answers.
-func (h *TransferHandler) ClaimTransfer(c echo.Context) error {
+func (h *TransferHandler) ClaimTransfer(c *echo.Context) error {
 	var req claimTransferRequest
 	if err := c.Bind(&req); err != nil {
 		return apperrors.BadRequestError("invalid request body")
@@ -166,7 +166,7 @@ func (h *TransferHandler) ClaimTransfer(c echo.Context) error {
 
 // PostAnswer stores the receiver's PAKE share and confirmation tag. An
 // identical retry succeeds; a different answer is refused.
-func (h *TransferHandler) PostAnswer(c echo.Context) error {
+func (h *TransferHandler) PostAnswer(c *echo.Context) error {
 	transfer, err := h.authenticate(c, domain.TransferSideReceiver)
 	if err != nil {
 		return err
@@ -195,7 +195,7 @@ func (h *TransferHandler) PostAnswer(c echo.Context) error {
 }
 
 // AwaitAnswer long-polls for the receiver's answer.
-func (h *TransferHandler) AwaitAnswer(c echo.Context) error {
+func (h *TransferHandler) AwaitAnswer(c *echo.Context) error {
 	transfer, err := h.authenticate(c, domain.TransferSideSender)
 	if err != nil {
 		return err
@@ -212,7 +212,7 @@ func (h *TransferHandler) AwaitAnswer(c echo.Context) error {
 
 // PostDelivery stores the sealed link once the transfer is answered, which
 // closes it as done. An identical retry succeeds.
-func (h *TransferHandler) PostDelivery(c echo.Context) error {
+func (h *TransferHandler) PostDelivery(c *echo.Context) error {
 	transfer, err := h.authenticate(c, domain.TransferSideSender)
 	if err != nil {
 		return err
@@ -238,7 +238,7 @@ func (h *TransferHandler) PostDelivery(c echo.Context) error {
 
 // AwaitDelivery long-polls for the sealed link. It is returned even though
 // storing it closed the transfer.
-func (h *TransferHandler) AwaitDelivery(c echo.Context) error {
+func (h *TransferHandler) AwaitDelivery(c *echo.Context) error {
 	transfer, err := h.authenticate(c, domain.TransferSideReceiver)
 	if err != nil {
 		return err
@@ -252,7 +252,7 @@ func (h *TransferHandler) AwaitDelivery(c echo.Context) error {
 
 // CloseTransfer ends a transfer early, as cancelled or as a mismatch. The
 // delivery closes a successful one by itself.
-func (h *TransferHandler) CloseTransfer(c echo.Context) error {
+func (h *TransferHandler) CloseTransfer(c *echo.Context) error {
 	transfer, err := h.authenticate(c, "")
 	if err != nil {
 		return err
@@ -278,7 +278,7 @@ func (h *TransferHandler) CloseTransfer(c echo.Context) error {
 // writes it and reports whether it did. A write can lose a race against a
 // close or another write, so a refused one is judged again on fresh state.
 func (h *TransferHandler) writeOnce(
-	c echo.Context,
+	c *echo.Context,
 	transfer *domain.Transfer,
 	written func(*domain.Transfer) (exists, same bool),
 	store func(context.Context, time.Time) (bool, error),
@@ -360,7 +360,7 @@ func (h *TransferHandler) await(ctx context.Context, transferID string, ready fu
 }
 
 // awaitFailed answers a long-poll that ended without its leg.
-func (h *TransferHandler) awaitFailed(c echo.Context, err error) error {
+func (h *TransferHandler) awaitFailed(c *echo.Context, err error) error {
 	switch {
 	case err == nil:
 		return c.NoContent(http.StatusNoContent)
@@ -374,7 +374,7 @@ func (h *TransferHandler) awaitFailed(c echo.Context, err error) error {
 
 // authenticate resolves the transfer and checks that the bearer token is
 // the given side's; an empty side accepts either.
-func (h *TransferHandler) authenticate(c echo.Context, side string) (*domain.Transfer, error) {
+func (h *TransferHandler) authenticate(c *echo.Context, side string) (*domain.Transfer, error) {
 	transferID := c.Param("transferID")
 	if !domain.ValidToken(transferID) {
 		return nil, apperrors.BadRequestError("malformed transfer_id")

@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v5"
+
 	"github.com/secretli/server/internal/domain"
 )
 
@@ -17,8 +19,7 @@ func getMetadata(t *testing.T, h *SecretHandler, publicID, metadataToken string)
 	req.Header.Set(HeaderMetadataToken, metadataToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 	callHandler(c, h.SecretMetadata)
 	return rec
 }
@@ -63,8 +64,7 @@ func startSessionAs(t *testing.T, h *SecretHandler, publicID, blobToken, deletio
 	}
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 	callHandler(c, h.StartRetrievalSession)
 	return rec
 }
@@ -76,8 +76,7 @@ func deleteSecretAs(t *testing.T, h *SecretHandler, publicID, metadataToken, del
 	req.Header.Set(HeaderDeletionToken, deletionToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 	callHandler(c, h.DeleteSecret)
 	return rec
 }

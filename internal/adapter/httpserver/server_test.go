@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -204,5 +205,209 @@ func TestVersionRouteServesTheVersionPassedToNew(t *testing.T) {
 	}
 	if body := strings.TrimSpace(rec.Body.String()); body != `{"version":"test"}` {
 		t.Errorf("body = %s, want the version passed to New", body)
+	}
+}
+
+func TestApp_UntrustedPeerBehindConfiguredProxiesCannotSpoofItsWayPastTheLimit(t *testing.T) {
+	// Production trusts the gateway pods only; a peer outside that range
+	// keys on its own address whatever it claims.
+	app := newTestApp(t, config.Config{MaxFileSize: 1 << 20, TrustedProxies: "10.42.0.0/16"})
+
+	var statuses []int
+	for i := 0; i < 11; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/secrets/uploads", bytes.NewReader(createSessionBody(t, fmt.Sprintf("untrusted-%d", i))))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		req.RemoteAddr = "203.0.113.7:4321"
+		req.Header.Set(echo.HeaderXForwardedFor, fmt.Sprintf("198.51.100.%d, 10.42.0.%d", i+1, i+1))
+		req.Header.Set(echo.HeaderXRealIP, fmt.Sprintf("198.51.100.%d", i+101))
+		rec := httptest.NewRecorder()
+		app.echo.ServeHTTP(rec, req)
+		statuses = append(statuses, rec.Code)
+	}
+
+	for i, code := range statuses[:10] {
+		if code != http.StatusCreated {
+			t.Fatalf("request %d: status = %d, want %d", i, code, http.StatusCreated)
+		}
+	}
+	if statuses[10] != http.StatusTooManyRequests {
+		t.Fatalf("request 10: status = %d, want %d (rate limit bypassed via forwarding headers)", statuses[10], http.StatusTooManyRequests)
+	}
+}
+
+func TestApp_RateLimitedResponsesKeepTheirHeaders(t *testing.T) {
+	app := newTestApp(t, config.Config{MaxFileSize: 1 << 20})
+
+	send := func(i int) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/secrets/uploads", bytes.NewReader(createSessionBody(t, fmt.Sprintf("headers-%d", i))))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		rec := httptest.NewRecorder()
+		app.echo.ServeHTTP(rec, req)
+		return rec
+	}
+
+	for i := 0; i < 11; i++ {
+		rec := send(i)
+		want := http.StatusCreated
+		if i == 10 {
+			want = http.StatusTooManyRequests
+		}
+		if rec.Code != want {
+			t.Fatalf("request %d: status = %d, want %d", i, rec.Code, want)
+		}
+		// The API does not announce its limits or the remaining budget.
+		for _, header := range []string{"X-RateLimit-Limit", "X-RateLimit-Remaining"} {
+			if got := rec.Header().Get(header); got != "" {
+				t.Errorf("request %d: %s = %q, want none", i, header, got)
+			}
+		}
+		if i == 10 {
+			if got := rec.Header().Get("Retry-After"); got != "60" {
+				t.Errorf("Retry-After = %q, want 60", got)
+			}
+			if body := strings.TrimSpace(rec.Body.String()); body != `{"error":"rate limit exceeded"}` {
+				t.Errorf("body = %s", body)
+			}
+		} else if got := rec.Header().Get("Retry-After"); got != "" {
+			t.Errorf("request %d: Retry-After = %q, want none", i, got)
+		}
+	}
+}
+
+func TestApp_SmallRequestBodyLimitIs64000Bytes(t *testing.T) {
+	app := newTestApp(t, config.Config{MaxFileSize: 1 << 30})
+
+	send := func(size int) int {
+		// Not JSON a handler accepts; only whether the limit lets it through
+		// matters.
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/transfers/claim", strings.NewReader(strings.Repeat(" ", size)))
+		req.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+		rec := httptest.NewRecorder()
+		app.echo.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if code := send(64_000); code == http.StatusRequestEntityTooLarge {
+		t.Errorf("64000 bytes: status = %d, want it past the limit", code)
+	}
+	if code := send(64_001); code != http.StatusRequestEntityTooLarge {
+		t.Errorf("64001 bytes: status = %d, want %d", code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestApp_EchoErrorsKeepTheirStatusAndShape(t *testing.T) {
+	app := newTestApp(t, config.Config{MaxFileSize: 1 << 20})
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+		status int
+		body   string
+	}{
+		{"unknown route", http.MethodGet, "/api/v1/unknown", http.StatusNotFound, `{"error":"Not Found"}`},
+		{"unknown route under a group", http.MethodGet, "/api/v1/secrets/" + testPublicID("echo errors") + "/unknown", http.StatusNotFound, `{"error":"Not Found"}`},
+		{"wrong method", http.MethodPost, "/api/v1/version", http.StatusMethodNotAllowed, `{"error":"Method Not Allowed"}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			app.echo.ServeHTTP(rec, httptest.NewRequest(tt.method, tt.path, nil))
+			if rec.Code != tt.status {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.status)
+			}
+			if body := strings.TrimSpace(rec.Body.String()); body != tt.body {
+				t.Errorf("body = %s, want %s", body, tt.body)
+			}
+		})
+	}
+}
+
+func TestApp_HTTPMetricsLabelRouteAndStatus(t *testing.T) {
+	app := newTestApp(t, config.Config{MaxFileSize: 1 << 20})
+	publicID := testPublicID("metrics")
+
+	requests := []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/api/v1/version", nil),
+		// A handler's error, written by the error handler.
+		httptest.NewRequest(http.MethodGet, "/api/v1/secrets/"+publicID+"/meta", nil),
+		// Echo's own errors.
+		httptest.NewRequest(http.MethodGet, "/api/v1/unknown/"+publicID, nil),
+		httptest.NewRequest(http.MethodPost, "/api/v1/version", nil),
+	}
+	oversized := httptest.NewRequest(http.MethodPost, "/api/v1/transfers/claim", strings.NewReader(strings.Repeat(" ", 64_001)))
+	oversized.Header.Set(echo.HeaderContentType, echo.MIMEApplicationJSON)
+	requests = append(requests, oversized)
+	for _, req := range requests {
+		app.echo.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	families, err := app.reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]float64{}
+	for _, family := range families {
+		if family.GetName() != "secretli_http_requests_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			labels := map[string]string{}
+			for _, label := range metric.GetLabel() {
+				labels[label.GetName()] = label.GetValue()
+			}
+			got[labels["method"]+" "+labels["route"]+" "+labels["status_code"]] = metric.GetCounter().GetValue()
+		}
+	}
+
+	want := map[string]float64{
+		"GET /api/v1/version 200":                1,
+		"GET /api/v1/secrets/:publicID/meta 400": 1,
+		"GET /* 404":                             1,
+		"POST /api/v1/version 405":               1,
+		"POST /api/v1/transfers/claim 413":       1,
+	}
+	for key, count := range want {
+		if got[key] != count {
+			t.Errorf("%s: count = %v, want %v (all: %v)", key, got[key], count, got)
+		}
+	}
+	for key := range got {
+		if strings.Contains(key, publicID) {
+			t.Errorf("metric labels name the public id: %s", key)
+		}
+	}
+}
+
+func TestApp_RejectsInvalidAllowedOrigins(t *testing.T) {
+	repo := fullMockRepo{mockSecretRepo: newMockRepo(), uploadMockRepo: newUploadMockRepo(), transferMockRepo: newTransferMockRepo()}
+	if _, err := New(config.Config{AllowedOrigins: "https://secretli.app/"}, "test", nil, repo, newUploadMockStore(), nil, prometheus.NewRegistry()); err == nil {
+		t.Fatal("expected error for an allowed origin with a path")
+	}
+	if _, err := New(config.Config{AllowedOrigins: "https://secretli.app, http://localhost:5173"}, "test", nil, repo, newUploadMockStore(), nil, prometheus.NewRegistry()); err != nil {
+		t.Fatalf("valid origins: %v", err)
+	}
+}
+
+func TestApp_PanicIsAnInternalServerError(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	app := newTestApp(t, config.Config{})
+	app.echo.GET("/panic", func(*echo.Context) error { panic("boom") })
+
+	rec := httptest.NewRecorder()
+	app.echo.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/panic", nil))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"error":"internal server error"}` {
+		t.Errorf("body = %s", body)
+	}
+	if !strings.Contains(logs.String(), "boom") {
+		t.Errorf("panic not logged: %s", logs.String())
 	}
 }

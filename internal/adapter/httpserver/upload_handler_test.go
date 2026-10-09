@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/labstack/echo/v5"
+
 	"github.com/secretli/server/internal/domain"
 	tokencrypto "github.com/secretli/server/internal/platform/crypto"
 )
@@ -550,8 +552,7 @@ func TestUploadPart_IdempotentAndConflict(t *testing.T) {
 	req := uploadPartRequest(session.SessionID, uploadToken, 1, 0, payload, hash)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("sessionID", "partNumber")
-	c.SetParamValues(session.SessionID, "1")
+	c.SetPathValues(echo.PathValues{{Name: "sessionID", Value: session.SessionID}, {Name: "partNumber", Value: "1"}})
 	callHandler(c, h.UploadPart)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("first upload status = %d, want %d. body: %s", rec.Code, http.StatusOK, rec.Body.String())
@@ -563,8 +564,7 @@ func TestUploadPart_IdempotentAndConflict(t *testing.T) {
 	req = uploadPartRequest(session.SessionID, uploadToken, 1, 0, payload, hash)
 	rec = httptest.NewRecorder()
 	c = newEchoContext(req, rec)
-	c.SetParamNames("sessionID", "partNumber")
-	c.SetParamValues(session.SessionID, "1")
+	c.SetPathValues(echo.PathValues{{Name: "sessionID", Value: session.SessionID}, {Name: "partNumber", Value: "1"}})
 	callHandler(c, h.UploadPart)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("idempotent upload status = %d, want %d. body: %s", rec.Code, http.StatusOK, rec.Body.String())
@@ -573,8 +573,7 @@ func TestUploadPart_IdempotentAndConflict(t *testing.T) {
 	req = uploadPartRequest(session.SessionID, uploadToken, 1, 0, []byte("zzzzzz"), sha256HexTest([]byte("zzzzzz")))
 	rec = httptest.NewRecorder()
 	c = newEchoContext(req, rec)
-	c.SetParamNames("sessionID", "partNumber")
-	c.SetParamValues(session.SessionID, "1")
+	c.SetPathValues(echo.PathValues{{Name: "sessionID", Value: session.SessionID}, {Name: "partNumber", Value: "1"}})
 	callHandler(c, h.UploadPart)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("conflict status = %d, want %d. body: %s", rec.Code, http.StatusConflict, rec.Body.String())
@@ -591,8 +590,7 @@ func TestUploadPart_RejectsHashMismatchBeforeS3Upload(t *testing.T) {
 	req := uploadPartRequest(session.SessionID, uploadToken, 1, 0, []byte("abcdef"), sha256HexTest([]byte("zzzzzz")))
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("sessionID", "partNumber")
-	c.SetParamValues(session.SessionID, "1")
+	c.SetPathValues(echo.PathValues{{Name: "sessionID", Value: session.SessionID}, {Name: "partNumber", Value: "1"}})
 	callHandler(c, h.UploadPart)
 
 	if rec.Code != http.StatusBadRequest {
@@ -616,8 +614,7 @@ func TestCompleteUploadSession_FailsWhenPartMissing(t *testing.T) {
 	req := completeUploadRequest(session.SessionID, uploadToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("sessionID")
-	c.SetParamValues(session.SessionID)
+	c.SetPathValues(echo.PathValues{{Name: "sessionID", Value: session.SessionID}})
 	callHandler(c, h.CompleteUploadSession)
 
 	if rec.Code != http.StatusBadRequest {
@@ -642,8 +639,7 @@ func TestCompleteUploadSession_CreatesSecret(t *testing.T) {
 	req := completeUploadRequest(session.SessionID, uploadToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("sessionID")
-	c.SetParamValues(session.SessionID)
+	c.SetPathValues(echo.PathValues{{Name: "sessionID", Value: session.SessionID}})
 	before := time.Now()
 	callHandler(c, h.CompleteUploadSession)
 	after := time.Now()
@@ -706,8 +702,7 @@ func TestUploadPart_RejectsPartsOutsideDeclaredBlob(t *testing.T) {
 			req := uploadPartRequest(session.SessionID, uploadToken, 1, tt.offset, payload, hash)
 			rec := httptest.NewRecorder()
 			c := newEchoContext(req, rec)
-			c.SetParamNames("sessionID", "partNumber")
-			c.SetParamValues(session.SessionID, tt.partNumber)
+			c.SetPathValues(echo.PathValues{{Name: "sessionID", Value: session.SessionID}, {Name: "partNumber", Value: tt.partNumber}})
 			callHandler(c, h.UploadPart)
 
 			if rec.Code != http.StatusBadRequest {
@@ -1079,8 +1074,7 @@ func abortUploadRequest(sessionID, uploadToken string) *http.Request {
 func callAbort(h *UploadHandler, sessionID, uploadToken string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	c := newEchoContext(abortUploadRequest(sessionID, uploadToken), rec)
-	c.SetParamNames("sessionID")
-	c.SetParamValues(sessionID)
+	c.SetPathValues(echo.PathValues{{Name: "sessionID", Value: sessionID}})
 	callHandler(c, h.AbortUploadSession)
 	return rec
 }
@@ -1089,8 +1083,7 @@ func callAbort(h *UploadHandler, sessionID, uploadToken string) *httptest.Respon
 func callUploadPart(h *UploadHandler, sessionID, uploadToken string, payload []byte) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	c := newEchoContext(uploadPartRequest(sessionID, uploadToken, 1, 0, payload, sha256HexTest(payload)), rec)
-	c.SetParamNames("sessionID", "partNumber")
-	c.SetParamValues(sessionID, "1")
+	c.SetPathValues(echo.PathValues{{Name: "sessionID", Value: sessionID}, {Name: "partNumber", Value: "1"}})
 	callHandler(c, h.UploadPart)
 	return rec
 }
@@ -1142,8 +1135,7 @@ func seedSinglePartUploadSession(repo *uploadMockRepo, uploadToken string) *doma
 func callComplete(h *UploadHandler, sessionID, uploadToken string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
 	c := newEchoContext(completeUploadRequest(sessionID, uploadToken), rec)
-	c.SetParamNames("sessionID")
-	c.SetParamValues(sessionID)
+	c.SetPathValues(echo.PathValues{{Name: "sessionID", Value: sessionID}})
 	callHandler(c, h.CompleteUploadSession)
 	return rec
 }
