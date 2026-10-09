@@ -58,8 +58,8 @@ func Run() error {
 	transferEvents := postgres.NewTransferEvents(pool)
 
 	reg := metrics.NewRegistry()
-	reg.MustRegister(metrics.NewStorageCollector(func(ctx context.Context) (domain.StorageStats, error) {
-		return secretRepo.StorageStats(ctx, time.Now())
+	reg.MustRegister(metrics.NewStatsCollector(func(ctx context.Context) (domain.MetricsStats, error) {
+		return secretRepo.MetricsStats(ctx, time.Now())
 	}, cfg.MaxStoredBytes))
 	app, err := httpserver.New(cfg, Version, pool, secretRepo, fileStore, transferEvents, reg)
 	if err != nil {

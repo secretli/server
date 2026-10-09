@@ -112,9 +112,27 @@ SELECT pg_advisory_xact_lock(7302102);
 SELECT COALESCE(SUM(blob_size), 0)::bigint AS stored_bytes
 FROM secrets;
 
--- name: StorageStats :one
--- Totals for the metrics: no secret is told apart.
+-- name: MetricsStats :one
+-- Totals for the metrics, read at every scrape: how things stand now, never
+-- a secret told apart and never a time. Overdue secrets and stuck uploads
+-- are what the expiry and abandon sweeps would pick up now, on their
+-- indexes; the other counts pass over tables that hold only what exists now.
 SELECT
-    (SELECT count(*) FROM secrets AS l WHERE l.state = 'live' AND l.expires_at > sqlc.arg(now_at))::bigint AS live_secrets,
+    live.one_time::bigint AS live_one_time,
+    live.reusable::bigint AS live_reusable,
     (SELECT COALESCE(SUM(h.blob_size), 0) FROM secrets AS h)::bigint AS stored_bytes,
-    (SELECT count(*) FROM objects AS o WHERE o.doomed)::bigint AS doomed_objects;
+    (SELECT count(*) FROM secrets AS e WHERE e.state <> 'uploading' AND e.expires_at <= sqlc.arg(now_at))::bigint AS overdue_secrets,
+    (SELECT count(*) FROM objects AS o WHERE o.doomed)::bigint AS doomed_objects,
+    (SELECT count(*) FROM objects AS f WHERE f.doomed AND f.failed_removals > 0)::bigint AS removal_failed_objects,
+    (SELECT count(*) FROM uploads AS u WHERE u.state = 'uploading' AND u.expires_at < sqlc.arg(now_at))::bigint AS stuck_uploads,
+    (SELECT count(*) FROM public_ids AS p WHERE NOT EXISTS (
+        SELECT 1 FROM secrets AS s WHERE s.public_id = p.public_id
+    ))::bigint AS reserved_public_ids
+FROM (
+    SELECT
+        count(*) FILTER (WHERE l.burn_after_read) AS one_time,
+        count(*) FILTER (WHERE NOT l.burn_after_read) AS reusable
+    FROM secrets AS l
+    WHERE l.state = 'live'
+      AND l.expires_at > sqlc.arg(now_at)
+) AS live;

@@ -323,24 +323,56 @@ func (q *Queries) MarkSecretOpened(ctx context.Context, publicID string) error {
 	return err
 }
 
-const storageStats = `-- name: StorageStats :one
+const metricsStats = `-- name: MetricsStats :one
 SELECT
-    (SELECT count(*) FROM secrets AS l WHERE l.state = 'live' AND l.expires_at > $1)::bigint AS live_secrets,
+    live.one_time::bigint AS live_one_time,
+    live.reusable::bigint AS live_reusable,
     (SELECT COALESCE(SUM(h.blob_size), 0) FROM secrets AS h)::bigint AS stored_bytes,
-    (SELECT count(*) FROM objects AS o WHERE o.doomed)::bigint AS doomed_objects
+    (SELECT count(*) FROM secrets AS e WHERE e.state <> 'uploading' AND e.expires_at <= $1)::bigint AS overdue_secrets,
+    (SELECT count(*) FROM objects AS o WHERE o.doomed)::bigint AS doomed_objects,
+    (SELECT count(*) FROM objects AS f WHERE f.doomed AND f.failed_removals > 0)::bigint AS removal_failed_objects,
+    (SELECT count(*) FROM uploads AS u WHERE u.state = 'uploading' AND u.expires_at < $1)::bigint AS stuck_uploads,
+    (SELECT count(*) FROM public_ids AS p WHERE NOT EXISTS (
+        SELECT 1 FROM secrets AS s WHERE s.public_id = p.public_id
+    ))::bigint AS reserved_public_ids
+FROM (
+    SELECT
+        count(*) FILTER (WHERE l.burn_after_read) AS one_time,
+        count(*) FILTER (WHERE NOT l.burn_after_read) AS reusable
+    FROM secrets AS l
+    WHERE l.state = 'live'
+      AND l.expires_at > $1
+) AS live
 `
 
-type StorageStatsRow struct {
-	LiveSecrets   int64
-	StoredBytes   int64
-	DoomedObjects int64
+type MetricsStatsRow struct {
+	LiveOneTime          int64
+	LiveReusable         int64
+	StoredBytes          int64
+	OverdueSecrets       int64
+	DoomedObjects        int64
+	RemovalFailedObjects int64
+	StuckUploads         int64
+	ReservedPublicIds    int64
 }
 
-// Totals for the metrics: no secret is told apart.
-func (q *Queries) StorageStats(ctx context.Context, nowAt pgtype.Timestamptz) (StorageStatsRow, error) {
-	row := q.db.QueryRow(ctx, storageStats, nowAt)
-	var i StorageStatsRow
-	err := row.Scan(&i.LiveSecrets, &i.StoredBytes, &i.DoomedObjects)
+// Totals for the metrics, read at every scrape: how things stand now, never
+// a secret told apart and never a time. Overdue secrets and stuck uploads
+// are what the expiry and abandon sweeps would pick up now, on their
+// indexes; the other counts pass over tables that hold only what exists now.
+func (q *Queries) MetricsStats(ctx context.Context, nowAt pgtype.Timestamptz) (MetricsStatsRow, error) {
+	row := q.db.QueryRow(ctx, metricsStats, nowAt)
+	var i MetricsStatsRow
+	err := row.Scan(
+		&i.LiveOneTime,
+		&i.LiveReusable,
+		&i.StoredBytes,
+		&i.OverdueSecrets,
+		&i.DoomedObjects,
+		&i.RemovalFailedObjects,
+		&i.StuckUploads,
+		&i.ReservedPublicIds,
+	)
 	return i, err
 }
 

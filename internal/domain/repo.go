@@ -14,13 +14,24 @@ type CleanupBatch struct {
 	Removed int
 }
 
-// StorageStats are totals over all secrets, for the metrics: how many can be
-// opened, what storage holds for them, and how many objects wait for the
-// cleanup. No secret is told apart.
-type StorageStats struct {
-	LiveSecrets   int64
-	StoredBytes   int64
-	DoomedObjects int64
+// MetricsStats are totals for the metrics, as things stand when they are
+// read: no secret is told apart and no time is kept.
+type MetricsStats struct {
+	// Secrets that can be opened now, one-time and reusable.
+	LiveOneTime  int64
+	LiveReusable int64
+	// What the secrets holding an object take up in storage.
+	StoredBytes int64
+	// Secrets past their expiry that the cleanup has not forgotten yet.
+	OverdueSecrets int64
+	// Objects waiting for the cleanup to delete them from storage, and those
+	// of them storage has refused to delete before.
+	DoomedObjects        int64
+	RemovalFailedObjects int64
+	// Uploads still under way past their own expiry.
+	StuckUploads int64
+	// Public ids kept reserved for secrets that are gone.
+	ReservedPublicIDs int64
 }
 
 type SecretRepo interface {
