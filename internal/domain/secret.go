@@ -10,55 +10,62 @@ const (
 	SecretUploading SecretState = "uploading"
 	// SecretLive: the secret can be opened.
 	SecretLive SecretState = "live"
-	// SecretEnded: a one-time secret was opened, or the owner deleted the
-	// secret. Until it expires, its row only tells which.
-	SecretEnded SecretState = "ended"
+	// SecretClosing: a one-time secret was opened. Nobody can open it again;
+	// it keeps only its object, for the download that opened it, and goes
+	// once that download has ended.
+	SecretClosing SecretState = "closing"
 )
 
-// Outcome is how an ended secret ended. Expiry is not one: once a secret
-// expires, nothing about it is kept.
-type Outcome string
+// TimePrecision is how precisely the server keeps the times of secrets and
+// uploads. To the microsecond, a secret's times would tell more than anybody
+// needs, such as how long its upload took.
+const TimePrecision = time.Minute
 
-const (
-	OutcomeOpened  Outcome = "opened"
-	OutcomeDeleted Outcome = "deleted"
-)
+// KeptTime is t as the server keeps it: cut to the minute.
+func KeptTime(t time.Time) time.Time {
+	return t.Truncate(TimePrecision)
+}
 
-// Secret is one secret, from the start of its upload until its expiry. The
-// server keeps ciphertext, token hashes, sizes and the expiry, and once the
-// secret ends only how it ended, never when.
+// SecretTimes returns when a secret whose upload completes at completedAt
+// was created and when it expires. Its lifetime counts from the completed
+// upload, and one more minute makes up for the cut, so a secret never lives
+// shorter than chosen. Every secret of a lifetime keeps the same span between
+// the two, so they tell nothing about its upload.
+func SecretTimes(completedAt time.Time, lifetime time.Duration) (createdAt, expiresAt time.Time) {
+	createdAt = KeptTime(completedAt)
+	return createdAt, createdAt.Add(lifetime + TimePrecision)
+}
+
+// Secret is one secret, from the start of its upload until it is deleted or
+// expires, or a one-time secret's last download ends. The server keeps
+// ciphertext, token hashes, sizes and the expiry. Once a secret can no longer
+// be opened, nothing tells that it ever existed.
 type Secret struct {
 	PublicID string
 	State    SecretState
-	// StorageKey is the secret's object, empty once the object is doomed.
-	StorageKey        string
+	// StorageKey is the secret's object; the secret goes when it is doomed.
+	StorageKey string
+	// The token hashes and the encrypted metadata are cleared when a
+	// one-time secret closes.
 	MetadataTokenHash string
-	// The blob and deletion token hashes and the encrypted metadata are
-	// cleared when the secret ends.
 	BlobTokenHash     string
 	DeletionTokenHash string
 	EncryptedMeta     string
 	BlobSize          int64
 	BurnAfterRead     bool
-	ExpiresAt         time.Time
-	// CreatedAt is when the upload completed; nil while uploading.
+	// ExpiresAt is provisional while uploading; the completed upload sets it.
+	ExpiresAt time.Time
+	// CreatedAt is the minute the upload completed, set only while the secret
+	// is live.
 	CreatedAt *time.Time
-	// Opened tells whether someone other than the owner has opened a reusable
-	// secret. A one-time secret ends when it is opened instead.
+	// Opened tells whether a recipient, not the owner, has opened a live
+	// reusable secret. A one-time secret closes when it is opened instead.
 	Opened bool
-	// Outcome is set once the secret has ended.
-	Outcome Outcome
 }
 
 // Readable reports whether the secret can be read at now.
 func (s *Secret) Readable(now time.Time) bool {
 	return s.State == SecretLive && s.ExpiresAt.After(now)
-}
-
-// Ended reports whether the secret has ended and not expired yet, so a link
-// to it can still be told how it ended.
-func (s *Secret) Ended(now time.Time) bool {
-	return s.State == SecretEnded && s.ExpiresAt.After(now)
 }
 
 type SecretMetadataResponse struct {

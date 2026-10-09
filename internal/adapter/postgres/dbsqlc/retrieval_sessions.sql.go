@@ -47,14 +47,13 @@ func (q *Queries) DeleteExpiredRetrievalSessions(ctx context.Context, nowAt pgty
 }
 
 const getDownloadableSecret = `-- name: GetDownloadableSecret :one
-SELECT s.public_id, s.state, s.storage_key, s.metadata_token_hash, s.blob_token_hash, s.deletion_token_hash, s.encrypted_meta, s.blob_size, s.burn_after_read, s.expires_at, s.created_at, s.opened, s.outcome
+SELECT s.public_id, s.state, s.storage_key, s.metadata_token_hash, s.blob_token_hash, s.deletion_token_hash, s.encrypted_meta, s.blob_size, s.burn_after_read, s.expires_at, s.created_at, s.opened
 FROM retrieval_sessions AS rs
 JOIN secrets AS s ON s.public_id = rs.public_id
 WHERE rs.session_token_hash = $1
   AND rs.public_id = $2
   AND rs.expires_at > $3
   AND s.expires_at > $3
-  AND s.storage_key IS NOT NULL
 `
 
 type GetDownloadableSecretParams struct {
@@ -63,9 +62,9 @@ type GetDownloadableSecretParams struct {
 	NowAt            pgtype.Timestamptz
 }
 
-// The secret a valid session may read: not expired, and still holding its
-// object. Whatever dooms an object clears it from its secret in the same
-// transaction, so deleting a secret ends running downloads.
+// The secret a valid session may read, live or closing, until it expires.
+// Whatever dooms an object deletes its secret in the same transaction, and
+// the secret's sessions with it, so deleting a secret ends running downloads.
 func (q *Queries) GetDownloadableSecret(ctx context.Context, arg GetDownloadableSecretParams) (Secret, error) {
 	row := q.db.QueryRow(ctx, getDownloadableSecret, arg.SessionTokenHash, arg.PublicID, arg.NowAt)
 	var i Secret
@@ -82,7 +81,6 @@ func (q *Queries) GetDownloadableSecret(ctx context.Context, arg GetDownloadable
 		&i.ExpiresAt,
 		&i.CreatedAt,
 		&i.Opened,
-		&i.Outcome,
 	)
 	return i, err
 }

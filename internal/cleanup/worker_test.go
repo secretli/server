@@ -98,7 +98,7 @@ var allSweeps = []string{
 	"AbandonExpiredUploads",
 	"DeleteFinishedUploads",
 	"DeleteEndedTransfers",
-	"ReleaseDrainedSecrets",
+	"DeleteDrainedSecrets",
 	"DeleteExpiredSecrets",
 	"DeleteDoomedObjects",
 }
@@ -123,8 +123,8 @@ func (m *mockRepo) DeleteFinishedUploads(ctx context.Context, finishedBefore tim
 	return m.finishedUploads.run(finishedBefore)
 }
 
-func (m *mockRepo) ReleaseDrainedSecrets(ctx context.Context, now time.Time, limit int) (int, error) {
-	m.called(ctx, "ReleaseDrainedSecrets")
+func (m *mockRepo) DeleteDrainedSecrets(ctx context.Context, now time.Time, limit int) (int, error) {
+	m.called(ctx, "DeleteDrainedSecrets")
 	return m.drainedSecrets.run(now, limit)
 }
 
@@ -726,7 +726,7 @@ func TestRunCycle_AFailingStepDoesNotStopTheOthers(t *testing.T) {
 		{"AbandonExpiredUploads", func(r *mockRepo) { r.abandonedUploads.err = boom }},
 		{"DeleteFinishedUploads", func(r *mockRepo) { r.finishedUploads.err = boom }},
 		{"DeleteEndedTransfers", func(r *mockRepo) { r.endedTransfers.err = boom }},
-		{"ReleaseDrainedSecrets", func(r *mockRepo) { r.drainedSecrets.err = boom }},
+		{"DeleteDrainedSecrets", func(r *mockRepo) { r.drainedSecrets.err = boom }},
 		{"DeleteExpiredSecrets", func(r *mockRepo) { r.expiredSecrets.err = boom }},
 		{"DeleteDoomedObjects", func(r *mockRepo) { r.doomedErr = boom }},
 	} {

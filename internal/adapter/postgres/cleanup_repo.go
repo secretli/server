@@ -60,10 +60,10 @@ func (r *SecretRepo) DeleteFinishedUploads(ctx context.Context, finishedBefore t
 	return n, nil
 }
 
-// ReleaseDrainedSecrets dooms the objects of one batch of at most limit
-// opened one-time secrets whose last download session has ended, and returns
-// how many it released.
-func (r *SecretRepo) ReleaseDrainedSecrets(ctx context.Context, now time.Time, limit int) (int, error) {
+// DeleteDrainedSecrets deletes one batch of at most limit closing secrets
+// whose last download session has ended, dooming their objects, and returns
+// how many it deleted.
+func (r *SecretRepo) DeleteDrainedSecrets(ctx context.Context, now time.Time, limit int) (int, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin drained secrets tx: %w", err)
@@ -78,29 +78,27 @@ func (r *SecretRepo) ReleaseDrainedSecrets(ctx context.Context, now time.Time, l
 	if err != nil {
 		return 0, fmt.Errorf("select drained secrets: %w", err)
 	}
+	var deleted int64
 	if len(rows) > 0 {
 		publicIDs := make([]string, 0, len(rows))
 		storageKeys := make([]string, 0, len(rows))
 		for _, row := range rows {
 			publicIDs = append(publicIDs, row.PublicID)
-			storageKeys = append(storageKeys, row.StorageKey.String)
+			storageKeys = append(storageKeys, row.StorageKey)
 		}
-		if err := qtx.ClearStorageKeys(ctx, publicIDs); err != nil {
-			return 0, fmt.Errorf("clear drained secrets' storage keys: %w", err)
-		}
-		if err := qtx.DoomObjects(ctx, storageKeys); err != nil {
-			return 0, fmt.Errorf("doom drained secrets' objects: %w", err)
+		if deleted, err = deleteSecrets(ctx, qtx, publicIDs, storageKeys); err != nil {
+			return 0, fmt.Errorf("drained secrets: %w", err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return 0, fmt.Errorf("commit drained secrets: %w", err)
 	}
-	return len(rows), nil
+	return int(deleted), nil
 }
 
 // DeleteExpiredSecrets forgets one batch of at most limit secrets past their
-// expiry, oldest first, dooming the objects they still hold, and returns how
-// many it deleted. Nothing about a secret outlives its expiry.
+// expiry, oldest first, dooming their objects, and returns how many it
+// deleted. Nothing about a secret outlives its expiry.
 func (r *SecretRepo) DeleteExpiredSecrets(ctx context.Context, now time.Time, limit int) (int, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
@@ -122,15 +120,10 @@ func (r *SecretRepo) DeleteExpiredSecrets(ctx context.Context, now time.Time, li
 		storageKeys := make([]string, 0, len(rows))
 		for _, row := range rows {
 			publicIDs = append(publicIDs, row.PublicID)
-			if row.StorageKey.Valid {
-				storageKeys = append(storageKeys, row.StorageKey.String)
-			}
+			storageKeys = append(storageKeys, row.StorageKey)
 		}
-		if err := qtx.DoomObjects(ctx, storageKeys); err != nil {
-			return 0, fmt.Errorf("doom expired secrets' objects: %w", err)
-		}
-		if deleted, err = qtx.DeleteSecretsByPublicIDs(ctx, publicIDs); err != nil {
-			return 0, fmt.Errorf("delete expired secrets: %w", err)
+		if deleted, err = deleteSecrets(ctx, qtx, publicIDs, storageKeys); err != nil {
+			return 0, fmt.Errorf("expired secrets: %w", err)
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -139,8 +132,22 @@ func (r *SecretRepo) DeleteExpiredSecrets(ctx context.Context, now time.Time, li
 	return int(deleted), nil
 }
 
+// deleteSecrets dooms the objects of secrets whose rows the caller has
+// locked and deletes the rows, their retrieval sessions with them, and
+// returns how many it deleted.
+func deleteSecrets(ctx context.Context, qtx *dbsqlc.Queries, publicIDs, storageKeys []string) (int64, error) {
+	if err := qtx.DoomObjects(ctx, storageKeys); err != nil {
+		return 0, fmt.Errorf("doom objects: %w", err)
+	}
+	deleted, err := qtx.DeleteSecretsByPublicIDs(ctx, publicIDs)
+	if err != nil {
+		return 0, fmt.Errorf("delete secrets: %w", err)
+	}
+	return deleted, nil
+}
+
 // DeleteDoomedObjects removes one batch of at most limit doomed objects: the
-// fewest failed removals first, then the oldest. remove runs for each row
+// fewest failed removals first, then by key. remove runs for each row
 // while it is locked and must delete the object from storage; rows it fails
 // for are kept with one more failed removal, so they sink behind the rest.
 // Nothing but this sweep locks a doomed object's row, so the storage calls
@@ -195,7 +202,6 @@ func objectFromRow(row dbsqlc.Object) *domain.Object {
 		StorageKey:     row.StorageKey,
 		State:          domain.ObjectState(row.State),
 		S3UploadID:     row.S3UploadID.String,
-		CreatedAt:      row.CreatedAt.Time,
 		Doomed:         row.Doomed,
 		FailedRemovals: int(row.FailedRemovals),
 	}

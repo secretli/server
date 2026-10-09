@@ -100,6 +100,9 @@ func (h *UploadHandler) CreateUploadSession(c echo.Context) error {
 	ctx := c.Request().Context()
 	now := time.Now()
 	storageKey := domain.UploadStorageKey(sessionID)
+	// Until the upload completes, the secret's expiry is the one it would get
+	// if it completed now; completing sets it for good.
+	_, expiresAt := domain.SecretTimes(now, duration)
 	secret := &domain.Secret{
 		PublicID:          req.PublicID,
 		State:             domain.SecretUploading,
@@ -110,14 +113,15 @@ func (h *UploadHandler) CreateUploadSession(c echo.Context) error {
 		EncryptedMeta:     req.EncryptedMeta,
 		BlobSize:          req.BlobSize,
 		BurnAfterRead:     req.BurnAfterRead,
-		ExpiresAt:         now.Add(duration),
+		ExpiresAt:         expiresAt,
 	}
 	upload := &domain.Upload{
 		SessionID:       sessionID,
 		PublicID:        req.PublicID,
 		UploadTokenHash: tokencrypto.TokenHash(uploadToken),
 		State:           domain.UploadUploading,
-		ExpiresAt:       now.Add(uploadSessionTTL),
+		ExpiresAt:       domain.KeptTime(now.Add(uploadSessionTTL)),
+		Lifetime:        duration,
 		StorageKey:      storageKey,
 		BlobSize:        req.BlobSize,
 		SecretExpiresAt: secret.ExpiresAt,
@@ -126,7 +130,7 @@ func (h *UploadHandler) CreateUploadSession(c echo.Context) error {
 	// The secret, the upload and its object are on file before anything
 	// reaches storage: a taken public id is refused first, and nothing written
 	// can be lost track of.
-	if err := h.repo.StartUpload(ctx, secret, upload, now); err != nil {
+	if err := h.repo.StartUpload(ctx, secret, upload); err != nil {
 		if errors.Is(err, domain.ErrDuplicate) {
 			return apperrors.ConflictError("secret with this public_id already exists")
 		}
@@ -246,6 +250,8 @@ func (h *UploadHandler) CompleteUploadSession(c echo.Context) error {
 	// leaves an object that no live secret references.
 	stored := false
 	completed, err := h.repo.CompleteUpload(ctx, upload.SessionID, time.Now(), func(locked *domain.Upload, parts []domain.UploadPart) error {
+		// The session's own expiry bounds an upload. The secret's provisional
+		// expiry does not: completing gives the secret its lifetime from now.
 		if time.Now().After(locked.ExpiresAt) {
 			return apperrors.ConflictError("upload session has expired")
 		}
@@ -268,7 +274,8 @@ func (h *UploadHandler) CompleteUploadSession(c echo.Context) error {
 	if stored {
 		h.metrics.SecretsCreated.Inc()
 	}
-	// Only a repeat long after the secret expired finds it gone.
+	// The expiry completing gave the secret, or for a repeat the one it got
+	// then. Only a repeat long after the secret expired finds it gone.
 	if completed.SecretExpiresAt.IsZero() {
 		return apperrors.ConflictError("upload session already completed")
 	}

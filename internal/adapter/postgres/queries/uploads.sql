@@ -4,15 +4,16 @@ INSERT INTO uploads (
     public_id,
     upload_token_hash,
     state,
-    expires_at
+    expires_at,
+    lifetime
 )
 VALUES (
-    $1, $2, $3, 'uploading', $4
+    $1, $2, $3, 'uploading', $4, $5
 );
 
 -- name: GetUpload :one
 -- The upload with what it needs of its secret and object, while the secret
--- has them.
+-- has them. Until the upload completes, the secret's expiry is provisional.
 SELECT
     u.session_id,
     u.public_id,
@@ -20,6 +21,7 @@ SELECT
     u.state,
     u.expires_at,
     u.finished_at,
+    u.lifetime,
     s.storage_key,
     s.blob_size,
     s.expires_at AS secret_expires_at,
@@ -30,6 +32,7 @@ LEFT JOIN objects AS o ON o.storage_key = s.storage_key
 WHERE u.session_id = $1;
 
 -- name: GetUploadForUpdate :one
+-- The upload as GetUpload returns it, locked for completing or abandoning it.
 SELECT
     u.session_id,
     u.public_id,
@@ -37,6 +40,7 @@ SELECT
     u.state,
     u.expires_at,
     u.finished_at,
+    u.lifetime,
     s.storage_key,
     s.blob_size,
     s.expires_at AS secret_expires_at,
@@ -48,9 +52,11 @@ WHERE u.session_id = $1
 FOR UPDATE OF u;
 
 -- name: MarkUploadCompleted :exec
+-- The secret has its expiry now, so the lifetime goes.
 UPDATE uploads
 SET state = 'completed',
-    finished_at = sqlc.arg(now_at)
+    finished_at = sqlc.arg(finished_at),
+    lifetime = NULL
 WHERE session_id = sqlc.arg(session_id)
   AND state = 'uploading';
 
@@ -58,7 +64,8 @@ WHERE session_id = sqlc.arg(session_id)
 -- Returns the public ids of the abandoned uploads' secrets.
 UPDATE uploads
 SET state = 'abandoned',
-    finished_at = sqlc.arg(now_at)
+    finished_at = sqlc.arg(finished_at),
+    lifetime = NULL
 WHERE session_id = ANY(sqlc.arg(session_ids)::text[])
   AND state = 'uploading'
 RETURNING public_id;

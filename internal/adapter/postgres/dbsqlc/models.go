@@ -27,7 +27,6 @@ type Object struct {
 	StorageKey     string
 	State          string
 	S3UploadID     pgtype.Text
-	CreatedAt      pgtype.Timestamptz
 	Doomed         bool
 	FailedRemovals int32
 }
@@ -41,8 +40,8 @@ type RetrievalSession struct {
 type Secret struct {
 	PublicID          string
 	State             string
-	StorageKey        pgtype.Text
-	MetadataTokenHash string
+	StorageKey        string
+	MetadataTokenHash pgtype.Text
 	BlobTokenHash     pgtype.Text
 	DeletionTokenHash pgtype.Text
 	EncryptedMeta     pgtype.Text
@@ -51,7 +50,6 @@ type Secret struct {
 	ExpiresAt         pgtype.Timestamptz
 	CreatedAt         pgtype.Timestamptz
 	Opened            bool
-	Outcome           pgtype.Text
 }
 
 type Upload struct {
@@ -61,6 +59,7 @@ type Upload struct {
 	State           string
 	ExpiresAt       pgtype.Timestamptz
 	FinishedAt      pgtype.Timestamptz
+	Lifetime        pgtype.Interval
 }
 
 type UploadPart struct {

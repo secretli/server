@@ -3,6 +3,7 @@ package postgres_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -63,7 +64,7 @@ func TestUploadRepo_StartUploadFilesTheSecretTheUploadAndTheObject(t *testing.T)
 	secretExpiresAt := moment(now.Add(24 * time.Hour))
 	uploadExpiresAt := moment(now.Add(time.Hour))
 
-	mustStartUpload(t, repo, "up-start", newTestSecret("start", secretExpiresAt), uploadExpiresAt, now)
+	mustStartUpload(t, repo, "up-start", newTestSecret("start", secretExpiresAt), uploadExpiresAt)
 
 	if got := mustGetSecret(t, repo, "start"); got.State != domain.SecretUploading || got.StorageKey != "blobs/up-start" {
 		t.Errorf("secret state = %q, storage key = %q; want uploading into blobs/up-start", got.State, got.StorageKey)
@@ -71,16 +72,18 @@ func TestUploadRepo_StartUploadFilesTheSecretTheUploadAndTheObject(t *testing.T)
 
 	// The object is known before anything is written under its key.
 	object := mustGetObject(t, pool, "blobs/up-start")
-	if object.State != string(domain.ObjectWriting) || object.S3UploadID != nil || object.Doomed || !object.CreatedAt.Equal(now) {
-		t.Errorf("object = %+v, want writing since %v, without upload id, not doomed", object, now)
+	if object.State != string(domain.ObjectWriting) || object.S3UploadID != nil || object.Doomed {
+		t.Errorf("object = %+v, want writing, without upload id, not doomed", object)
 	}
 
+	// The upload keeps the lifetime until it completes.
 	upload, parts := mustGetUpload(t, repo, "up-start")
 	want := domain.Upload{
 		SessionID:       "up-start",
 		PublicID:        "start",
 		UploadTokenHash: tokencrypto.TokenHash("upload-token-up-start"),
 		State:           domain.UploadUploading,
+		Lifetime:        testLifetime,
 		StorageKey:      "blobs/up-start",
 		BlobSize:        1024,
 	}
@@ -104,12 +107,9 @@ func TestUploadRepo_StartUploadRefusesATakenPublicID(t *testing.T) {
 	ctx := context.Background()
 	now := moment(time.Now())
 
-	mustStartUpload(t, repo, "up-taken-uploading", newTestSecret("taken-uploading", now.Add(time.Hour)), now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-taken-uploading", newTestSecret("taken-uploading", now.Add(time.Hour)), now.Add(time.Hour))
 	mustCreate(t, repo, newTestSecret("taken-live", now.Add(time.Hour)))
-	mustCreate(t, repo, newTestSecret("taken-deleted", now.Add(time.Hour)))
-	if err := repo.Delete(ctx, "taken-deleted", now); err != nil {
-		t.Fatalf("delete: %v", err)
-	}
+	// An opened one-time secret holds its id while its download drains.
 	burned := newTestSecret("taken-opened", now.Add(time.Hour))
 	burned.BurnAfterRead = true
 	mustCreate(t, repo, burned)
@@ -117,10 +117,10 @@ func TestUploadRepo_StartUploadRefusesATakenPublicID(t *testing.T) {
 	// Expired but not yet cleaned up still counts as taken.
 	mustCreate(t, repo, newTestSecret("taken-expired", now.Add(-time.Minute)))
 
-	for _, id := range []string{"taken-uploading", "taken-live", "taken-deleted", "taken-opened", "taken-expired"} {
+	for _, id := range []string{"taken-uploading", "taken-live", "taken-opened", "taken-expired"} {
 		sessionID := "up-again-" + id
 		secret := newTestSecret(id, now.Add(time.Hour))
-		err := repo.StartUpload(ctx, secret, newTestUpload(sessionID, secret, now.Add(time.Hour)), now)
+		err := repo.StartUpload(ctx, secret, newTestUpload(sessionID, secret, now.Add(time.Hour)))
 		if !errors.Is(err, domain.ErrDuplicate) {
 			t.Errorf("%s: err = %v, want ErrDuplicate", id, err)
 		}
@@ -132,6 +132,13 @@ func TestUploadRepo_StartUploadRefusesATakenPublicID(t *testing.T) {
 			t.Errorf("%s: refused upload: err = %v, want ErrNotFound", id, err)
 		}
 	}
+
+	// Nothing of a deleted secret is kept, not even its id.
+	mustCreate(t, repo, newTestSecret("deleted", now.Add(time.Hour)))
+	if err := repo.Delete(ctx, "deleted", now); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	mustStartUpload(t, repo, "up-again-deleted", newTestSecret("deleted", now.Add(time.Hour)), now.Add(time.Hour))
 }
 
 func TestUploadRepo_StartUploadRefusesPastTheStorageCap(t *testing.T) {
@@ -145,11 +152,11 @@ func TestUploadRepo_StartUploadRefusesPastTheStorageCap(t *testing.T) {
 		return s
 	}
 
-	mustStartUpload(t, repo, "up-first", sized("first", 600), now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-first", sized("first", 600), now.Add(time.Hour))
 
 	// 600 + 500 would pass the cap: refused, and nothing is filed for it.
 	tooBig := sized("too-big", 500)
-	if err := repo.StartUpload(ctx, tooBig, newTestUpload("up-too-big", tooBig, now.Add(time.Hour)), now); !errors.Is(err, domain.ErrStorageFull) {
+	if err := repo.StartUpload(ctx, tooBig, newTestUpload("up-too-big", tooBig, now.Add(time.Hour))); !errors.Is(err, domain.ErrStorageFull) {
 		t.Fatalf("start past the cap: err = %v, want ErrStorageFull", err)
 	}
 	if getObject(t, pool, "blobs/up-too-big") != nil {
@@ -160,14 +167,14 @@ func TestUploadRepo_StartUploadRefusesPastTheStorageCap(t *testing.T) {
 	}
 
 	// Up to the cap exactly is fine.
-	mustStartUpload(t, repo, "up-exact", sized("exact", 400), now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-exact", sized("exact", 400), now.Add(time.Hour))
 
 	// Bytes come free once an object is doomed: abandoning the first upload
 	// makes room again.
 	if err := repo.AbortUpload(ctx, "up-first", now); err != nil {
 		t.Fatalf("abort: %v", err)
 	}
-	mustStartUpload(t, repo, "up-later", sized("later", 500), now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-later", sized("later", 500), now.Add(time.Hour))
 }
 
 func TestUploadRepo_StartUploadWithoutACapTakesAnySize(t *testing.T) {
@@ -176,7 +183,7 @@ func TestUploadRepo_StartUploadWithoutACapTakesAnySize(t *testing.T) {
 	now := moment(time.Now())
 	big := newTestSecret("big", now.Add(time.Hour))
 	big.BlobSize = 1 << 40
-	mustStartUpload(t, repo, "up-big", big, now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-big", big, now.Add(time.Hour))
 }
 
 func TestUploadRepo_RecordS3UploadIDWhileTheObjectIsWritten(t *testing.T) {
@@ -184,7 +191,7 @@ func TestUploadRepo_RecordS3UploadIDWhileTheObjectIsWritten(t *testing.T) {
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
 	now := moment(time.Now())
-	mustStartUpload(t, repo, "up-s3", newTestSecret("s3", now.Add(time.Hour)), now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-s3", newTestSecret("s3", now.Add(time.Hour)), now.Add(time.Hour))
 
 	if err := repo.RecordS3UploadID(ctx, "blobs/up-s3", "s3-upload-1"); err != nil {
 		t.Fatalf("record: %v", err)
@@ -218,7 +225,7 @@ func TestUploadRepo_RecordUploadPart(t *testing.T) {
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
 	now := moment(time.Now())
-	mustStartUpload(t, repo, "up-parts", newTestSecret("parts", now.Add(time.Hour)), now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-parts", newTestSecret("parts", now.Add(time.Hour)), now.Add(time.Hour))
 
 	mustRecordPart(t, repo, newTestUploadPart("up-parts", 2, 512, 512))
 	first := newTestUploadPart("up-parts", 1, 0, 512)
@@ -273,7 +280,7 @@ func TestUploadRepo_CompleteMakesTheSecretLive(t *testing.T) {
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
 	now := moment(time.Now())
-	mustStartUpload(t, repo, "up-done", newTestSecret("done", now.Add(time.Hour)), now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-done", newTestSecret("done", now.Add(time.Hour)), now.Add(time.Hour))
 	if err := repo.RecordS3UploadID(ctx, "blobs/up-done", "s3-done"); err != nil {
 		t.Fatalf("record s3 upload id: %v", err)
 	}
@@ -281,6 +288,8 @@ func TestUploadRepo_CompleteMakesTheSecretLive(t *testing.T) {
 	mustRecordPart(t, repo, newTestUploadPart("up-done", 1, 0, 512))
 
 	completedAt := moment(now.Add(time.Minute))
+	createdAt := completedAt.Truncate(time.Minute)
+	expiresAt := createdAt.Add(testLifetime + time.Minute)
 	var finalized []domain.UploadPart
 	upload, err := repo.CompleteUpload(ctx, "up-done", completedAt, func(u *domain.Upload, parts []domain.UploadPart) error {
 		// finalize gets what it needs to assemble the object.
@@ -296,20 +305,29 @@ func TestUploadRepo_CompleteMakesTheSecretLive(t *testing.T) {
 	if len(finalized) != 2 || finalized[0].PartNumber != 1 || finalized[1].PartNumber != 2 {
 		t.Errorf("finalize got parts %+v, want 1 and 2 in order", finalized)
 	}
-	if upload.State != domain.UploadCompleted || upload.FinishedAt == nil || !upload.FinishedAt.Equal(completedAt) {
-		t.Errorf("returned upload state = %q, finished at %v; want completed at %v", upload.State, upload.FinishedAt, completedAt)
+	// Times are kept to the minute. The lifetime counts from the completed
+	// upload, one minute more for the cut, and the answer has the expiry.
+	if upload.State != domain.UploadCompleted || upload.FinishedAt == nil || !upload.FinishedAt.Equal(createdAt) {
+		t.Errorf("returned upload state = %q, finished at %v; want completed at %v", upload.State, upload.FinishedAt, createdAt)
+	}
+	if !upload.SecretExpiresAt.Equal(expiresAt) || upload.Lifetime != 0 {
+		t.Errorf("returned secret expiry = %v, lifetime = %v; want %v and the lifetime gone", upload.SecretExpiresAt, upload.Lifetime, expiresAt)
 	}
 
 	secret := mustGetSecret(t, repo, "done")
-	if secret.State != domain.SecretLive || secret.CreatedAt == nil || !secret.CreatedAt.Equal(completedAt) {
-		t.Errorf("secret state = %q, created at %v; want live since %v", secret.State, secret.CreatedAt, completedAt)
+	if secret.State != domain.SecretLive || secret.CreatedAt == nil || !secret.CreatedAt.Equal(createdAt) {
+		t.Errorf("secret state = %q, created at %v; want live since %v", secret.State, secret.CreatedAt, createdAt)
+	}
+	if !secret.ExpiresAt.Equal(expiresAt) {
+		t.Errorf("secret expires at %v, want %v", secret.ExpiresAt, expiresAt)
 	}
 	if object := mustGetObject(t, pool, "blobs/up-done"); object.State != string(domain.ObjectStored) || object.Doomed {
 		t.Errorf("object = %+v, want stored", object)
 	}
 	stored, parts := mustGetUpload(t, repo, "up-done")
-	if stored.State != domain.UploadCompleted || stored.FinishedAt == nil || !stored.FinishedAt.Equal(completedAt) || stored.PublicID != "done" {
-		t.Errorf("stored upload = %+v, want completed at %v for done", stored, completedAt)
+	if stored.State != domain.UploadCompleted || stored.FinishedAt == nil || !stored.FinishedAt.Equal(createdAt) ||
+		stored.PublicID != "done" || stored.Lifetime != 0 || !stored.SecretExpiresAt.Equal(expiresAt) {
+		t.Errorf("stored upload = %+v, want completed at %v for done, without its lifetime", stored, createdAt)
 	}
 	if len(parts) != 0 {
 		t.Errorf("completed upload keeps %d parts, want 0", len(parts))
@@ -321,18 +339,82 @@ func TestUploadRepo_RepeatedCompleteReturnsTheUploadWithoutFinalizing(t *testing
 	pool := setupTestDB(t)
 	repo := pgadapter.NewSecretRepo(pool)
 	now := moment(time.Now())
-	mustStartUpload(t, repo, "up-twice", newTestSecret("twice", now.Add(time.Hour)), now.Add(time.Hour), now)
-	mustComplete(t, repo, "up-twice", now)
+	mustStartUpload(t, repo, "up-twice", newTestSecret("twice", now.Add(time.Hour)), now.Add(time.Hour))
+	first, err := repo.CompleteUpload(context.Background(), "up-twice", now, noopFinalize)
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	completedAt := now.Truncate(time.Minute)
 
+	// The same answer, the same expiry, a minute later.
 	upload, err := repo.CompleteUpload(context.Background(), "up-twice", now.Add(time.Minute), noFinalize(t))
 	if err != nil {
 		t.Fatalf("repeated complete: %v", err)
 	}
-	if upload.State != domain.UploadCompleted || upload.PublicID != "twice" || upload.FinishedAt == nil || !upload.FinishedAt.Equal(now) {
-		t.Errorf("repeated complete = %+v, want the upload completed at %v", upload, now)
+	if upload.State != domain.UploadCompleted || upload.PublicID != "twice" || upload.FinishedAt == nil || !upload.FinishedAt.Equal(completedAt) {
+		t.Errorf("repeated complete = %+v, want the upload completed at %v", upload, completedAt)
 	}
-	if secret := mustGetSecret(t, repo, "twice"); secret.CreatedAt == nil || !secret.CreatedAt.Equal(now) {
-		t.Errorf("secret created at %v, want %v unchanged", secret.CreatedAt, now)
+	if !upload.SecretExpiresAt.Equal(first.SecretExpiresAt) {
+		t.Errorf("repeated complete: secret expires at %v, want %v as the first answer said", upload.SecretExpiresAt, first.SecretExpiresAt)
+	}
+	if secret := mustGetSecret(t, repo, "twice"); secret.CreatedAt == nil || !secret.CreatedAt.Equal(completedAt) ||
+		!secret.ExpiresAt.Equal(first.SecretExpiresAt) {
+		t.Errorf("secret created at %v, expires at %v; want %v and %v unchanged", secret.CreatedAt, secret.ExpiresAt, completedAt, first.SecretExpiresAt)
+	}
+}
+
+// TestUploadRepo_CompleteAfterTheProvisionalExpiry completes an upload that
+// took longer than the secret's lifetime: the secret still gets all of it.
+func TestUploadRepo_CompleteAfterTheProvisionalExpiry(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	ctx := context.Background()
+	now := moment(time.Now())
+	startedAt := now.Add(-3 * time.Hour)
+	// Started three hours ago with an hour to live and a day to upload.
+	mustStartUpload(t, repo, "up-slow", newTestSecret("slow", startedAt.Add(testLifetime)), startedAt.Add(24*time.Hour))
+
+	upload, err := repo.CompleteUpload(ctx, "up-slow", now, noopFinalize)
+	if err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	want := now.Truncate(time.Minute).Add(testLifetime + time.Minute)
+	if !upload.SecretExpiresAt.Equal(want) {
+		t.Errorf("secret expires at %v, want %v", upload.SecretExpiresAt, want)
+	}
+	if got := mustGetSecret(t, repo, "slow"); !got.Readable(now) || !got.ExpiresAt.Equal(want) {
+		t.Errorf("secret readable = %v, expires at %v; want readable until %v", got.Readable(now), got.ExpiresAt, want)
+	}
+	// The expiry sweep leaves it alone.
+	if n, err := repo.DeleteExpiredSecrets(ctx, now, testBatchSize); err != nil || n != 0 {
+		t.Errorf("expiry sweep = %d, %v; want nothing expired", n, err)
+	}
+	mustOpen(t, repo, "slow", "recipient", false, now)
+}
+
+// TestUploadRepo_CompleteKeepsNothingThatTellsTheUploadsDuration completes,
+// in the same minute, uploads that started as the service starts them but
+// took different times, and checks that their secrets keep the same times.
+func TestUploadRepo_CompleteKeepsNothingThatTellsTheUploadsDuration(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	now := moment(time.Now())
+	wantCreated, wantExpires := now.Truncate(time.Minute), now.Truncate(time.Minute).Add(testLifetime+time.Minute)
+	for i, took := range []time.Duration{time.Second, 2*time.Minute + 50*time.Second, 5 * time.Hour} {
+		id := fmt.Sprintf("took-%d", i)
+		startedAt := now.Add(-took)
+		_, provisional := domain.SecretTimes(startedAt, testLifetime)
+		mustStartUpload(t, repo, "up-"+id, newTestSecret(id, provisional), domain.KeptTime(startedAt.Add(24*time.Hour)))
+		mustComplete(t, repo, "up-"+id, now)
+
+		row := mustGetSecretRow(t, pool, id)
+		if row.CreatedAt == nil || !row.CreatedAt.Equal(wantCreated) || !row.ExpiresAt.Equal(wantExpires) {
+			t.Errorf("%s: created_at %v, expires_at %v; want %v and %v whatever the upload took",
+				id, deref(row.CreatedAt), row.ExpiresAt, wantCreated, wantExpires)
+		}
+		if n := countRows(t, pool, "SELECT count(*) FROM uploads WHERE session_id = $1 AND lifetime IS NULL AND finished_at = $2", "up-"+id, wantCreated); n != 1 {
+			t.Errorf("%s: the completed upload keeps its lifetime, or a finish time finer than the minute", id)
+		}
 	}
 }
 
@@ -340,7 +422,7 @@ func TestUploadRepo_ConcurrentCompletesFinalizeOnce(t *testing.T) {
 	pool := setupTestDB(t)
 	repo := pgadapter.NewSecretRepo(pool)
 	now := moment(time.Now())
-	mustStartUpload(t, repo, "up-race", newTestSecret("race", now.Add(time.Hour)), now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-race", newTestSecret("race", now.Add(time.Hour)), now.Add(time.Hour))
 
 	const callers = 5
 	var finalizeCalls atomic.Int32
@@ -378,7 +460,7 @@ func TestUploadRepo_CompleteRollsBackWhenFinalizeFails(t *testing.T) {
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
 	now := moment(time.Now())
-	mustStartUpload(t, repo, "up-fail", newTestSecret("fail", now.Add(time.Hour)), now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-fail", newTestSecret("fail", now.Add(time.Hour)), now.Add(time.Hour))
 	mustRecordPart(t, repo, newTestUploadPart("up-fail", 1, 0, 1024))
 
 	wantErr := errors.New("storage rejected parts")
@@ -410,7 +492,7 @@ func TestUploadRepo_CompleteRefusesAnAbandonedUpload(t *testing.T) {
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
 	now := moment(time.Now())
-	mustStartUpload(t, repo, "up-gone", newTestSecret("gone", now.Add(time.Hour)), now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-gone", newTestSecret("gone", now.Add(time.Hour)), now.Add(time.Hour))
 	if err := repo.AbortUpload(ctx, "up-gone", now); err != nil {
 		t.Fatalf("abort: %v", err)
 	}
@@ -428,7 +510,7 @@ func TestUploadRepo_AbortAbandonsTheUploadAndFreesThePublicID(t *testing.T) {
 	repo := pgadapter.NewSecretRepo(pool)
 	ctx := context.Background()
 	now := moment(time.Now())
-	mustStartUpload(t, repo, "up-abort", newTestSecret("abort", now.Add(time.Hour)), now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-abort", newTestSecret("abort", now.Add(time.Hour)), now.Add(time.Hour))
 	mustRecordPart(t, repo, newTestUploadPart("up-abort", 1, 0, 1024))
 
 	abortedAt := moment(now.Add(time.Minute))
@@ -439,9 +521,12 @@ func TestUploadRepo_AbortAbandonsTheUploadAndFreesThePublicID(t *testing.T) {
 	// The secret never existed.
 	assertSecretGone(t, repo, "abort")
 	assertDoomed(t, pool, "blobs/up-abort")
+	// Abandoned in the minute it was aborted, without its lifetime.
+	finishedAt := abortedAt.Truncate(time.Minute)
 	upload, _ := mustGetUpload(t, repo, "up-abort")
-	if upload.State != domain.UploadAbandoned || upload.FinishedAt == nil || !upload.FinishedAt.Equal(abortedAt) {
-		t.Errorf("upload state = %q, finished at %v; want abandoned at %v", upload.State, upload.FinishedAt, abortedAt)
+	if upload.State != domain.UploadAbandoned || upload.FinishedAt == nil || !upload.FinishedAt.Equal(finishedAt) || upload.Lifetime != 0 {
+		t.Errorf("upload state = %q, finished at %v, lifetime %v; want abandoned at %v without a lifetime",
+			upload.State, upload.FinishedAt, upload.Lifetime, finishedAt)
 	}
 	if upload.PublicID != "" || upload.StorageKey != "" {
 		t.Errorf("abandoned upload keeps public id %q, storage key %q; want both gone with the secret", upload.PublicID, upload.StorageKey)
@@ -451,12 +536,12 @@ func TestUploadRepo_AbortAbandonsTheUploadAndFreesThePublicID(t *testing.T) {
 	if err := repo.AbortUpload(ctx, "up-abort", abortedAt.Add(time.Minute)); err != nil {
 		t.Errorf("second abort: %v", err)
 	}
-	if again, _ := mustGetUpload(t, repo, "up-abort"); again.FinishedAt == nil || !again.FinishedAt.Equal(abortedAt) {
-		t.Errorf("second abort moved finished at to %v, want %v", again.FinishedAt, abortedAt)
+	if again, _ := mustGetUpload(t, repo, "up-abort"); again.FinishedAt == nil || !again.FinishedAt.Equal(finishedAt) {
+		t.Errorf("second abort moved finished at to %v, want %v", again.FinishedAt, finishedAt)
 	}
 
 	// The public id is free for a new upload, which writes its own object.
-	mustStartUpload(t, repo, "up-abort-again", newTestSecret("abort", now.Add(time.Hour)), now.Add(time.Hour), now)
+	mustStartUpload(t, repo, "up-abort-again", newTestSecret("abort", now.Add(time.Hour)), now.Add(time.Hour))
 	if got := mustGetSecret(t, repo, "abort"); got.StorageKey != "blobs/up-abort-again" {
 		t.Errorf("new secret's storage key = %q, want blobs/up-abort-again", got.StorageKey)
 	}

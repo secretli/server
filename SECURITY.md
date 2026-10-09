@@ -22,7 +22,7 @@ Secretli uses a zero-knowledge architecture:
 - This server only stores opaque, encrypted blobs and never has access to plaintext data or encryption keys; CI checks that the format library is not among its dependencies
 - Encryption keys are transported in URL fragments (`#`), which are never sent to the server
 - Metadata, blob, and deletion bearer tokens are stored as SHA-256 hashes, not raw tokens
-- Tombstones of gone secrets hold no content and no key material, only the token hashes that guard them, the outcome and its times
+- Nothing of a secret is kept once it is deleted or expires. An opened one-time secret keeps only its encrypted object, the object's size and its expiry, for the download that opened it, and goes once that download ends; no token hash, so no link can tell it from a secret that never existed
 
 ## Supported Versions
 

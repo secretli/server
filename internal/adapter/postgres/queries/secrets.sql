@@ -1,6 +1,6 @@
 -- name: CreateSecret :exec
 -- A secret is filed when its upload starts, so its public id is taken from
--- then on.
+-- then on. Its expiry is provisional until the upload completes.
 INSERT INTO secrets (
     public_id,
     state,
@@ -31,39 +31,32 @@ WHERE public_id = sqlc.arg(public_id)
 FOR UPDATE;
 
 -- name: MakeSecretLive :execrows
+-- The completed upload sets both times, to the minute: the secret's lifetime
+-- counts from here, and nothing kept tells how long the upload took.
 UPDATE secrets
 SET state = 'live',
-    created_at = sqlc.arg(now_at)
+    created_at = sqlc.arg(created_at),
+    expires_at = sqlc.arg(expires_at)
 WHERE public_id = sqlc.arg(public_id)
   AND state = 'uploading';
 
--- name: EndSecretOpened :exec
--- Opening a one-time secret ends it. Its object stays until the download
--- that opened it has ended.
+-- name: CloseSecret :exec
+-- Opening a one-time secret closes it, whoever opens it. Its row keeps only
+-- what the download that opened it needs, the object, its size and the
+-- expiry, until that download has ended.
 UPDATE secrets
-SET state = 'ended',
-    outcome = 'opened',
+SET state = 'closing',
+    created_at = NULL,
+    metadata_token_hash = NULL,
     encrypted_meta = NULL,
     blob_token_hash = NULL,
     deletion_token_hash = NULL
 WHERE public_id = $1;
 
 -- name: MarkSecretOpened :exec
--- Someone other than the owner opened a reusable secret.
+-- A recipient, not the owner, opened a reusable secret.
 UPDATE secrets
 SET opened = TRUE
-WHERE public_id = $1;
-
--- name: EndSecretDeleted :exec
--- Deleting ends the secret; the caller dooms its object in the same
--- transaction.
-UPDATE secrets
-SET state = 'ended',
-    outcome = 'deleted',
-    storage_key = NULL,
-    encrypted_meta = NULL,
-    blob_token_hash = NULL,
-    deletion_token_hash = NULL
 WHERE public_id = $1;
 
 -- name: DeleteUploadingSecrets :many
@@ -75,11 +68,10 @@ WHERE public_id = ANY(sqlc.arg(public_ids)::text[])
 RETURNING storage_key;
 
 -- name: ListDrainedSecretsForUpdate :many
--- Opened one-time secrets whose last download session has ended.
+-- Closing secrets whose last download session has ended.
 SELECT s.public_id, s.storage_key
 FROM secrets AS s
-WHERE s.state = 'ended'
-  AND s.storage_key IS NOT NULL
+WHERE s.state = 'closing'
   AND NOT EXISTS (
       SELECT 1
       FROM retrieval_sessions AS rs
@@ -90,13 +82,8 @@ ORDER BY s.public_id
 LIMIT sqlc.arg(batch_size)
 FOR UPDATE OF s SKIP LOCKED;
 
--- name: ClearStorageKeys :exec
-UPDATE secrets
-SET storage_key = NULL
-WHERE public_id = ANY(sqlc.arg(public_ids)::text[]);
-
 -- name: ListExpiredSecretsForUpdate :many
--- Live and ended secrets past their expiry, oldest first. An upload under
+-- Live and closing secrets past their expiry, oldest first. An upload under
 -- way is left to its own expiry.
 SELECT public_id, storage_key
 FROM secrets
@@ -107,6 +94,8 @@ LIMIT sqlc.arg(batch_size)
 FOR UPDATE SKIP LOCKED;
 
 -- name: DeleteSecretsByPublicIDs :execrows
+-- Nothing about a deleted secret is kept, and its retrieval sessions go with
+-- it. The caller dooms the objects in the same transaction.
 DELETE FROM secrets
 WHERE public_id = ANY(sqlc.arg(public_ids)::text[]);
 
@@ -116,15 +105,15 @@ WHERE public_id = ANY(sqlc.arg(public_ids)::text[]);
 SELECT pg_advisory_xact_lock(7302102);
 
 -- name: StoredBytes :one
--- What the secrets that hold an object take up in storage, uploads under way
--- included. Doomed objects are left out: they are gone within a minute.
+-- What the secrets take up in storage, uploads under way and downloads that
+-- drain included. Every secret holds its object; doomed objects are left
+-- out, since they are gone within a minute.
 SELECT COALESCE(SUM(blob_size), 0)::bigint AS stored_bytes
-FROM secrets
-WHERE storage_key IS NOT NULL;
+FROM secrets;
 
 -- name: StorageStats :one
 -- Totals for the metrics: no secret is told apart.
 SELECT
     (SELECT count(*) FROM secrets AS l WHERE l.state = 'live' AND l.expires_at > sqlc.arg(now_at))::bigint AS live_secrets,
-    (SELECT COALESCE(SUM(h.blob_size), 0) FROM secrets AS h WHERE h.storage_key IS NOT NULL)::bigint AS stored_bytes,
+    (SELECT COALESCE(SUM(h.blob_size), 0) FROM secrets AS h)::bigint AS stored_bytes,
     (SELECT count(*) FROM objects AS o WHERE o.doomed)::bigint AS doomed_objects;

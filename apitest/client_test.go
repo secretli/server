@@ -1,5 +1,5 @@
 // Package apitest checks a running Secretli server through its HTTP API
-// alone: uploads, metadata, retrieval, tombstones, deletion and the
+// alone: uploads, metadata, retrieval, gone secrets, deletion and the
 // short-code relay, against the real database and object store.
 //
 // It needs no client and no format library. The server never decrypts
@@ -102,18 +102,30 @@ func (r reply) expect(t *testing.T, what string, status int, out any) {
 	}
 }
 
-// gone is the body of a 410: what became of a secret, or why a transfer ended.
+// gone is the body of a 410: why a transfer ended.
 type gone struct {
 	Details map[string]any `json:"details"`
 }
 
-// expectEnded checks what the link of an ended secret is told: how it ended and
-// whether it was a one-time secret, and nothing else. In particular no time,
-// and not who opened it.
-func (g gone) expectEnded(t *testing.T, when, outcome string, burnAfterRead bool) {
-	t.Helper()
-	if len(g.Details) != 2 || g.Details["outcome"] != outcome || g.Details["burn_after_read"] != burnAfterRead {
-		t.Errorf("%s: details = %v, want exactly outcome %q and burn_after_read %t", when, g.Details, outcome, burnAfterRead)
+// expectNotThere checks that a secret is not there for either of its links:
+// the metadata, opening it as a recipient or as its owner, and deleting it
+// all get the 404 a secret that never was gets, which tells nothing about
+// what became of it.
+func (a api) expectNotThere(s secret, when string) {
+	a.t.Helper()
+	never := a.metadata(newSecret(a.t, 1, false), s.metadataToken)
+	never.expect(a.t, "metadata of a secret that never was", http.StatusNotFound, nil)
+	for what, r := range map[string]reply{
+		"metadata":                    a.metadata(s, s.metadataToken),
+		"metadata, wrong token":       a.metadata(s, b64(randomBytes(a.t, 32))),
+		"opening":                     a.startRetrieval(s, s.blobToken, ""),
+		"opening with the owner link": a.startRetrieval(s, s.blobToken, s.deletionToken),
+		"deleting":                    a.deleteSecret(s, s.deletionToken),
+	} {
+		r.expect(a.t, what+" "+when, http.StatusNotFound, nil)
+		if !bytes.Equal(r.body, never.body) {
+			a.t.Errorf("%s %s answers %s; a secret that never was answers %s", what, when, r.body, never.body)
+		}
 	}
 }
 
@@ -139,6 +151,9 @@ type secret struct {
 	envelope                                          string
 	blob                                              []byte
 	oneTime                                           bool
+	// expiration is the lifetime as the API names it, 1h unless a test
+	// chooses another.
+	expiration string
 }
 
 func newSecret(t *testing.T, size int, oneTime bool) secret {
@@ -151,6 +166,7 @@ func newSecret(t *testing.T, size int, oneTime bool) secret {
 		envelope:      "v2$" + b64(randomBytes(t, 24)) + "$" + b64(randomBytes(t, 80)),
 		blob:          randomBytes(t, size),
 		oneTime:       oneTime,
+		expiration:    "1h",
 	}
 }
 
@@ -160,6 +176,14 @@ type uploadSession struct {
 	PublicID    string `json:"public_id"`
 	PartSize    int64  `json:"part_size"`
 	BlobSize    int64  `json:"blob_size"`
+	// ExpiresAt is the secret's expiry if the upload completed at once.
+	ExpiresAt       time.Time `json:"expires_at"`
+	UploadExpiresAt time.Time `json:"upload_expires_at"`
+}
+
+// completed is the answer to completing an upload.
+type completed struct {
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 func (a api) startUpload(s secret) reply {
@@ -170,7 +194,7 @@ func (a api) startUpload(s secret) reply {
 		"blob_token":      s.blobToken,
 		"deletion_token":  s.deletionToken,
 		"encrypted_meta":  s.envelope,
-		"expiration":      "1h",
+		"expiration":      s.expiration,
 		"burn_after_read": s.oneTime,
 		"blob_size":       len(s.blob),
 	})
@@ -194,8 +218,8 @@ func (a api) putPartWithHash(session uploadSession, number int, offset int, data
 }
 
 // upload makes the secret through an upload session in parts of the given
-// sizes, or in one part.
-func (a api) upload(s secret, parts ...int) {
+// sizes, or in one part, and returns the answer to completing it.
+func (a api) upload(s secret, parts ...int) completed {
 	a.t.Helper()
 	if len(parts) == 0 {
 		parts = []int{len(s.blob)}
@@ -207,14 +231,17 @@ func (a api) upload(s secret, parts ...int) {
 		a.putPart(session, i+1, offset, s.blob[offset:offset+size]).expect(a.t, fmt.Sprintf("part %d", i+1), http.StatusOK, nil)
 		offset += size
 	}
-	a.completeUpload(session).expect(a.t, "complete upload", http.StatusCreated, nil)
+	var done completed
+	a.completeUpload(session).expect(a.t, "complete upload", http.StatusCreated, &done)
+	return done
 }
 
 type metadata struct {
-	EncryptedMeta string `json:"encrypted_meta"`
-	BlobSize      int64  `json:"blob_size"`
-	BurnAfterRead bool   `json:"burn_after_read"`
-	ExpiresAt     string `json:"expires_at"`
+	EncryptedMeta string    `json:"encrypted_meta"`
+	BlobSize      int64     `json:"blob_size"`
+	BurnAfterRead bool      `json:"burn_after_read"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	CreatedAt     time.Time `json:"created_at"`
 	// Opened is a pointer, so that a reply without the field shows as nil and
 	// not as false.
 	Opened *bool `json:"opened"`

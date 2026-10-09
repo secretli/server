@@ -1,11 +1,11 @@
 package apitest
 
 import (
-	"bytes"
 	"fmt"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestHealthAndVersion(t *testing.T) {
@@ -21,7 +21,7 @@ func TestHealthAndVersion(t *testing.T) {
 	}
 }
 
-func TestAOneTimeSecretOpensOnceAndLeavesATombstone(t *testing.T) {
+func TestAOneTimeSecretOpensOnceAndItsDownloadCompletes(t *testing.T) {
 	a := server(t)
 	s := newSecret(t, 4096, true)
 	a.upload(s)
@@ -47,40 +47,26 @@ func TestAOneTimeSecretOpensOnceAndLeavesATombstone(t *testing.T) {
 	if session.BlobSize != int64(len(s.blob)) || !session.BurnAfterRead {
 		t.Errorf("session = %+v", session)
 	}
+	a.readRange(s, session, 0, 99)
+
+	// Gone for everyone now, with either link, as if it never was.
+	a.expectNotThere(s, "after opening")
+
+	// The download that opened it still completes.
+	a.readRange(s, session, 100, len(s.blob)-1)
 	a.readRange(s, session, 0, len(s.blob)-1)
-	a.readRange(s, session, 100, 199)
-
-	// Gone for everyone now; the metadata token still learns what happened, and
-	// only that.
-	a.startRetrieval(s, s.blobToken, "").expect(t, "second retrieval", http.StatusNotFound, nil)
-	var tomb gone
-	a.metadata(s, s.metadataToken).expect(t, "metadata after opening", http.StatusGone, &tomb)
-	tomb.expectEnded(t, "metadata after opening", "opened", true)
-
-	// Without the token, nothing is told: the same refusal as for a secret that
-	// never was.
-	guess := a.metadata(s, b64(randomBytes(t, 32)))
-	guess.expect(t, "metadata after opening, wrong token", http.StatusNotFound, nil)
-	never := a.metadata(newSecret(t, 1, true), b64(randomBytes(t, 32)))
-	never.expect(t, "metadata of a secret that never was", http.StatusNotFound, nil)
-	if !bytes.Equal(guess.body, never.body) {
-		t.Errorf("metadata after opening, wrong token, answers %s; a secret that never was answers %s", guess.body, never.body)
-	}
 }
 
-func TestAOneTimeSecretOpenedByItsOwnerIsReportedAsOpened(t *testing.T) {
+func TestAOneTimeSecretOpenedByItsOwnerIsGoneToo(t *testing.T) {
 	a := server(t)
 	s := newSecret(t, 512, true)
 	a.upload(s)
 
-	// A one-time secret ends whoever opens it, and the link is not told who.
-	a.startRetrieval(s, s.blobToken, s.deletionToken).expect(t, "owner's retrieval", http.StatusCreated, nil)
-	var tomb gone
-	a.metadata(s, s.metadataToken).expect(t, "metadata after the owner opened it", http.StatusGone, &tomb)
-	tomb.expectEnded(t, "metadata after the owner opened it", "opened", true)
-	if _, told := tomb.Details["opened_by_owner"]; told {
-		t.Errorf("the owner's opening is told apart from a recipient's: %v", tomb.Details)
-	}
+	// A one-time secret closes whoever opens it.
+	var session retrievalSession
+	a.startRetrieval(s, s.blobToken, s.deletionToken).expect(t, "owner's retrieval", http.StatusCreated, &session)
+	a.expectNotThere(s, "after the owner opened it")
+	a.readRange(s, session, 0, len(s.blob)-1)
 }
 
 func TestAReusableSecretInSeveralPartsOpensAgain(t *testing.T) {
@@ -147,10 +133,7 @@ func TestOnlyTheDeletionTokenDeletes(t *testing.T) {
 	a.deleteSecret(s, b64(randomBytes(t, 32))).expect(t, "delete, wrong token", http.StatusForbidden, nil)
 	a.deleteSecret(s, s.deletionToken).expect(t, "delete", http.StatusNoContent, nil)
 
-	a.startRetrieval(s, s.blobToken, "").expect(t, "retrieval after deletion", http.StatusNotFound, nil)
-	var tomb gone
-	a.metadata(s, s.metadataToken).expect(t, "metadata after deletion", http.StatusGone, &tomb)
-	tomb.expectEnded(t, "metadata after deletion", "deleted", false)
+	a.expectNotThere(s, "after deletion")
 }
 
 func TestDeletingASecretEndsRunningDownloads(t *testing.T) {
@@ -253,4 +236,72 @@ func TestMalformedRequestsAreRefused(t *testing.T) {
 	a.startUpload(s).expect(t, "upload, wrong envelope", http.StatusBadRequest, nil)
 	a.do(http.MethodGet, "/api/v1/secrets/not-an-id/meta", map[string]string{"X-Metadata-Token": b64(randomBytes(t, 32))}, nil).
 		expect(t, "metadata, malformed id", http.StatusBadRequest, nil)
+}
+
+func TestDeletedSecretsAreGoneWhetherOrNotSomeoneOpenedThem(t *testing.T) {
+	a := server(t)
+
+	// A one-time secret deleted before anyone opened it.
+	oneTime := newSecret(t, 256, true)
+	a.upload(oneTime)
+	a.deleteSecret(oneTime, oneTime.deletionToken).expect(t, "delete the one-time secret", http.StatusNoContent, nil)
+	a.expectNotThere(oneTime, "after deleting the one-time secret")
+
+	// A reusable secret a recipient had opened, then deleted.
+	reusable := newSecret(t, 256, false)
+	a.upload(reusable)
+	a.startRetrieval(reusable, reusable.blobToken, "").expect(t, "recipient's retrieval", http.StatusCreated, nil)
+	a.expectOpened(reusable, "after a recipient opened it", true)
+	a.deleteSecret(reusable, reusable.deletionToken).expect(t, "delete the opened reusable secret", http.StatusNoContent, nil)
+	a.expectNotThere(reusable, "after deleting the opened reusable secret")
+}
+
+// TestTimesAreKeptToTheMinute checks the times a secret is told: to the
+// minute, the lifetime counted from the completed upload and never shorter
+// than chosen, and the same span between creation and expiry for every
+// secret of a lifetime, so that they do not tell how long the upload took.
+func TestTimesAreKeptToTheMinute(t *testing.T) {
+	for expiration, lifetime := range map[string]time.Duration{"5m": 5 * time.Minute, "1h": time.Hour, "7d": 7 * 24 * time.Hour} {
+		t.Run(expiration, func(t *testing.T) {
+			a := server(t)
+			s := newSecret(t, 512, false)
+			s.expiration = expiration
+			toTheMinute := func(what string, at time.Time) {
+				t.Helper()
+				if at.IsZero() || !at.Equal(at.Truncate(time.Minute)) {
+					t.Errorf("%s = %v, want a time to the minute", what, at)
+				}
+			}
+
+			var session uploadSession
+			a.startUpload(s).expect(t, "start upload", http.StatusCreated, &session)
+			toTheMinute("the upload's provisional expires_at", session.ExpiresAt)
+			toTheMinute("upload_expires_at", session.UploadExpiresAt)
+			a.putPart(session, 1, 0, s.blob).expect(t, "part", http.StatusOK, nil)
+
+			before := time.Now()
+			var done completed
+			a.completeUpload(session).expect(t, "complete upload", http.StatusCreated, &done)
+			var meta metadata
+			a.metadata(s, s.metadataToken).expect(t, "metadata", http.StatusOK, &meta)
+
+			toTheMinute("the completed upload's expires_at", done.ExpiresAt)
+			toTheMinute("created_at", meta.CreatedAt)
+			toTheMinute("expires_at", meta.ExpiresAt)
+			if !meta.ExpiresAt.Equal(done.ExpiresAt) {
+				t.Errorf("metadata expires_at = %v, the completed upload said %v", meta.ExpiresAt, done.ExpiresAt)
+			}
+			if span := meta.ExpiresAt.Sub(meta.CreatedAt); span != lifetime+time.Minute {
+				t.Errorf("expires_at - created_at = %v, want %v and a minute", span, lifetime)
+			}
+			// The server's clock is the test's, give or take a little.
+			const skew = 5 * time.Second
+			if left := done.ExpiresAt.Sub(before); left < lifetime-skew {
+				t.Errorf("the secret lives %v from completing, want at least %v", left, lifetime)
+			}
+			if created := meta.CreatedAt; created.Before(before.Add(-time.Minute-skew)) || created.After(time.Now().Add(skew)) {
+				t.Errorf("created_at = %v, want the minute the upload completed in, at about %v", created, before)
+			}
+		})
+	}
 }

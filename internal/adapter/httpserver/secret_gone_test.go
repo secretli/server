@@ -1,11 +1,10 @@
 package httpserver
 
 import (
+	"bytes"
 	"encoding/json"
-	"maps"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"testing"
 	"time"
 
@@ -24,40 +23,20 @@ func getMetadata(t *testing.T, h *SecretHandler, publicID, metadataToken string)
 	return rec
 }
 
-// decodeGone returns the details of a 410. They tell how the secret ended and
-// nothing else, so any other key fails the test.
-func decodeGone(t *testing.T, rec *httptest.ResponseRecorder) map[string]any {
-	t.Helper()
-	if rec.Code != http.StatusGone {
-		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusGone, rec.Body.String())
-	}
-	var body struct {
-		Error   string         `json:"error"`
-		Details map[string]any `json:"details"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode body: %v", err)
-	}
-	keys := slices.Sorted(maps.Keys(body.Details))
-	if want := []string{"burn_after_read", "outcome"}; !slices.Equal(keys, want) {
-		t.Errorf("details keys = %v, want exactly %v", keys, want)
-	}
-	return body.Details
-}
-
 // assertNothingTold checks for a plain 404 that does not let on whether the
-// secret ever existed or how it ended.
-func assertNothingTold(t *testing.T, rec *httptest.ResponseRecorder) {
+// secret ever existed or what became of it.
+func assertNothingTold(t *testing.T, rec *httptest.ResponseRecorder, what string) {
 	t.Helper()
 	if rec.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want %d. body: %s", rec.Code, http.StatusNotFound, rec.Body.String())
+		t.Errorf("%s: status = %d, want %d. body: %s", what, rec.Code, http.StatusNotFound, rec.Body.String())
+		return
 	}
 	var body map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
-		t.Fatalf("decode body: %v", err)
+		t.Fatalf("%s: decode body: %v", what, err)
 	}
 	if _, ok := body["details"]; ok {
-		t.Errorf("body = %s, want no details", rec.Body.String())
+		t.Errorf("%s: body = %s, want no details", what, rec.Body.String())
 	}
 }
 
@@ -103,123 +82,59 @@ func deleteSecretAs(t *testing.T, h *SecretHandler, publicID, metadataToken, del
 	return rec
 }
 
-func TestSecretMetadata_OpenedOneTimeSecretTellsItWasOpened(t *testing.T) {
-	repo := newMockRepo()
-	fs := newMockFileStore()
-	h := NewSecretHandler(repo, fs)
-	publicID := testPublicID("gone opened")
-	token := testToken("gone opened token")
-	seedSecret(repo, fs, publicID, token, testToken("gone opened deletion"), true)
-
-	startTestRetrievalSession(t, h, publicID, token)
-
-	details := decodeGone(t, getMetadata(t, h, publicID, token))
-	if details["outcome"] != "opened" || details["burn_after_read"] != true {
-		t.Errorf("details = %v, want an opened one-time secret", details)
-	}
-}
-
-func TestSecretMetadata_OwnerOpeningTheirOneTimeSecretEndsItAlike(t *testing.T) {
-	repo := newMockRepo()
-	fs := newMockFileStore()
-	h := NewSecretHandler(repo, fs)
-	publicID := testPublicID("gone owner opened")
-	token := testToken("gone owner opened token")
-	deletionToken := testToken("gone owner opened deletion")
-	seedSecret(repo, fs, publicID, token, deletionToken, true)
-
-	if rec := startSessionAs(t, h, publicID, token, deletionToken); rec.Code != http.StatusCreated {
-		t.Fatalf("owner open status = %d, want %d. body: %s", rec.Code, http.StatusCreated, rec.Body.String())
-	}
-
-	// Nothing tells who opened it: the answer is the same as for a recipient.
-	details := decodeGone(t, getMetadata(t, h, publicID, token))
-	if details["outcome"] != "opened" || details["burn_after_read"] != true {
-		t.Errorf("details = %v, want an opened one-time secret", details)
-	}
-}
-
-func TestSecretMetadata_DeletedSecretTellsItWasDeleted(t *testing.T) {
-	for _, burnAfterRead := range []bool{false, true} {
-		repo := newMockRepo()
-		fs := newMockFileStore()
-		h := NewSecretHandler(repo, fs)
-		publicID := testPublicID("gone deleted")
-		token := testToken("gone deleted token")
-		deletionToken := testToken("gone deleted deletion")
-		seedSecret(repo, fs, publicID, token, deletionToken, burnAfterRead)
-
-		if rec := deleteSecretAs(t, h, publicID, token, deletionToken); rec.Code != http.StatusNoContent {
-			t.Fatalf("delete status = %d, want %d. body: %s", rec.Code, http.StatusNoContent, rec.Body.String())
-		}
-
-		details := decodeGone(t, getMetadata(t, h, publicID, token))
-		if details["outcome"] != "deleted" || details["burn_after_read"] != burnAfterRead {
-			t.Errorf("details = %v, want deleted with burn_after_read %v", details, burnAfterRead)
-		}
-	}
-}
-
-func TestDeleteSecret_DeletingTwiceTellsItIsGone(t *testing.T) {
-	repo := newMockRepo()
-	fs := newMockFileStore()
-	h := NewSecretHandler(repo, fs)
-	publicID := testPublicID("gone deleted twice")
-	token := testToken("gone deleted twice token")
-	deletionToken := testToken("gone deleted twice deletion")
-	seedSecret(repo, fs, publicID, token, deletionToken, false)
-
-	if rec := deleteSecretAs(t, h, publicID, token, deletionToken); rec.Code != http.StatusNoContent {
-		t.Fatalf("first delete status = %d. body: %s", rec.Code, rec.Body.String())
-	}
-
-	details := decodeGone(t, deleteSecretAs(t, h, publicID, token, deletionToken))
-	if details["outcome"] != "deleted" {
-		t.Errorf("details = %v, want deleted", details)
-	}
-}
-
-func TestSecretMetadata_WhatBecameOfASecretNeedsItsLink(t *testing.T) {
-	repo := newMockRepo()
-	fs := newMockFileStore()
-	h := NewSecretHandler(repo, fs)
-	publicID := testPublicID("gone guarded")
-	token := testToken("gone guarded token")
-	seedSecret(repo, fs, publicID, token, testToken("gone guarded deletion"), true)
-	startTestRetrievalSession(t, h, publicID, token)
-
-	rec := getMetadata(t, h, publicID, testToken("somebody else's token"))
-
-	// A guess must learn nothing, not even that the id was ever used.
-	assertNothingTold(t, rec)
-}
-
-func TestSecretMetadata_ExpiredSecretIsNotFound(t *testing.T) {
-	tests := []struct {
-		name  string
-		state domain.SecretState
+// TestGoneSecretsAreAnsweredLikeSecretsThatNeverWere ends a secret in each
+// way there is, then asks with both its links. Nothing tells how it ended,
+// or that it existed: every answer is the 404 a secret that never was gets.
+func TestGoneSecretsAreAnsweredLikeSecretsThatNeverWere(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		burnAfterRead bool
+		end           func(t *testing.T, h *SecretHandler, repo *mockSecretRepo, publicID, token, deletionToken string)
 	}{
-		{name: "live", state: domain.SecretLive},
-		{name: "ended", state: domain.SecretEnded},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		{"one-time secret opened by a recipient", true, func(t *testing.T, h *SecretHandler, _ *mockSecretRepo, publicID, token, _ string) {
+			startTestRetrievalSession(t, h, publicID, token)
+		}},
+		{"one-time secret opened by its owner", true, func(t *testing.T, h *SecretHandler, _ *mockSecretRepo, publicID, token, deletionToken string) {
+			if rec := startSessionAs(t, h, publicID, token, deletionToken); rec.Code != http.StatusCreated {
+				t.Fatalf("owner's open: status %d. body: %s", rec.Code, rec.Body.String())
+			}
+		}},
+		{"deleted one-time secret", true, func(t *testing.T, h *SecretHandler, _ *mockSecretRepo, publicID, token, deletionToken string) {
+			if rec := deleteSecretAs(t, h, publicID, token, deletionToken); rec.Code != http.StatusNoContent {
+				t.Fatalf("delete: status %d. body: %s", rec.Code, rec.Body.String())
+			}
+		}},
+		{"reusable secret opened, then deleted", false, func(t *testing.T, h *SecretHandler, _ *mockSecretRepo, publicID, token, deletionToken string) {
+			startTestRetrievalSession(t, h, publicID, token)
+			if rec := deleteSecretAs(t, h, publicID, token, deletionToken); rec.Code != http.StatusNoContent {
+				t.Fatalf("delete: status %d. body: %s", rec.Code, rec.Body.String())
+			}
+		}},
+		// The cleanup has not reached the row yet, but expiry keeps nothing.
+		{"expired secret", false, func(_ *testing.T, _ *SecretHandler, repo *mockSecretRepo, publicID, _, _ string) {
+			repo.secrets[publicID].ExpiresAt = time.Now().Add(-time.Minute)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			repo := newMockRepo()
 			fs := newMockFileStore()
 			h := NewSecretHandler(repo, fs)
-			publicID := testPublicID("gone expired " + tt.name)
-			token := testToken("gone expired token " + tt.name)
-			seedSecret(repo, fs, publicID, token, testToken("gone expired deletion "+tt.name), true)
-			// The cleanup has not reached the row yet, but expiry keeps
-			// nothing: not even how the secret ended.
-			secret := repo.secrets[publicID]
-			secret.State = tt.state
-			if tt.state == domain.SecretEnded {
-				secret.Outcome = domain.OutcomeOpened
-			}
-			secret.ExpiresAt = time.Now().Add(-time.Minute)
+			publicID := testPublicID("gone " + tc.name)
+			token := testToken("gone token " + tc.name)
+			deletionToken := testToken("gone deletion " + tc.name)
+			seedSecret(repo, fs, publicID, token, deletionToken, tc.burnAfterRead)
+			tc.end(t, h, repo, publicID, token, deletionToken)
 
-			assertNothingTold(t, getMetadata(t, h, publicID, token))
+			never := getMetadata(t, h, testPublicID("never "+tc.name), token)
+			meta := getMetadata(t, h, publicID, token)
+			assertNothingTold(t, meta, "metadata")
+			if !bytes.Equal(meta.Body.Bytes(), never.Body.Bytes()) {
+				t.Errorf("metadata answers %s; a secret that never was answers %s", meta.Body.String(), never.Body.String())
+			}
+			assertNothingTold(t, getMetadata(t, h, publicID, testToken("somebody else's token")), "metadata, wrong token")
+			assertNothingTold(t, startSessionAs(t, h, publicID, token, ""), "open")
+			assertNothingTold(t, startSessionAs(t, h, publicID, token, deletionToken), "open with the owner link")
+			assertNothingTold(t, deleteSecretAs(t, h, publicID, token, deletionToken), "delete")
 		})
 	}
 }
@@ -235,7 +150,7 @@ func TestSecretMetadata_UploadingSecretIsNotFound(t *testing.T) {
 	repo.secrets[publicID].CreatedAt = nil
 
 	// Until the upload completes, the secret does not exist for anybody.
-	assertNothingTold(t, getMetadata(t, h, publicID, token))
+	assertNothingTold(t, getMetadata(t, h, publicID, token), "metadata")
 }
 
 func TestSecretMetadata_ReusableSecretTellsWhetherARecipientOpenedIt(t *testing.T) {

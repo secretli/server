@@ -204,9 +204,10 @@ func (h *SecretHandler) DeleteSecret(c echo.Context) error {
 		return apperrors.ForbiddenError("invalid deletion token")
 	}
 
-	// Deleting ends the secret at once and dooms its object: from now on
-	// nothing reads it, and the cleanup removes the object within a cycle. If
-	// the secret expired since it was read above, it is over either way.
+	// Deleting removes the secret at once and dooms its object: from now on
+	// nothing reads it, its link gets 404 like any other, and the cleanup
+	// removes the object within a cycle. If the secret expired or was opened
+	// since it was read above, it is over either way.
 	if err := h.repo.Delete(ctx, secret.PublicID, time.Now()); err != nil && !errors.Is(err, domain.ErrNotFound) {
 		return apperrors.InternalError("failed to delete secret", err)
 	}
@@ -242,29 +243,16 @@ func (h *SecretHandler) authenticateMetadata(c echo.Context) (*domain.Secret, er
 		return nil, apperrors.InternalError("failed to get secret", err)
 	}
 
-	switch {
-	case secret.Readable(now):
-		if !crypto.TokensEqual(tokenHash, secret.MetadataTokenHash) {
-			return nil, apperrors.ForbiddenError("invalid token")
-		}
-		return secret, nil
-	case secret.Ended(now) && crypto.TokensEqual(tokenHash, secret.MetadataTokenHash):
-		// Until the secret expires, its link is told how it ended.
-		return nil, apperrors.GoneError("secret is gone", goneDetails(secret))
-	default:
-		// An upload under way, a secret past its expiry, or the wrong token
-		// for an ended one: there is nothing to tell.
+	// An upload under way, a secret past its expiry, or an opened one-time
+	// secret whose last download is still running: there is nothing to tell,
+	// the same as for a secret that was deleted or never existed.
+	if !secret.Readable(now) {
 		return nil, apperrors.NotFoundError("secret not found")
 	}
-}
-
-// goneDetails is what a link is told about a secret that has ended: how, and
-// nothing else.
-func goneDetails(secret *domain.Secret) map[string]any {
-	return map[string]any{
-		"outcome":         string(secret.Outcome),
-		"burn_after_read": secret.BurnAfterRead,
+	if !crypto.TokensEqual(tokenHash, secret.MetadataTokenHash) {
+		return nil, apperrors.ForbiddenError("invalid token")
 	}
+	return secret, nil
 }
 
 var expirationDurations = map[string]time.Duration{

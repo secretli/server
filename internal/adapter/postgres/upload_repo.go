@@ -12,7 +12,7 @@ import (
 	"github.com/secretli/server/internal/domain"
 )
 
-func (r *SecretRepo) StartUpload(ctx context.Context, secret *domain.Secret, upload *domain.Upload, now time.Time) error {
+func (r *SecretRepo) StartUpload(ctx context.Context, secret *domain.Secret, upload *domain.Upload) error {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("begin start upload tx: %w", err)
@@ -34,16 +34,13 @@ func (r *SecretRepo) StartUpload(ctx context.Context, secret *domain.Secret, upl
 	}
 
 	// The object is known before anything is written under its key.
-	if err := qtx.CreateObject(ctx, dbsqlc.CreateObjectParams{
-		StorageKey: secret.StorageKey,
-		CreatedAt:  timestamptz(now),
-	}); err != nil {
+	if err := qtx.CreateObject(ctx, secret.StorageKey); err != nil {
 		return fmt.Errorf("insert object: %w", err)
 	}
 	err = qtx.CreateSecret(ctx, dbsqlc.CreateSecretParams{
 		PublicID:          secret.PublicID,
-		StorageKey:        text(secret.StorageKey),
-		MetadataTokenHash: secret.MetadataTokenHash,
+		StorageKey:        secret.StorageKey,
+		MetadataTokenHash: text(secret.MetadataTokenHash),
 		BlobTokenHash:     text(secret.BlobTokenHash),
 		DeletionTokenHash: text(secret.DeletionTokenHash),
 		EncryptedMeta:     text(secret.EncryptedMeta),
@@ -62,6 +59,7 @@ func (r *SecretRepo) StartUpload(ctx context.Context, secret *domain.Secret, upl
 		PublicID:        text(secret.PublicID),
 		UploadTokenHash: upload.UploadTokenHash,
 		ExpiresAt:       timestamptz(upload.ExpiresAt),
+		Lifetime:        interval(upload.Lifetime),
 	}); err != nil {
 		return fmt.Errorf("insert upload: %w", err)
 	}
@@ -178,6 +176,10 @@ func (r *SecretRepo) CompleteUpload(ctx context.Context, sessionID string, now t
 	default:
 		return nil, domain.ErrConflict
 	}
+	// Without its lifetime the secret would expire within a minute.
+	if upload.Lifetime <= 0 {
+		return nil, fmt.Errorf("complete upload %q: it has no lifetime", sessionID)
+	}
 
 	// Read the parts under the lock: the caller's earlier read may predate a
 	// concurrent part upload or reset.
@@ -189,9 +191,13 @@ func (r *SecretRepo) CompleteUpload(ctx context.Context, sessionID string, now t
 		return nil, err
 	}
 
+	// The lifetime counts from now: however long the upload took, the secret
+	// lives as long as chosen, and the times kept do not tell how long that was.
+	createdAt, expiresAt := domain.SecretTimes(now, upload.Lifetime)
 	n, err := qtx.MakeSecretLive(ctx, dbsqlc.MakeSecretLiveParams{
-		NowAt:    timestamptz(now),
-		PublicID: upload.PublicID,
+		CreatedAt: timestamptz(createdAt),
+		ExpiresAt: timestamptz(expiresAt),
+		PublicID:  upload.PublicID,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("make secret live: %w", err)
@@ -202,9 +208,10 @@ func (r *SecretRepo) CompleteUpload(ctx context.Context, sessionID string, now t
 	if err := qtx.MarkObjectStored(ctx, upload.StorageKey); err != nil {
 		return nil, fmt.Errorf("mark object stored: %w", err)
 	}
+	finishedAt := domain.KeptTime(now)
 	if err := qtx.MarkUploadCompleted(ctx, dbsqlc.MarkUploadCompletedParams{
-		NowAt:     timestamptz(now),
-		SessionID: sessionID,
+		FinishedAt: timestamptz(finishedAt),
+		SessionID:  sessionID,
 	}); err != nil {
 		return nil, fmt.Errorf("mark upload completed: %w", err)
 	}
@@ -217,7 +224,9 @@ func (r *SecretRepo) CompleteUpload(ctx context.Context, sessionID string, now t
 	}
 
 	upload.State = domain.UploadCompleted
-	upload.FinishedAt = &now
+	upload.FinishedAt = &finishedAt
+	upload.Lifetime = 0
+	upload.SecretExpiresAt = expiresAt
 	return upload, nil
 }
 
@@ -259,7 +268,7 @@ func (r *SecretRepo) AbortUpload(ctx context.Context, sessionID string, now time
 // lack.
 func abandonUploads(ctx context.Context, qtx *dbsqlc.Queries, sessionIDs []string, now time.Time) error {
 	publicIDs, err := qtx.MarkUploadsAbandoned(ctx, dbsqlc.MarkUploadsAbandonedParams{
-		NowAt:      timestamptz(now),
+		FinishedAt: timestamptz(domain.KeptTime(now)),
 		SessionIds: sessionIDs,
 	})
 	if err != nil {
@@ -269,7 +278,7 @@ func abandonUploads(ctx context.Context, qtx *dbsqlc.Queries, sessionIDs []strin
 	if err != nil {
 		return fmt.Errorf("delete abandoned uploads' secrets: %w", err)
 	}
-	if err := qtx.DoomObjects(ctx, validTexts(storageKeys)); err != nil {
+	if err := qtx.DoomObjects(ctx, storageKeys); err != nil {
 		return fmt.Errorf("doom abandoned uploads' objects: %w", err)
 	}
 	return nil
@@ -283,6 +292,7 @@ func uploadFromRow(row dbsqlc.GetUploadRow) *domain.Upload {
 		State:           domain.UploadState(row.State),
 		ExpiresAt:       row.ExpiresAt.Time,
 		FinishedAt:      pointerFromTimestamp(row.FinishedAt),
+		Lifetime:        durationFromInterval(row.Lifetime),
 		StorageKey:      row.StorageKey.String,
 		S3UploadID:      row.S3UploadID.String,
 		BlobSize:        row.BlobSize.Int64,

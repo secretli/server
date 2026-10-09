@@ -25,21 +25,15 @@ func (q *Queries) CountFailedRemovals(ctx context.Context, storageKeys []string)
 const createObject = `-- name: CreateObject :exec
 INSERT INTO objects (
     storage_key,
-    state,
-    created_at
+    state
 )
 VALUES (
-    $1, 'writing', $2
+    $1, 'writing'
 )
 `
 
-type CreateObjectParams struct {
-	StorageKey string
-	CreatedAt  pgtype.Timestamptz
-}
-
-func (q *Queries) CreateObject(ctx context.Context, arg CreateObjectParams) error {
-	_, err := q.db.Exec(ctx, createObject, arg.StorageKey, arg.CreatedAt)
+func (q *Queries) CreateObject(ctx context.Context, storageKey string) error {
+	_, err := q.db.Exec(ctx, createObject, storageKey)
 	return err
 }
 
@@ -68,7 +62,7 @@ func (q *Queries) DoomObjects(ctx context.Context, storageKeys []string) error {
 }
 
 const listDoomedObjectsForUpdate = `-- name: ListDoomedObjectsForUpdate :many
-SELECT o.storage_key, o.state, o.s3_upload_id, o.created_at, o.doomed, o.failed_removals
+SELECT o.storage_key, o.state, o.s3_upload_id, o.doomed, o.failed_removals
 FROM objects AS o
 WHERE o.doomed
   AND NOT EXISTS (
@@ -76,15 +70,15 @@ WHERE o.doomed
       FROM secrets AS s
       WHERE s.storage_key = o.storage_key
   )
-ORDER BY o.failed_removals, o.created_at
+ORDER BY o.failed_removals, o.storage_key
 LIMIT $1
 FOR UPDATE OF o SKIP LOCKED
 `
 
-// Doomed objects, one batch at a time: the fewest failed removals first,
-// then the oldest, so objects that storage keeps refusing sink behind the
-// rest. One a secret still points at would be a bug; it is left alone rather
-// than deleted from under the secret.
+// Doomed objects, one batch at a time: the fewest failed removals first, so
+// objects that storage keeps refusing sink behind the rest, then by key, an
+// order that needs no time. One a secret still points at would be a bug; it
+// is left alone rather than deleted from under the secret.
 func (q *Queries) ListDoomedObjectsForUpdate(ctx context.Context, batchSize int32) ([]Object, error) {
 	rows, err := q.db.Query(ctx, listDoomedObjectsForUpdate, batchSize)
 	if err != nil {
@@ -98,7 +92,6 @@ func (q *Queries) ListDoomedObjectsForUpdate(ctx context.Context, batchSize int3
 			&i.StorageKey,
 			&i.State,
 			&i.S3UploadID,
-			&i.CreatedAt,
 			&i.Doomed,
 			&i.FailedRemovals,
 		); err != nil {
