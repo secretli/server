@@ -41,7 +41,7 @@ services:
       retries: 30
 
   seaweedfs:
-    image: chrislusf/seaweedfs:4.21
+    image: chrislusf/seaweedfs:4.48
     ports:
       - "8333:8333"
     environment:
