@@ -4,10 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/secretli/server/internal/adapter/metrics"
@@ -17,7 +18,7 @@ import (
 
 type App struct {
 	echo           *echo.Echo
-	addr           string
+	server         *http.Server
 	pool           *pgxpool.Pool
 	secretRepo     domain.Repo
 	fileStore      domain.MultipartFileStore
@@ -37,22 +38,28 @@ func New(cfg config.Config, version string, pool *pgxpool.Pool, secretRepo domai
 		return nil, fmt.Errorf("configure trusted proxies: %w", err)
 	}
 
-	e := echo.New()
-	e.HideBanner = true
-	e.HidePort = true
-	e.HTTPErrorHandler = httpErrorHandler
-	// Never trust client-supplied X-Forwarded-For unless a proxy is configured;
-	// the rate limiters key on the client IP.
-	e.IPExtractor = ipExtractor
-
-	e.Server.ReadHeaderTimeout = 10 * time.Second
-	e.Server.ReadTimeout = 30 * time.Minute
-	e.Server.WriteTimeout = 30 * time.Minute
-	e.Server.IdleTimeout = 120 * time.Second
+	e := echo.NewWithConfig(echo.Config{
+		// Echo's own messages go through the correlated application logger.
+		Logger:           slog.Default(),
+		HTTPErrorHandler: httpErrorHandler,
+		// Never trust client-supplied X-Forwarded-For unless a proxy is
+		// configured; the rate limiters key on the client IP.
+		IPExtractor: ipExtractor,
+	})
 
 	a := &App{
-		echo:           e,
-		addr:           fmt.Sprintf(":%s", cfg.Port),
+		echo: e,
+		// Echo v5 leaves the server to the caller, so the app keeps its own
+		// with the timeouts it always had.
+		server: &http.Server{
+			Addr:              fmt.Sprintf(":%s", cfg.Port),
+			Handler:           e,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Minute,
+			WriteTimeout:      30 * time.Minute,
+			IdleTimeout:       120 * time.Second,
+			ErrorLog:          slog.NewLogLogger(slog.Default().Handler(), slog.LevelError),
+		},
 		pool:           pool,
 		secretRepo:     secretRepo,
 		fileStore:      fileStore,
@@ -66,15 +73,20 @@ func New(cfg config.Config, version string, pool *pgxpool.Pool, secretRepo domai
 		slog.Warn("rate limits are raised for testing; production must not set RATE_LIMIT_MULTIPLIER",
 			"multiplier", cfg.RateLimitMultiplier)
 	}
-	a.SecretMetrics = a.registerRoutes()
+	secretMetrics, err := a.registerRoutes()
+	if err != nil {
+		return nil, err
+	}
+	a.SecretMetrics = secretMetrics
 
 	return a, nil
 }
 
+// Start serves until Shutdown, then returns http.ErrServerClosed.
 func (a *App) Start() error {
-	return a.echo.Start(a.addr)
+	return a.server.ListenAndServe()
 }
 
 func (a *App) Shutdown(ctx context.Context) error {
-	return a.echo.Shutdown(ctx)
+	return a.server.Shutdown(ctx)
 }

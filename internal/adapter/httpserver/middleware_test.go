@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 
 	apperrors "github.com/secretli/server/internal/platform/errors"
 )
@@ -23,7 +23,7 @@ func TestHTTPErrorHandler(t *testing.T) {
 		rec := httptest.NewRecorder()
 		c := e.NewContext(req, rec)
 
-		httpErrorHandler(apperrors.BadRequestError("test error"), c)
+		httpErrorHandler(c, apperrors.BadRequestError("test error"))
 
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadRequest)
@@ -45,7 +45,7 @@ func TestHTTPErrorHandler(t *testing.T) {
 		rec := httptest.NewRecorder()
 		c := e.NewContext(req, rec)
 
-		httpErrorHandler(errors.New("boom"), c)
+		httpErrorHandler(c, errors.New("boom"))
 
 		if rec.Code != http.StatusInternalServerError {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
@@ -59,7 +59,7 @@ func TestHTTPErrorHandler(t *testing.T) {
 		rec := httptest.NewRecorder()
 		c := e.NewContext(req, rec)
 
-		httpErrorHandler(echo.ErrStatusRequestEntityTooLarge, c)
+		httpErrorHandler(c, echo.ErrStatusRequestEntityTooLarge)
 
 		if rec.Code != http.StatusRequestEntityTooLarge {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
@@ -80,7 +80,7 @@ func TestHTTPErrorHandler(t *testing.T) {
 		rec := httptest.NewRecorder()
 		c := e.NewContext(req, rec)
 
-		httpErrorHandler(echo.NewHTTPError(http.StatusBadGateway, "upstream detail"), c)
+		httpErrorHandler(c, echo.NewHTTPError(http.StatusBadGateway, "upstream detail"))
 
 		if rec.Code != http.StatusBadGateway {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadGateway)
@@ -104,7 +104,7 @@ func TestHTTPErrorHandler(t *testing.T) {
 		// Commit the response by writing a status
 		c.NoContent(http.StatusOK)
 
-		httpErrorHandler(apperrors.BadRequestError("should not appear"), c)
+		httpErrorHandler(c, apperrors.BadRequestError("should not appear"))
 
 		// Status should remain 200, not be changed to 400
 		if rec.Code != http.StatusOK {
@@ -194,35 +194,111 @@ func TestNewIPExtractor(t *testing.T) {
 		name           string
 		trustedProxies string
 		remoteAddr     string
-		xff            string
+		xff            []string
+		realIP         string
 		want           string
 	}{
 		{
 			name:       "no proxies ignores forwarded header",
 			remoteAddr: "203.0.113.7:4321",
-			xff:        "198.51.100.99",
+			xff:        []string{"198.51.100.99"},
 			want:       "203.0.113.7",
+		},
+		{
+			name:       "no proxies ignores real ip header",
+			remoteAddr: "203.0.113.7:4321",
+			realIP:     "198.51.100.99",
+			want:       "203.0.113.7",
+		},
+		{
+			name:       "no proxies trusts no private peer's header either",
+			remoteAddr: "10.1.2.3:4321",
+			xff:        []string{"198.51.100.99"},
+			want:       "10.1.2.3",
 		},
 		{
 			name:           "trusted proxy resolves client from forwarded header",
 			trustedProxies: "10.0.0.0/8",
 			remoteAddr:     "10.1.2.3:4321",
-			xff:            "198.51.100.99",
+			xff:            []string{"198.51.100.99"},
 			want:           "198.51.100.99",
+		},
+		{
+			name:           "trusted proxy without forwarded header is the client",
+			trustedProxies: "10.0.0.0/8",
+			remoteAddr:     "10.1.2.3:4321",
+			want:           "10.1.2.3",
 		},
 		{
 			name:           "untrusted peer cannot spoof through forwarded header",
 			trustedProxies: "10.0.0.0/8",
 			remoteAddr:     "203.0.113.7:4321",
-			xff:            "198.51.100.99",
+			xff:            []string{"198.51.100.99"},
 			want:           "203.0.113.7",
+		},
+		{
+			name:           "untrusted peer cannot spoof through real ip header",
+			trustedProxies: "10.0.0.0/8",
+			remoteAddr:     "203.0.113.7:4321",
+			realIP:         "10.9.9.9",
+			want:           "203.0.113.7",
+		},
+		{
+			name:           "untrusted peer cannot spoof with both headers",
+			trustedProxies: "10.0.0.0/8",
+			remoteAddr:     "203.0.113.7:4321",
+			xff:            []string{"10.9.9.9, 198.51.100.99"},
+			realIP:         "198.51.100.99",
+			want:           "203.0.113.7",
+		},
+		{
+			name:           "trusted proxy does not read the real ip header",
+			trustedProxies: "10.0.0.0/8",
+			remoteAddr:     "10.1.2.3:4321",
+			realIP:         "198.51.100.99",
+			want:           "10.1.2.3",
+		},
+		{
+			name:           "trust is only what is configured, not every private network",
+			trustedProxies: "10.42.0.0/16",
+			remoteAddr:     "192.168.1.5:4321",
+			xff:            []string{"198.51.100.99"},
+			want:           "192.168.1.5",
 		},
 		{
 			name:           "forwarded chain stops at first untrusted hop",
 			trustedProxies: "10.0.0.0/8",
 			remoteAddr:     "10.1.2.3:4321",
-			xff:            "1.2.3.4, 198.51.100.99, 10.9.9.9",
+			xff:            []string{"1.2.3.4, 198.51.100.99, 10.9.9.9"},
 			want:           "198.51.100.99",
+		},
+		{
+			name:           "forwarded hops over several header lines",
+			trustedProxies: "10.0.0.0/8",
+			remoteAddr:     "10.1.2.3:4321",
+			xff:            []string{"1.2.3.4", "198.51.100.99", "10.9.9.9"},
+			want:           "198.51.100.99",
+		},
+		{
+			name:           "forwarded chain of trusted hops resolves to the furthest",
+			trustedProxies: "10.0.0.0/8",
+			remoteAddr:     "10.1.2.3:4321",
+			xff:            []string{"10.5.5.5, 10.9.9.9"},
+			want:           "10.5.5.5",
+		},
+		{
+			name:           "unparsable hop falls back to the peer",
+			trustedProxies: "10.0.0.0/8",
+			remoteAddr:     "10.1.2.3:4321",
+			xff:            []string{"198.51.100.99, not-an-ip"},
+			want:           "10.1.2.3",
+		},
+		{
+			name:           "ipv6 client through a trusted proxy",
+			trustedProxies: "10.0.0.0/8",
+			remoteAddr:     "10.1.2.3:4321",
+			xff:            []string{"[2001:db8::1]"},
+			want:           "2001:db8::1",
 		},
 	}
 
@@ -234,8 +310,11 @@ func TestNewIPExtractor(t *testing.T) {
 			}
 			req := httptest.NewRequest(http.MethodGet, "/", nil)
 			req.RemoteAddr = tt.remoteAddr
-			if tt.xff != "" {
-				req.Header.Set(echo.HeaderXForwardedFor, tt.xff)
+			for _, hop := range tt.xff {
+				req.Header.Add(echo.HeaderXForwardedFor, hop)
+			}
+			if tt.realIP != "" {
+				req.Header.Set(echo.HeaderXRealIP, tt.realIP)
 			}
 			if got := extractor(req); got != tt.want {
 				t.Errorf("extracted IP = %q, want %q", got, tt.want)
@@ -270,7 +349,7 @@ func TestMetricsAuth(t *testing.T) {
 			rec := httptest.NewRecorder()
 			c := e.NewContext(req, rec)
 
-			handler := metricsAuth("metrics-secret")(func(c echo.Context) error {
+			handler := metricsAuth("metrics-secret")(func(c *echo.Context) error {
 				return c.NoContent(http.StatusOK)
 			})
 
@@ -290,7 +369,7 @@ func TestMetricsAuth(t *testing.T) {
 func TestSecurityHeadersKeepEverythingFirstParty(t *testing.T) {
 	e := echo.New()
 	e.Use(securityHeaders())
-	e.GET("/", func(c echo.Context) error { return c.NoContent(http.StatusOK) })
+	e.GET("/", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 
@@ -320,7 +399,7 @@ func TestSecurityHeadersKeepEverythingFirstParty(t *testing.T) {
 func TestSecurityHeadersLimitCameraToThisOrigin(t *testing.T) {
 	e := echo.New()
 	e.Use(securityHeaders())
-	e.GET("/", func(c echo.Context) error { return c.NoContent(http.StatusOK) })
+	e.GET("/", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
 
@@ -333,7 +412,11 @@ func TestSecurityHeadersLimitCameraToThisOrigin(t *testing.T) {
 
 func TestCORSMiddlewareAllowsRangeAPIHeaders(t *testing.T) {
 	e := echo.New()
-	handler := corsMiddleware([]string{"https://app.example"})(func(c echo.Context) error {
+	cors, err := corsMiddleware([]string{"https://app.example"})
+	if err != nil {
+		t.Fatalf("corsMiddleware: %v", err)
+	}
+	handler := cors(func(c *echo.Context) error {
 		c.Response().Header().Set("Content-Range", "bytes 0-1/10")
 		return c.NoContent(http.StatusPartialContent)
 	})
@@ -404,12 +487,12 @@ func TestRequestLoggerKeepsErrorLevelForServerFaults(t *testing.T) {
 	e := echo.New()
 	e.HTTPErrorHandler = httpErrorHandler
 	e.Use(requestLogger())
-	e.GET("/ok", func(c echo.Context) error { return c.NoContent(http.StatusOK) })
-	e.GET("/gone", func(echo.Context) error {
+	e.GET("/ok", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
+	e.GET("/gone", func(*echo.Context) error {
 		return apperrors.GoneError("transfer has ended", map[string]any{"reason": "cancelled"})
 	})
-	e.GET("/conflict", func(echo.Context) error { return apperrors.ConflictError("transfer already claimed") })
-	e.GET("/broken", func(echo.Context) error { return apperrors.InternalError("failed", errors.New("db down")) })
+	e.GET("/conflict", func(*echo.Context) error { return apperrors.ConflictError("transfer already claimed") })
+	e.GET("/broken", func(*echo.Context) error { return apperrors.InternalError("failed", errors.New("db down")) })
 
 	want := map[string]struct {
 		level    string
@@ -458,7 +541,7 @@ func TestRequestLoggerNamesTheRouteNotThePath(t *testing.T) {
 	e := echo.New()
 	e.HTTPErrorHandler = httpErrorHandler
 	e.Use(requestLogger())
-	e.GET("/api/v1/secrets/:publicID/meta", func(c echo.Context) error { return c.NoContent(http.StatusOK) })
+	e.GET("/api/v1/secrets/:publicID/meta", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
 	publicID := testPublicID("logged route")
 
 	tests := []struct {

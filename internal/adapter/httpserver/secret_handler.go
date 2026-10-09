@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 
 	"github.com/secretli/server/internal/domain"
 	"github.com/secretli/server/internal/platform/crypto"
@@ -44,7 +44,7 @@ func NewSecretHandler(repo domain.SecretRepo, fileStore domain.FileStore) *Secre
 	return &SecretHandler{repo: repo, fileStore: fileStore}
 }
 
-func (h *SecretHandler) StartRetrievalSession(c echo.Context) error {
+func (h *SecretHandler) StartRetrievalSession(c *echo.Context) error {
 	publicID := c.Param("publicID")
 	if publicID == "" {
 		return apperrors.BadRequestError("missing public_id")
@@ -105,7 +105,7 @@ func (h *SecretHandler) StartRetrievalSession(c echo.Context) error {
 	})
 }
 
-func (h *SecretHandler) RetrieveSecretRange(c echo.Context) error {
+func (h *SecretHandler) RetrieveSecretRange(c *echo.Context) error {
 	publicID := c.Param("publicID")
 	if publicID == "" {
 		return apperrors.BadRequestError("missing public_id")
@@ -167,7 +167,7 @@ func (h *SecretHandler) RetrieveSecretRange(c echo.Context) error {
 	return nil
 }
 
-func (h *SecretHandler) SecretMetadata(c echo.Context) error {
+func (h *SecretHandler) SecretMetadata(c *echo.Context) error {
 	secret, err := h.authenticateMetadata(c)
 	if err != nil {
 		return err
@@ -183,7 +183,7 @@ func (h *SecretHandler) SecretMetadata(c echo.Context) error {
 	})
 }
 
-func (h *SecretHandler) DeleteSecret(c echo.Context) error {
+func (h *SecretHandler) DeleteSecret(c *echo.Context) error {
 	secret, err := h.authenticateMetadata(c)
 	if err != nil {
 		return err
@@ -215,7 +215,7 @@ func (h *SecretHandler) DeleteSecret(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-func (h *SecretHandler) authenticateMetadata(c echo.Context) (*domain.Secret, error) {
+func (h *SecretHandler) authenticateMetadata(c *echo.Context) (*domain.Secret, error) {
 	publicID := c.Param("publicID")
 	if publicID == "" {
 		return nil, apperrors.BadRequestError("missing public_id")

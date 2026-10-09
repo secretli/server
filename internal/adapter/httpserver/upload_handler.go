@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"github.com/go-playground/validator/v10"
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 
 	"github.com/secretli/server/internal/adapter/metrics"
 	"github.com/secretli/server/internal/domain"
@@ -68,7 +68,7 @@ func NewUploadHandler(repo domain.UploadRepo, fileStore domain.MultipartFileStor
 	}
 }
 
-func (h *UploadHandler) CreateUploadSession(c echo.Context) error {
+func (h *UploadHandler) CreateUploadSession(c *echo.Context) error {
 	var req createUploadSessionRequest
 	if err := c.Bind(&req); err != nil {
 		return apperrors.BadRequestError("invalid request body")
@@ -158,7 +158,7 @@ func (h *UploadHandler) CreateUploadSession(c echo.Context) error {
 	return c.JSON(http.StatusCreated, uploadSessionResponse(upload, uploadToken))
 }
 
-func (h *UploadHandler) UploadPart(c echo.Context) error {
+func (h *UploadHandler) UploadPart(c *echo.Context) error {
 	upload, parts, _, err := h.authenticateUploadSession(c)
 	if err != nil {
 		return err
@@ -239,7 +239,7 @@ func (h *UploadHandler) UploadPart(c echo.Context) error {
 	return c.JSON(http.StatusOK, uploadPartResponse(*recorded))
 }
 
-func (h *UploadHandler) CompleteUploadSession(c echo.Context) error {
+func (h *UploadHandler) CompleteUploadSession(c *echo.Context) error {
 	upload, _, _, err := h.authenticateUploadSession(c)
 	if err != nil {
 		return err
@@ -326,7 +326,7 @@ func (h *UploadHandler) abandon(ctx context.Context, sessionID string) {
 	}
 }
 
-func (h *UploadHandler) AbortUploadSession(c echo.Context) error {
+func (h *UploadHandler) AbortUploadSession(c *echo.Context) error {
 	upload, _, _, err := h.authenticateUploadSession(c)
 	if err != nil {
 		return err
@@ -346,7 +346,7 @@ func (h *UploadHandler) AbortUploadSession(c echo.Context) error {
 	return c.NoContent(http.StatusNoContent)
 }
 
-func (h *UploadHandler) authenticateUploadSession(c echo.Context) (*domain.Upload, []domain.UploadPart, string, error) {
+func (h *UploadHandler) authenticateUploadSession(c *echo.Context) (*domain.Upload, []domain.UploadPart, string, error) {
 	sessionID := c.Param("sessionID")
 	if sessionID == "" {
 		return nil, nil, "", apperrors.BadRequestError("missing session_id")
@@ -507,7 +507,7 @@ func parseInt64Header(r *http.Request, header string) (int64, error) {
 	return parsed, nil
 }
 
-func spoolValidatedPart(c echo.Context, expectedSize int64, expectedSHA256 string) (*os.File, func(), error) {
+func spoolValidatedPart(c *echo.Context, expectedSize int64, expectedSHA256 string) (*os.File, func(), error) {
 	partFile, err := os.CreateTemp("", "secretli-upload-part-*")
 	if err != nil {
 		return nil, nil, apperrors.InternalError("failed to create temporary upload part", err)

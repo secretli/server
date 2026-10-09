@@ -1,20 +1,22 @@
 package httpserver
 
 import (
+	"fmt"
 	"time"
 
-	"github.com/labstack/echo/v4"
-	"github.com/labstack/echo/v4/middleware"
+	"github.com/labstack/echo/v5"
+	"github.com/labstack/echo/v5/middleware"
 
 	"github.com/secretli/server/internal/adapter/metrics"
 )
 
 // smallRequestBodyLimit bounds JSON and header-only API requests so a client
 // cannot make the server buffer an arbitrarily large body before validation.
-// Blob and part uploads enforce their own size limits.
-const smallRequestBodyLimit = "64K"
+// Blob and part uploads enforce their own size limits. It is the 64 kB
+// (decimal) that Echo v4 read from "64K".
+const smallRequestBodyLimit = 64_000
 
-func (a *App) registerRoutes() *metrics.SecretMetrics {
+func (a *App) registerRoutes() (*metrics.SecretMetrics, error) {
 	e := a.echo
 	httpMetrics := metrics.NewHTTPMetrics(a.reg)
 	secretMetrics := metrics.NewSecretMetrics(a.reg)
@@ -28,7 +30,11 @@ func (a *App) registerRoutes() *metrics.SecretMetrics {
 	e.Use(securityHeaders())
 
 	if origins := parseOrigins(a.cfg.AllowedOrigins); len(origins) > 0 {
-		e.Use(corsMiddleware(origins))
+		cors, err := corsMiddleware(origins)
+		if err != nil {
+			return nil, fmt.Errorf("configure allowed origins: %w", err)
+		}
+		e.Use(cors)
 	}
 
 	// Metrics
@@ -122,5 +128,5 @@ func (a *App) registerRoutes() *metrics.SecretMetrics {
 	uploadPartGroup.Use(a.limited(600, time.Minute))
 	uploadPartGroup.PUT("/:sessionID/parts/:partNumber", uh.UploadPart)
 
-	return secretMetrics
+	return secretMetrics, nil
 }

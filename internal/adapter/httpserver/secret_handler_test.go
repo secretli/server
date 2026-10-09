@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/secretli/server/internal/adapter/metrics"
 	"github.com/secretli/server/internal/domain"
@@ -26,15 +26,15 @@ func testMetrics() *metrics.SecretMetrics {
 	return metrics.NewSecretMetrics(prometheus.NewRegistry())
 }
 
-func newEchoContext(req *http.Request, rec *httptest.ResponseRecorder) echo.Context {
+func newEchoContext(req *http.Request, rec *httptest.ResponseRecorder) *echo.Context {
 	e := echo.New()
 	e.HTTPErrorHandler = httpErrorHandler
 	return e.NewContext(req, rec)
 }
 
-func callHandler(c echo.Context, handler echo.HandlerFunc) {
+func callHandler(c *echo.Context, handler echo.HandlerFunc) {
 	if err := handler(c); err != nil {
-		c.Echo().HTTPErrorHandler(err, c)
+		c.Echo().HTTPErrorHandler(c, err)
 	}
 }
 
@@ -189,8 +189,7 @@ func startTestRetrievalSession(t *testing.T, h *SecretHandler, publicID, blobTok
 	req.Header.Set(HeaderBlobToken, blobToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.StartRetrievalSession)
 
@@ -265,8 +264,7 @@ func TestStartRetrievalSession_Success(t *testing.T) {
 	req.Header.Set(HeaderBlobToken, blobToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.StartRetrievalSession)
 
@@ -305,8 +303,7 @@ func TestStartRetrievalSession_InvalidBlobToken(t *testing.T) {
 	req.Header.Set(HeaderBlobToken, testToken("wrong session blob"))
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.StartRetrievalSession)
 
@@ -331,8 +328,7 @@ func TestStartRetrievalSession_BurnAfterReadClaimsOnce(t *testing.T) {
 	req.Header.Set(HeaderBlobToken, blobToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.StartRetrievalSession)
 
@@ -350,8 +346,7 @@ func TestStartRetrievalSession_BurnAfterReadClaimsOnce(t *testing.T) {
 	req.Header.Set(HeaderBlobToken, blobToken)
 	rec = httptest.NewRecorder()
 	c = newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.StartRetrievalSession)
 
@@ -375,8 +370,7 @@ func TestRetrieveSecretRange_Success(t *testing.T) {
 	req.Header.Set("Range", "bytes=3-8")
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.RetrieveSecretRange)
 
@@ -411,8 +405,7 @@ func TestRetrieveSecretRange_InvalidSession(t *testing.T) {
 	req.Header.Set("Range", "bytes=0-1")
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.RetrieveSecretRange)
 
@@ -440,8 +433,7 @@ func TestRetrieveSecretRange_ExpiredSession(t *testing.T) {
 	req.Header.Set("Range", "bytes=0-1")
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.RetrieveSecretRange)
 
@@ -457,8 +449,7 @@ func rangeRequest(h *SecretHandler, publicID, sessionToken string) *httptest.Res
 	req.Header.Set("Range", "bytes=0-1")
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 	callHandler(c, h.RetrieveSecretRange)
 	return rec
 }
@@ -558,8 +549,7 @@ func TestRetrieveSecretRange_AuthorizationValidation(t *testing.T) {
 			req.Header.Set("Range", "bytes=0-1")
 			rec := httptest.NewRecorder()
 			c := newEchoContext(req, rec)
-			c.SetParamNames("publicID")
-			c.SetParamValues(publicID)
+			c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 			callHandler(c, h.RetrieveSecretRange)
 
@@ -609,8 +599,7 @@ func TestRetrieveSecretRange_RangeValidation(t *testing.T) {
 			req.Header.Set("Range", tt.rangeValue)
 			rec := httptest.NewRecorder()
 			c := newEchoContext(req, rec)
-			c.SetParamNames("publicID")
-			c.SetParamValues(publicID)
+			c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 			callHandler(c, h.RetrieveSecretRange)
 
@@ -637,8 +626,7 @@ func TestSecretMetadata_Success(t *testing.T) {
 	req.Header.Set(HeaderMetadataToken, metadataToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.SecretMetadata)
 
@@ -678,8 +666,7 @@ func TestSecretMetadata_BurnAfterRead_AlreadyRetrieved(t *testing.T) {
 	req.Header.Set(HeaderMetadataToken, metadataToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.SecretMetadata)
 
@@ -706,8 +693,7 @@ func TestSecretMetadata_BlobTokenCannotFetchMetadata(t *testing.T) {
 	req.Header.Set(HeaderMetadataToken, blobToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.SecretMetadata)
 
@@ -775,8 +761,7 @@ func TestSecretHandlers_MalformedPublicID(t *testing.T) {
 			tt.setup(req)
 			rec := httptest.NewRecorder()
 			c := newEchoContext(req, rec)
-			c.SetParamNames("publicID")
-			c.SetParamValues(publicID)
+			c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 			callHandler(c, tt.handler(h))
 
@@ -858,8 +843,7 @@ func TestSecretHandlers_MalformedTokenHeaders(t *testing.T) {
 			tt.setup(repo, fs, publicID, req)
 			rec := httptest.NewRecorder()
 			c := newEchoContext(req, rec)
-			c.SetParamNames("publicID")
-			c.SetParamValues(publicID)
+			c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 			callHandler(c, tt.handler(h))
 
@@ -886,8 +870,7 @@ func TestDeleteSecret_Success(t *testing.T) {
 	req.Header.Set(HeaderDeletionToken, deletionToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.DeleteSecret)
 
@@ -928,8 +911,7 @@ func TestDeleteSecret_InvalidDeletionToken(t *testing.T) {
 	req.Header.Set(HeaderDeletionToken, testToken("wrong deletion"))
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.DeleteSecret)
 
@@ -951,8 +933,7 @@ func TestDeleteSecret_MissingDeletionToken(t *testing.T) {
 	req.Header.Set(HeaderMetadataToken, metadataToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.DeleteSecret)
 
@@ -972,8 +953,7 @@ func TestDeleteSecret_NotFound(t *testing.T) {
 	req.Header.Set(HeaderDeletionToken, testToken("delete deletion"))
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.DeleteSecret)
 
@@ -992,8 +972,7 @@ func TestDeleteSecret_MissingMetadataToken(t *testing.T) {
 	req.Header.Set(HeaderDeletionToken, testToken("delete deletion"))
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.DeleteSecret)
 
@@ -1034,8 +1013,7 @@ func TestDeleteSecret_InvalidMetadataToken(t *testing.T) {
 	req.Header.Set(HeaderDeletionToken, deletionToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.DeleteSecret)
 
@@ -1060,8 +1038,7 @@ func TestDeleteSecret_SecretThatEndedMeanwhileReturnsNoContent(t *testing.T) {
 	req.Header.Set(HeaderDeletionToken, deletionToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.DeleteSecret)
 
@@ -1101,8 +1078,7 @@ func TestDeleteSecret_DatabaseError(t *testing.T) {
 	req.Header.Set(HeaderDeletionToken, deletionToken)
 	rec := httptest.NewRecorder()
 	c := newEchoContext(req, rec)
-	c.SetParamNames("publicID")
-	c.SetParamValues(publicID)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
 
 	callHandler(c, h.DeleteSecret)
 
