@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v5"
 
 	"github.com/secretli/server/internal/domain"
 	"github.com/secretli/server/internal/platform/crypto"
