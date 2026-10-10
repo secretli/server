@@ -149,8 +149,8 @@ jobs:
           docker compose -f docker/docker-compose.yml down -v
 
   # The whole of Secretli with this change: the web app and both clients
-  # against this server, behind a gateway like production's, including the
-  # oldest client release the server supports. See secretli/e2e.
+  # against this server, behind a gateway like production's. See
+  # secretli/e2e.
   whole-setup:
     uses: secretli/e2e/.github/workflows/whole-setup.yml@main
     secrets: inherit
