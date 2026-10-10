@@ -87,9 +87,22 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # Registries limit anonymous pulls per address, and runners share
+      # theirs: a burst of jobs is turned down ("Rate exceeded" from ECR
+      # Public, "toomanyrequests" from Docker Hub) and passes a little later.
+      # Starting pulls the images, so starting is tried again.
       - name: Start Postgres and SeaweedFS
         run: |
-          docker compose -f docker/docker-compose.yml up -d postgres seaweedfs
+          retry() {
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              [ "$attempt" = 5 ] && break
+              echo "attempt $attempt failed, trying again in $((attempt * 10))s" >&2
+              sleep $((attempt * 10))
+            done
+            return 1
+          }
+          retry docker compose -f docker/docker-compose.yml up -d postgres seaweedfs
           for i in {1..60}; do
             if docker compose -f docker/docker-compose.yml exec -T postgres pg_isready -U secretli >/dev/null; then
               break
