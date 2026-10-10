@@ -27,7 +27,7 @@ The server cannot read what it stores. Keys are derived and used only by the cli
 | `POST /api/v1/secrets/{id}/retrieval-session` | open the secret for reading |
 | `GET /api/v1/secrets/{id}/blob` | read a byte range within a retrieval session |
 | `DELETE /api/v1/secrets/{id}` | delete, with the owner's deletion token |
-| `POST /api/v1/transfers`, `/claim`, `/{id}/answer`, `/{id}/delivery` | the short-code relay |
+| `POST /api/v1/transfers`, `/claim`; `POST` and `GET` `/{id}/answer`, `/{id}/delivery`; `DELETE /{id}` | the short-code relay: open and claim a transfer, write each leg once and wait for it up to 25 s, end it early |
 | `GET /api/v1/version` | the commit the server was built from |
 | `GET /api/v1/health/live`, `/api/v1/health/ready` | liveness and readiness |
 | `GET /metrics` | Prometheus metrics, optionally behind a bearer token |
@@ -117,7 +117,7 @@ make lint
 make vuln
 ```
 
-The API test (`apitest/`) checks a running server through its HTTP API alone, with no client and no format library: uploads in one and several parts, the upload rules, metadata, retrieval and byte ranges, one-time and reusable secrets, that a gone secret answers like one that never was, deletion, times kept to the minute, and the short-code relay. The server never decrypts anything, so random bytes stand in for ciphertext. It sends more requests than the rate limits allow from one address, so the server under test needs raised limits:
+The API test (`apitest/`) checks a running server through its HTTP API alone, with no client and no format library: uploads in one and several parts, the upload rules, metadata, retrieval and byte ranges, one-time and reusable secrets, that a gone secret answers like one that never was and its link cannot be reused, deletion, times kept to the minute, and the short-code relay. The server never decrypts anything, so random bytes stand in for ciphertext. It sends more requests than the rate limits allow from one address, so the server under test needs raised limits:
 
 ```bash
 make build && RATE_LIMIT_MULTIPLIER=100 ./bin/secretli   # with DATABASE_URL and S3_* set
@@ -126,7 +126,7 @@ SECRETLI_SERVER=http://localhost:8080 make api-test
 
 One test waits about six minutes for a secret to expire and runs only with `SECRETLI_SLOW_TESTS=1` set.
 
-CI runs the API test against a fresh server at every change. It also runs the whole of Secretli with the change, from [secretli/e2e](https://github.com/secretli/e2e): the web app and both clients against this server behind a gateway like production's, with the newest command-line client and the oldest one the server still supports (v0.3.0). Nothing is published unless both pass.
+CI runs the API test against a fresh server at every change. It also runs the whole of Secretli with the change, from [secretli/e2e](https://github.com/secretli/e2e): the web app and both clients against this server behind a gateway like production's. Only the latest command-line client is supported, so it runs with that one alone. Nothing is published unless both pass.
 
 Database queries are generated with [sqlc](https://sqlc.dev) from `internal/adapter/postgres/queries`; run `sqlc generate` after changing them or the migrations.
 
