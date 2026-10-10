@@ -2,9 +2,7 @@
 # the target; running the Go compiler under QEMU emulation for arm64 makes
 # the publish job many times slower for no benefit.
 
-# Docker's official images, as Docker publishes them on Amazon ECR Public:
-# the same images as on Docker Hub, without its pull limits.
-FROM --platform=$BUILDPLATFORM public.ecr.aws/docker/library/golang:1.27-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG VERSION=dev
 ARG TARGETOS
 ARG TARGETARCH
