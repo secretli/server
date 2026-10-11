@@ -20,6 +20,17 @@
         "\"(?<depName>chrislusf/seaweedfs|postgres):(?<currentValue>[^\"]+)\""
       ],
       "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "govulncheck, which CI runs with go run at a pinned version",
+      "managerFilePatterns": [
+        "/^\\.github/workflows/.+\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "go run (?<depName>golang\\.org/x/vuln)/cmd/govulncheck@(?<currentValue>v\\S+)"
+      ],
+      "datasourceTemplate": "go"
     }
   ],
   "packageRules": [

@@ -31,7 +31,7 @@ jobs:
           args: ./...
 
       - name: Vulnerabilities
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       # Zero knowledge means the server cannot hold a key, not merely that it
       # does not: the code that derives keys and decrypts must never be part
@@ -149,7 +149,9 @@ jobs:
   # secretli/e2e.
   whole-setup:
     uses: secretli/e2e/.github/workflows/whole-setup.yml@main
-    secrets: inherit
+    # Only what whole-setup uses, not every secret of this repository.
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
     with:
       server_ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
