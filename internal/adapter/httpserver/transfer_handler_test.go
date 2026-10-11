@@ -21,8 +21,9 @@ import (
 	"github.com/secretli/server/internal/platform/config"
 )
 
-// transferMockRepo mirrors the Postgres transfer semantics in memory: the
-// smallest free nameplate, one claim, legs written once in order.
+// transferMockRepo mirrors the Postgres transfer semantics in memory: a free
+// nameplate (the smallest, where Postgres draws one at random, so that the
+// tests here can predict it), one claim, legs written once in order.
 type transferMockRepo struct {
 	mu        sync.Mutex
 	transfers map[string]domain.Transfer
