@@ -49,7 +49,9 @@ type UploadHandler struct {
 	partSize int64
 	// budget limits the bytes one address may declare for new uploads; nil
 	// allows everything.
-	budget   *uploadBudget
+	budget *uploadBudget
+	// slots bounds the part bodies spooled at once; nil bounds nothing.
+	slots    *partSlots
 	metrics  *metrics.SecretMetrics
 	validate *validator.Validate
 }
@@ -184,6 +186,11 @@ func (h *UploadHandler) CreateUploadSession(c *echo.Context) error {
 }
 
 func (h *UploadHandler) UploadPart(c *echo.Context) error {
+	// Until the body is read, the answer closes the connection: the client
+	// may still be sending, and on a kept connection the rest of its body
+	// would be taken for the next request.
+	c.Response().Header().Set("Connection", "close")
+
 	upload, parts, _, err := h.authenticateUploadSession(c)
 	if err != nil {
 		return err
@@ -222,17 +229,30 @@ func (h *UploadHandler) UploadPart(c *echo.Context) error {
 		if existing.PartNumber != partNumber {
 			continue
 		}
+		// A part sent again, after a lost answer say: the answer doesn't
+		// need the body, but read it to the end, so that the client gets
+		// the answer rather than a reset connection.
+		drainPart(c, size)
 		if existing.Offset == offset && existing.Size == size && existing.SHA256 == partSHA256 {
 			return c.JSON(http.StatusOK, uploadPartResponse(existing))
 		}
 		return apperrors.ConflictError("part already uploaded with different content")
 	}
 
+	if h.slots != nil {
+		release, ok := h.slots.acquire(c, clientKey(c.RealIP()))
+		if !ok {
+			return nil
+		}
+		defer release()
+	}
+	setPartBodyDeadline(c)
 	partFile, cleanup, err := spoolValidatedPart(c, size, partSHA256)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
+	c.Response().Header().Del("Connection")
 
 	etag, err := h.fileStore.UploadPart(
 		c.Request().Context(),
@@ -570,6 +590,22 @@ func spoolValidatedPart(c *echo.Context, expectedSize int64, expectedSHA256 stri
 		return nil, nil, apperrors.InternalError("failed to prepare upload part", err)
 	}
 	return partFile, cleanup, nil
+}
+
+// setPartBodyDeadline gives the part's body partBodyTimeout to arrive from
+// now, rather than the server's read timeout for every request.
+func setPartBodyDeadline(c *echo.Context) {
+	_ = http.NewResponseController(c.Response()).SetReadDeadline(time.Now().Add(partBodyTimeout))
+}
+
+// drainPart reads and drops a part's body of size bytes. When it was all
+// there, the connection can stay open.
+func drainPart(c *echo.Context, size int64) {
+	setPartBodyDeadline(c)
+	n, err := io.Copy(io.Discard, io.LimitReader(c.Request().Body, size+1))
+	if err == nil && n == size {
+		c.Response().Header().Del("Connection")
+	}
 }
 
 func isSHA256Hex(value string) bool {

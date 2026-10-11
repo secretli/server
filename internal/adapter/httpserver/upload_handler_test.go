@@ -580,6 +580,48 @@ func TestUploadPart_IdempotentAndConflict(t *testing.T) {
 	}
 }
 
+// A part sent again is answered once its body was read to the end, so the
+// connection can stay open; an answer before the body is read closes it.
+func TestUploadPart_ReadsARepeatedPartToTheEnd(t *testing.T) {
+	repo := newUploadMockRepo()
+	store := newUploadMockStore()
+	uploadToken := testToken("upload token")
+	session := seedUploadSession(repo, uploadToken, 6)
+	h := NewUploadHandler(repo, store, 100*1024*1024, testMetrics())
+	payload := []byte("abcdef")
+	send := func(body []byte, hash string) (*httptest.ResponseRecorder, *bytes.Reader) {
+		req := uploadPartRequest(session.SessionID, uploadToken, 1, 0, body, hash)
+		reader := bytes.NewReader(body)
+		req.Body = io.NopCloser(reader)
+		rec := httptest.NewRecorder()
+		c := newEchoContext(req, rec)
+		c.SetPathValues(echo.PathValues{{Name: "sessionID", Value: session.SessionID}, {Name: "partNumber", Value: "1"}})
+		callHandler(c, h.UploadPart)
+		return rec, reader
+	}
+
+	if rec, _ := send(payload, sha256HexTest(payload)); rec.Code != http.StatusOK || rec.Header().Get("Connection") != "" {
+		t.Fatalf("first upload: %d, Connection %q", rec.Code, rec.Header().Get("Connection"))
+	}
+	for _, tc := range []struct {
+		body []byte
+		want int
+	}{
+		{payload, http.StatusOK},
+		{[]byte("zzzzzz"), http.StatusConflict},
+	} {
+		rec, body := send(tc.body, sha256HexTest(tc.body))
+		if rec.Code != tc.want || body.Len() != 0 || rec.Header().Get("Connection") != "" {
+			t.Errorf("repeated part: %d with %d bytes unread, Connection %q; want %d, all read, kept open", rec.Code, body.Len(), rec.Header().Get("Connection"), tc.want)
+		}
+	}
+
+	rec, body := send(payload, "not a hash")
+	if rec.Code != http.StatusBadRequest || body.Len() == 0 || rec.Header().Get("Connection") != "close" {
+		t.Errorf("refused part: %d with %d bytes unread, Connection %q; want 400, unread, closed", rec.Code, body.Len(), rec.Header().Get("Connection"))
+	}
+}
+
 func TestUploadPart_RejectsHashMismatchBeforeS3Upload(t *testing.T) {
 	repo := newUploadMockRepo()
 	store := newUploadMockStore()
