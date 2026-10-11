@@ -69,6 +69,9 @@ func New(cfg config.Config, version string, pool *pgxpool.Pool, secretRepo domai
 		reg:            reg,
 	}
 
+	if cfg.MetricsToken == "" {
+		slog.Warn("/metrics answers without a token; set METRICS_TOKEN wherever more than the scraper can reach the server's port")
+	}
 	if cfg.RateLimitMultiplier > 1 {
 		slog.Warn("rate limits are raised for testing; production must not set RATE_LIMIT_MULTIPLIER",
 			"multiplier", cfg.RateLimitMultiplier)

@@ -9,8 +9,10 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v5"
+	"github.com/labstack/echo/v5/middleware"
 
 	apperrors "github.com/secretli/server/internal/platform/errors"
 )
@@ -571,5 +573,82 @@ func TestRequestLoggerNamesTheRouteNotThePath(t *testing.T) {
 		if strings.Contains(line, publicID) {
 			t.Errorf("%s: log line names the public id: %s", tt.path, line)
 		}
+	}
+}
+
+func TestClientKey(t *testing.T) {
+	for ip, want := range map[string]string{
+		"198.51.100.7":         "198.51.100.7",
+		"::ffff:198.51.100.7":  "198.51.100.7",
+		"2001:db8:1:2:aaaa::1": "2001:db8:1:2::/64",
+		"2001:db8:1:2:bbbb::9": "2001:db8:1:2::/64",
+		"2001:db8:1:3::1":      "2001:db8:1:3::/64",
+		"fe80::1%eth0":         "fe80::/64",
+		"not an address":       "not an address",
+	} {
+		if got := clientKey(ip); got != want {
+			t.Errorf("clientKey(%q) = %q, want %q", ip, got, want)
+		}
+	}
+}
+
+// IPv6 addresses in one /64 share an allowance; the next /64 has its own.
+func TestRateLimitCountsAnIPv6NetworkOnce(t *testing.T) {
+	e := echo.NewWithConfig(echo.Config{IPExtractor: echo.ExtractIPDirect()})
+	e.Use(rateLimiter(1, time.Minute))
+	e.GET("/", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
+	from := func(addr string) int {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = addr
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	for _, tc := range []struct {
+		addr string
+		want int
+	}{
+		{"[2001:db8::1]:40000", http.StatusOK},
+		{"[2001:db8::2]:40001", http.StatusTooManyRequests},
+		{"[2001:db8::ffff:1]:40002", http.StatusTooManyRequests},
+		{"[2001:db8:0:1::1]:40003", http.StatusOK},
+		{"198.51.100.7:40004", http.StatusOK},
+		{"198.51.100.8:40005", http.StatusOK},
+	} {
+		if got := from(tc.addr); got != tc.want {
+			t.Errorf("%s: %d, want %d", tc.addr, got, tc.want)
+		}
+	}
+}
+
+// A client's request id goes into every log line of the request, so only a
+// short token is kept; anything else is replaced by a generated one.
+func TestRequestIDsAreShortTokens(t *testing.T) {
+	e := echo.New()
+	e.Use(dropUnfitRequestID())
+	e.Use(middleware.RequestIDWithConfig(middleware.RequestIDConfig{TargetHeader: echo.HeaderXRequestID}))
+	e.GET("/", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
+	idFor := func(sent string) string {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		if sent != "" {
+			req.Header.Set(echo.HeaderXRequestID, sent)
+		}
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, req)
+		return rec.Header().Get(echo.HeaderXRequestID)
+	}
+	for _, kept := range []string{"0b7f2c1e-3a4d-4c5b-8e6f-7a8b9c0d1e2f", "req-abc123", strings.Repeat("a", 64)} {
+		if got := idFor(kept); got != kept {
+			t.Errorf("%q came back as %q", kept, got)
+		}
+	}
+	for _, replaced := range []string{strings.Repeat("a", 65), "two words", "line\nbreak", `{"json":1}`, "ünïcode"} {
+		got := idFor(replaced)
+		if got == replaced || !requestIDPattern.MatchString(got) {
+			t.Errorf("%q came back as %q, want a generated id", replaced, got)
+		}
+	}
+	if got := idFor(""); !requestIDPattern.MatchString(got) {
+		t.Errorf("no id sent, got %q", got)
 	}
 }

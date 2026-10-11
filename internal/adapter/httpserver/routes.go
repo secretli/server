@@ -23,6 +23,7 @@ func (a *App) registerRoutes() (*metrics.SecretMetrics, error) {
 
 	// Middleware stack
 	e.Use(middleware.Recover())
+	e.Use(dropUnfitRequestID())
 	e.Use(middleware.RequestIDWithConfig(middleware.RequestIDConfig{TargetHeader: echo.HeaderXRequestID}))
 	e.Use(correlationMiddleware())
 	e.Use(httpMetrics.Middleware())

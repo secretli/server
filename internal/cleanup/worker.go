@@ -19,9 +19,11 @@ const (
 	// answer. Clients retry within seconds, so a few minutes do; anything
 	// longer only keeps the upload's traces around.
 	finishedUploadRetention = 10 * time.Minute
-	// endedTransferRetention keeps an ended transfer briefly, so the other
-	// side's next poll learns why it ended instead of finding nothing.
-	endedTransferRetention = time.Minute
+	// endedTransferRetention keeps an ended transfer for a while, so the
+	// other side's next poll learns why it ended instead of finding nothing,
+	// and a receiver that missed a poll or two, in a background tab or on a
+	// flaky network, still gets a delivered link. Polls come every 25 s.
+	endedTransferRetention = 5 * time.Minute
 	// batchSize bounds how many rows one cleanup transaction locks. Each batch
 	// commits, so a large backlog (after an outage, say) is worked off across
 	// batches and cycles instead of in one transaction that times out and

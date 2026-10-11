@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v5"
 )
@@ -92,5 +93,56 @@ func TestReadinessWithDB_Unhealthy(t *testing.T) {
 	}
 	if resp.Status != "unavailable" {
 		t.Errorf("status = %q, want %q", resp.Status, "unavailable")
+	}
+}
+
+type countingPinger struct {
+	pings int
+	err   error
+}
+
+func (p *countingPinger) Ping(context.Context) error {
+	p.pings++
+	return p.err
+}
+
+// A ping that succeeded answers the checks within readyFor; a failed one
+// answers none, so the next check pings again.
+func TestReadinessReusesAFreshPing(t *testing.T) {
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	check := func(handler echo.HandlerFunc) int {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		if err := handler(echo.New().NewContext(httptest.NewRequest(http.MethodGet, "/api/v1/health/ready", nil), rec)); err != nil {
+			t.Fatal(err)
+		}
+		return rec.Code
+	}
+
+	pinger := &countingPinger{}
+	handler := readiness(pinger, time.Second, func() time.Time { return now })
+	for range 100 {
+		if code := check(handler); code != http.StatusOK {
+			t.Fatalf("status %d", code)
+		}
+	}
+	if pinger.pings != 1 {
+		t.Errorf("%d pings for 100 checks within a second, want 1", pinger.pings)
+	}
+	now = now.Add(time.Second)
+	check(handler)
+	if pinger.pings != 2 {
+		t.Errorf("%d pings after the result went stale, want 2", pinger.pings)
+	}
+
+	failing := &countingPinger{err: errors.New("connection refused")}
+	handler = readiness(failing, time.Second, func() time.Time { return now })
+	for range 3 {
+		if code := check(handler); code != http.StatusServiceUnavailable {
+			t.Fatalf("status %d, want 503", code)
+		}
+	}
+	if failing.pings != 3 {
+		t.Errorf("%d pings for 3 checks against a failing database, want 3", failing.pings)
 	}
 }
