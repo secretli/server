@@ -51,8 +51,10 @@ services:
     volumes:
       - seaweedfs_data:/data
 
+  # The SeaweedFS image has curl too, so the bucket is made with the image
+  # pulled anyway.
   createbucket:
-    image: curlimages/curl:8.22.0
+    image: chrislusf/seaweedfs:4.48
     depends_on:
       - seaweedfs
     entrypoint: >
