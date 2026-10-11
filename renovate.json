@@ -1,8 +1,11 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    "schedule:weekly",
+    "group:allNonMajor"
   ],
+  "timezone": "Europe/Berlin",
   "postUpdateOptions": [
     "gomodUpdateImportPaths"
   ],
@@ -21,15 +24,21 @@
   ],
   "packageRules": [
     {
-      "description": "The tests and docker/docker-compose.yml run the same SeaweedFS and Postgres, so each moves in one pull request",
+      "description": "The tests and docker/docker-compose.yml run the same SeaweedFS and Postgres, so each major version moves in one pull request; the others go with the weekly group",
       "matchPackageNames": [
         "chrislusf/seaweedfs"
+      ],
+      "matchUpdateTypes": [
+        "major"
       ],
       "groupName": "SeaweedFS"
     },
     {
       "matchPackageNames": [
         "postgres"
+      ],
+      "matchUpdateTypes": [
+        "major"
       ],
       "groupName": "Postgres"
     }
