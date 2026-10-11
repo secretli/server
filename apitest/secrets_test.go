@@ -70,20 +70,41 @@ func TestAOneTimeSecretOpenedByItsOwnerIsGoneToo(t *testing.T) {
 	a.readRange(s, session, 0, len(s.blob)-1)
 }
 
+// partSize is the part_size every upload session states: every part but
+// the last is exactly this long.
+const partSize = 32 << 20
+
 func TestAReusableSecretInSeveralPartsOpensAgain(t *testing.T) {
 	a := server(t)
 	const mib = 1 << 20
-	s := newSecret(t, 6*mib+123, false)
-	// Every part but the last must be at least 5 MiB.
-	a.upload(s, 5*mib, mib+123)
+	s := newSecret(t, partSize+mib+123, false)
+	a.upload(s, partSize, mib+123)
 
 	for i := range 2 {
 		var session retrievalSession
 		a.startRetrieval(s, s.blobToken, "").expect(t, "retrieval", http.StatusCreated, &session)
 		a.readRange(s, session, 0, len(s.blob)-1)
-		a.readRange(s, session, 5*mib-10, 5*mib+10) // across the part boundary
+		a.readRange(s, session, partSize-10, partSize+10) // across the part boundary
 		a.expectOpened(s, fmt.Sprintf("after opening %d", i+1), true)
 	}
+}
+
+// A part goes only where it belongs: part n at (n-1) times the part size,
+// exactly that long but for the last. So an upload can't put more into
+// storage than it declared.
+func TestAPartOutOfPlaceIsRefused(t *testing.T) {
+	a := server(t)
+	const mib = 1 << 20
+	s := newSecret(t, partSize+mib+123, false)
+	var session uploadSession
+	a.startUpload(s).expect(t, "start", http.StatusCreated, &session)
+
+	a.putPart(session, 1, 0, s.blob[:5*mib]).expect(t, "a first part shorter than the part size", http.StatusBadRequest, nil)
+	a.putPart(session, 2, 5*mib, s.blob[5*mib:6*mib]).expect(t, "a second part not where it belongs", http.StatusBadRequest, nil)
+	a.putPart(session, 3, 2*partSize, s.blob[:mib]).expect(t, "a part past the declared size", http.StatusBadRequest, nil)
+	a.putPart(session, 2, partSize, s.blob[partSize:]).expect(t, "the last part where it belongs", http.StatusOK, nil)
+	a.putPart(session, 1, 0, s.blob[:partSize]).expect(t, "the first part where it belongs", http.StatusOK, nil)
+	a.completeUpload(session).expect(t, "complete", http.StatusCreated, nil)
 }
 
 func TestAReusableSecretTellsWhetherARecipientOpenedIt(t *testing.T) {

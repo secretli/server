@@ -716,7 +716,10 @@ func TestUploadPart_RejectsPartsOutsideDeclaredBlob(t *testing.T) {
 }
 
 func TestValidatePartPlacement(t *testing.T) {
-	const mib = 1024 * 1024
+	const (
+		mib  = 1024 * 1024
+		part = 32 * mib
+	)
 	tests := []struct {
 		name       string
 		blobSize   int64
@@ -726,20 +729,59 @@ func TestValidatePartPlacement(t *testing.T) {
 		wantErr    bool
 	}{
 		{name: "single tiny final part", blobSize: 6, partNumber: 1, offset: 0, size: 6},
-		{name: "first full part", blobSize: 40 * mib, partNumber: 1, offset: 0, size: 28 * mib},
-		{name: "final short part", blobSize: 40 * mib, partNumber: 2, offset: 28 * mib, size: 12 * mib},
-		{name: "part number too high", blobSize: 6 * mib, partNumber: 3, offset: 5 * mib, size: mib, wantErr: true},
-		{name: "offset too small for part number", blobSize: 40 * mib, partNumber: 3, offset: 6 * mib, size: 5 * mib, wantErr: true},
-		{name: "overruns blob", blobSize: 40 * mib, partNumber: 2, offset: 28 * mib, size: 13 * mib, wantErr: true},
-		{name: "undersized non-final part", blobSize: 40 * mib, partNumber: 1, offset: 0, size: 4 * mib, wantErr: true},
+		{name: "single part of exactly part size", blobSize: part, partNumber: 1, offset: 0, size: part},
+		{name: "first full part", blobSize: 40 * mib, partNumber: 1, offset: 0, size: part},
+		{name: "final short part", blobSize: 40 * mib, partNumber: 2, offset: part, size: 8 * mib},
+		{name: "last of many", blobSize: 1024 * mib, partNumber: 32, offset: 31 * part, size: part},
+		{name: "part number too high", blobSize: 40 * mib, partNumber: 3, offset: 2 * part, size: mib, wantErr: true},
+		{name: "part number zero", blobSize: 40 * mib, partNumber: 0, offset: 0, size: part, wantErr: true},
+		{name: "offset not where the part belongs", blobSize: 40 * mib, partNumber: 2, offset: 5 * mib, size: 8 * mib, wantErr: true},
+		{name: "first part shorter than part size", blobSize: 40 * mib, partNumber: 1, offset: 0, size: 28 * mib, wantErr: true},
+		{name: "first part longer than part size", blobSize: 40 * mib, partNumber: 1, offset: 0, size: part + 1, wantErr: true},
+		{name: "final part longer than the rest", blobSize: 40 * mib, partNumber: 2, offset: part, size: 8*mib + 1, wantErr: true},
+		{name: "final part shorter than the rest", blobSize: 40 * mib, partNumber: 2, offset: part, size: 8*mib - 1, wantErr: true},
+		{name: "single part shorter than declared", blobSize: 6, partNumber: 1, offset: 0, size: 5, wantErr: true},
+		// The layout the old per-part checks allowed: parts of 33 MiB at the
+		// lowest offsets their numbers permitted, far more than declared.
+		{name: "overlapping oversized part", blobSize: 1024 * mib, partNumber: 2, offset: 5 * mib, size: 33 * mib, wantErr: true},
+		{name: "part past the declared parts", blobSize: 1024 * mib, partNumber: 205, offset: 204 * 5 * mib, size: 4 * mib, wantErr: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validatePartPlacement(tt.blobSize, tt.partNumber, tt.offset, tt.size)
+			err := validatePartPlacement(part, tt.blobSize, tt.partNumber, tt.offset, tt.size)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("validatePartPlacement() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// Under the layout rule, the parts a session can put into storage add up to
+// at most its declared size, whatever it sends: every part number has one
+// valid offset and size.
+func TestValidatePartPlacementBoundsTheTotal(t *testing.T) {
+	const part = 32 * 1024 * 1024
+	for _, blobSize := range []int64{1, part - 1, part, part + 1, 1024*1024*1024 - 7, 1024 * 1024 * 1024} {
+		var total int64
+		for n := 1; n <= 10000; n++ {
+			offset := int64(n-1) * part
+			candidates := map[int64]bool{1: true, 5 * 1024 * 1024: true, part - 1: true, part: true, part + 1: true, blobSize - offset: true}
+			var accepted []int64
+			for size := range candidates {
+				if size > 0 && validatePartPlacement(part, blobSize, n, offset, size) == nil {
+					accepted = append(accepted, size)
+				}
+			}
+			if len(accepted) > 1 {
+				t.Fatalf("blob of %d bytes: part %d accepts several sizes %v", blobSize, n, accepted)
+			}
+			for _, size := range accepted {
+				total += size
+			}
+		}
+		if total != blobSize {
+			t.Errorf("blob of %d bytes: the accepted parts add up to %d", blobSize, total)
+		}
 	}
 }
 
@@ -1177,4 +1219,45 @@ func sha256HexTest(data []byte) string {
 
 func strconvFormatInt(value int64) string {
 	return fmt.Sprintf("%d", value)
+}
+
+func TestUploadSession_CreateRefusesPastTheAddressBudget(t *testing.T) {
+	repo := newUploadMockRepo()
+	store := newUploadMockStore()
+	h := NewUploadHandler(repo, store, 100*1024*1024, testMetrics())
+	h.budget = newUploadBudget(15 * 1024 * 1024) // one 10 MiB upload, not two
+
+	if rec := callCreate(t, h, createUploadBody("budget-first")); rec.Code != http.StatusCreated {
+		t.Fatalf("first create: status = %d, want %d. body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	rec := callCreate(t, h, createUploadBody("budget-second"))
+
+	// Both clients retry a 429, waiting as long as Retry-After says (up to
+	// their own limit), and then tell the user to try again later.
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second create: status = %d, want %d. body: %s", rec.Code, http.StatusTooManyRequests, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got == "" || got == "0" {
+		t.Errorf("Retry-After = %q, want the seconds until 10 MiB are back", got)
+	}
+	if len(repo.uploads) != 1 {
+		t.Errorf("uploads filed = %d, want 1: a refused start files nothing", len(repo.uploads))
+	}
+}
+
+func TestUploadSession_CreateGivesTheBudgetBackWhenItFails(t *testing.T) {
+	repo := newUploadMockRepo()
+	store := newUploadMockStore()
+	h := NewUploadHandler(repo, store, 100*1024*1024, testMetrics())
+	h.budget = newUploadBudget(15 * 1024 * 1024)
+
+	repo.startErr = domain.ErrStorageFull
+	if rec := callCreate(t, h, createUploadBody("budget-full")); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("create on full storage: status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	repo.startErr = nil
+	// Had the failed start kept its 10 MiB, this one would not fit.
+	if rec := callCreate(t, h, createUploadBody("budget-retry")); rec.Code != http.StatusCreated {
+		t.Fatalf("create after a failed one: status = %d, want %d. body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
 }

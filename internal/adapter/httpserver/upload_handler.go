@@ -28,9 +28,11 @@ const (
 	HeaderPartSize   = "X-Part-Size"
 	HeaderPartSHA256 = "X-Part-SHA256"
 
-	uploadSessionTTL        = 24 * time.Hour
+	uploadSessionTTL = 24 * time.Hour
+	// multipartUploadPartSize is the part_size every upload session states.
+	// Part n starts at (n-1) times it and is exactly that long, but for the
+	// last part, which holds what is left (FORMAT.md section 9).
 	multipartUploadPartSize = 32 * 1024 * 1024
-	maxMultipartUploadPart  = multipartUploadPartSize + 1024*1024
 	s3MinimumPartSize       = 5 * 1024 * 1024
 	maxMultipartPartNumber  = 10000
 
@@ -43,8 +45,13 @@ type UploadHandler struct {
 	repo        domain.UploadRepo
 	fileStore   domain.MultipartFileStore
 	maxFileSize int64
-	metrics     *metrics.SecretMetrics
-	validate    *validator.Validate
+	// partSize is multipartUploadPartSize; tests use smaller parts.
+	partSize int64
+	// budget limits the bytes one address may declare for new uploads; nil
+	// allows everything.
+	budget   *uploadBudget
+	metrics  *metrics.SecretMetrics
+	validate *validator.Validate
 }
 
 type createUploadSessionRequest struct {
@@ -63,6 +70,7 @@ func NewUploadHandler(repo domain.UploadRepo, fileStore domain.MultipartFileStor
 		repo:        repo,
 		fileStore:   fileStore,
 		maxFileSize: maxFileSize,
+		partSize:    multipartUploadPartSize,
 		metrics:     m,
 		validate:    newValidator(),
 	}
@@ -87,6 +95,22 @@ func (h *UploadHandler) CreateUploadSession(c *echo.Context) error {
 	if err != nil {
 		return apperrors.BadRequestError(err.Error())
 	}
+
+	// The declared size comes out of this address's budget before anything
+	// is filed, and goes back unless the session is created.
+	release, wait, ok := h.budget.reserve(c.RealIP(), req.BlobSize)
+	if !ok {
+		c.Response().Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(wait)))
+		return c.JSON(http.StatusTooManyRequests, map[string]string{
+			"error": "too much uploaded from this address for now; try again later",
+		})
+	}
+	created := false
+	defer func() {
+		if !created {
+			release()
+		}
+	}()
 
 	sessionID, err := newRetrievalSessionToken()
 	if err != nil {
@@ -155,7 +179,8 @@ func (h *UploadHandler) CreateUploadSession(c *echo.Context) error {
 	}
 	upload.S3UploadID = uploadID
 
-	return c.JSON(http.StatusCreated, uploadSessionResponse(upload, uploadToken))
+	created = true
+	return c.JSON(http.StatusCreated, uploadSessionResponse(upload, uploadToken, h.partSize))
 }
 
 func (h *UploadHandler) UploadPart(c *echo.Context) error {
@@ -179,10 +204,10 @@ func (h *UploadHandler) UploadPart(c *echo.Context) error {
 	if err != nil {
 		return apperrors.BadRequestError(err.Error())
 	}
-	if size <= 0 || size > maxMultipartUploadPart || size > h.maxFileSize {
+	if size <= 0 {
 		return apperrors.BadRequestError("invalid " + HeaderPartSize + " header")
 	}
-	if err := validatePartPlacement(upload.BlobSize, partNumber, offset, size); err != nil {
+	if err := validatePartPlacement(h.partSize, upload.BlobSize, partNumber, offset, size); err != nil {
 		return apperrors.BadRequestError(err.Error())
 	}
 	if c.Request().ContentLength >= 0 && c.Request().ContentLength != size {
@@ -392,11 +417,11 @@ func (h *UploadHandler) validateRequest(v any) []string {
 	return details
 }
 
-func uploadSessionResponse(upload *domain.Upload, uploadToken string) map[string]any {
+func uploadSessionResponse(upload *domain.Upload, uploadToken string, partSize int64) map[string]any {
 	return map[string]any{
 		"session_id":        upload.SessionID,
 		"public_id":         upload.PublicID,
-		"part_size":         multipartUploadPartSize,
+		"part_size":         partSize,
 		"blob_size":         upload.BlobSize,
 		"expires_at":        upload.SecretExpiresAt.UTC().Format(time.RFC3339),
 		"upload_expires_at": upload.ExpiresAt.UTC().Format(time.RFC3339),
@@ -462,27 +487,27 @@ func validateUploadParts(upload *domain.Upload, parts []domain.UploadPart) ([]do
 	return completed, nil
 }
 
-// validatePartPlacement rejects parts that cannot belong to a valid final
-// layout of blobSize bytes. Without it a session declaring a tiny blob could
-// push thousands of full-size parts into storage until the session expires.
-func validatePartPlacement(blobSize int64, partNumber int, offset, size int64) error {
-	maxParts := (blobSize + s3MinimumPartSize - 1) / s3MinimumPartSize
-	if maxParts < 1 {
-		maxParts = 1
+// validatePartPlacement accepts a part only where it belongs: part n starts
+// at (n-1)*partSize and is exactly partSize long, but for the last part,
+// which holds the rest of the declared size. Every part number then has one
+// valid offset and size, and there are at most ceil(blobSize/partSize) of
+// them, so a session can never put more than its declared size into storage
+// (a part sent again replaces the one before). Both clients cut their parts
+// this way (FORMAT.md section 9).
+func validatePartPlacement(partSize, blobSize int64, partNumber int, offset, size int64) error {
+	if blobSize <= 0 || partSize <= 0 {
+		return errors.New("upload session has no size")
 	}
-	if int64(partNumber) > maxParts {
+	parts := (blobSize + partSize - 1) / partSize
+	if partNumber < 1 || int64(partNumber) > parts {
 		return errors.New("part number exceeds the number of parts for the declared blob size")
 	}
-	// Every part before this one is non-final and therefore at least the S3
-	// minimum, so the offset has a hard lower bound.
-	if offset < int64(partNumber-1)*s3MinimumPartSize {
-		return errors.New("invalid " + HeaderPartOffset + " header")
+	wantOffset := int64(partNumber-1) * partSize
+	if offset != wantOffset {
+		return fmt.Errorf("invalid %s header: part %d starts at %d", HeaderPartOffset, partNumber, wantOffset)
 	}
-	if offset+size > blobSize {
-		return errors.New("part exceeds the declared blob size")
-	}
-	if offset+size < blobSize && size < s3MinimumPartSize {
-		return errors.New("non-final part is below the minimum part size")
+	if wantSize := min(partSize, blobSize-wantOffset); size != wantSize {
+		return fmt.Errorf("invalid %s header: part %d is %d bytes", HeaderPartSize, partNumber, wantSize)
 	}
 	return nil
 }

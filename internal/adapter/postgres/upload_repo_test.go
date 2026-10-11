@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	pgadapter "github.com/secretli/server/internal/adapter/postgres"
 	"github.com/secretli/server/internal/domain"
 	tokencrypto "github.com/secretli/server/internal/platform/crypto"
@@ -662,5 +665,101 @@ func TestUploadRepo_AbortRefusesACompletedUpload(t *testing.T) {
 	assertNotDoomed(t, pool, domain.UploadStorageKey(uploadSessionOf("kept")))
 	if err := repo.AbortUpload(ctx, "unknown", now); !errors.Is(err, domain.ErrNotFound) {
 		t.Errorf("unknown: err = %v, want ErrNotFound", err)
+	}
+}
+
+// idleUntil reads an upload's idle deadline; ok is false when it has none.
+func idleUntil(t *testing.T, pool *pgxpool.Pool, sessionID string) (deadline time.Time, ok bool) {
+	t.Helper()
+	var value pgtype.Timestamptz
+	if err := pool.QueryRow(context.Background(),
+		"SELECT idle_until FROM uploads WHERE session_id = $1", sessionID).Scan(&value); err != nil {
+		t.Fatalf("read idle_until of %s: %v", sessionID, err)
+	}
+	return value.Time, value.Valid
+}
+
+func setIdleUntil(t *testing.T, pool *pgxpool.Pool, sessionID string, deadline time.Time) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(),
+		"UPDATE uploads SET idle_until = $2 WHERE session_id = $1", sessionID, deadline); err != nil {
+		t.Fatalf("set idle_until of %s: %v", sessionID, err)
+	}
+}
+
+func TestUploadRepo_AnUploadStartsWithHalfAnHourToSendItsFirstPart(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	now := time.Now()
+
+	mustStartUpload(t, repo, "up-fresh", newTestSecret("fresh", now.Add(time.Hour)), now.Add(24*time.Hour))
+	deadline, ok := idleUntil(t, pool, "up-fresh")
+	if !ok {
+		t.Fatal("a new upload has no idle deadline")
+	}
+	if deadline.Before(now.Add(29*time.Minute)) || deadline.After(now.Add(30*time.Minute)) {
+		t.Errorf("idle deadline %v, want this minute plus 30 minutes (now %v)", deadline, now)
+	}
+	if deadline.Second() != 0 || deadline.Nanosecond() != 0 {
+		t.Errorf("idle deadline %v is not to the minute", deadline)
+	}
+}
+
+func TestUploadRepo_TheIdleDeadlineNeverPassesTheUploadsExpiry(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	now := moment(time.Now())
+	expires := now.Add(10 * time.Minute)
+
+	mustStartUpload(t, repo, "up-short", newTestSecret("short", now.Add(time.Hour)), expires)
+	if deadline, _ := idleUntil(t, pool, "up-short"); !deadline.Equal(expires) {
+		t.Errorf("idle deadline %v, want the upload's expiry %v", deadline, expires)
+	}
+	setIdleUntil(t, pool, "up-short", now.Add(-time.Minute))
+	mustRecordPart(t, repo, newTestUploadPart("up-short", 1, 0, 1024))
+	if deadline, _ := idleUntil(t, pool, "up-short"); !deadline.Equal(expires) {
+		t.Errorf("idle deadline after a part %v, want the upload's expiry %v", deadline, expires)
+	}
+}
+
+func TestUploadRepo_ANewPartExtendsTheIdleDeadlineAndARepeatDoesNot(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	now := time.Now()
+	mustStartUpload(t, repo, "up-parts", newTestSecret("parts", now.Add(time.Hour)), now.Add(24*time.Hour))
+
+	setIdleUntil(t, pool, "up-parts", now.Add(-time.Minute))
+	part := newTestUploadPart("up-parts", 1, 0, 1024)
+	mustRecordPart(t, repo, part)
+	if deadline, _ := idleUntil(t, pool, "up-parts"); deadline.Before(now.Add(29 * time.Minute)) {
+		t.Errorf("idle deadline after a new part %v, want about half an hour from now", deadline)
+	}
+
+	// The same part again is no progress.
+	setIdleUntil(t, pool, "up-parts", now.Add(-time.Minute))
+	mustRecordPart(t, repo, part)
+	if deadline, _ := idleUntil(t, pool, "up-parts"); deadline.After(now) {
+		t.Errorf("a repeated part moved the idle deadline to %v", deadline)
+	}
+}
+
+func TestUploadRepo_AFinishedUploadHasNoIdleDeadline(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	now := moment(time.Now())
+
+	mustStartUpload(t, repo, "up-done", newTestSecret("done", now.Add(time.Hour)), now.Add(24*time.Hour))
+	mustRecordPart(t, repo, newTestUploadPart("up-done", 1, 0, 1024))
+	mustComplete(t, repo, "up-done", now)
+	if _, ok := idleUntil(t, pool, "up-done"); ok {
+		t.Error("a completed upload still has an idle deadline")
+	}
+
+	mustStartUpload(t, repo, "up-gone", newTestSecret("gone", now.Add(time.Hour)), now.Add(24*time.Hour))
+	if err := repo.AbortUpload(context.Background(), "up-gone", now); err != nil {
+		t.Fatalf("abort: %v", err)
+	}
+	if _, ok := idleUntil(t, pool, "up-gone"); ok {
+		t.Error("an abandoned upload still has an idle deadline")
 	}
 }

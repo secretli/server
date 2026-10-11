@@ -18,10 +18,12 @@ INSERT INTO uploads (
     upload_token_hash,
     state,
     expires_at,
-    lifetime
+    lifetime,
+    idle_until
 )
 VALUES (
-    $1, $2, $3, 'uploading', $4, $5
+    $1, $2, $3, 'uploading', $4, $5,
+    LEAST($4, date_trunc('minute', now()) + interval '30 minutes')
 )
 `
 
@@ -33,6 +35,9 @@ type CreateUploadParams struct {
 	Lifetime        pgtype.Interval
 }
 
+// The upload has half an hour for its first part (idle_until), never past
+// its own expiry. The column's default does the same for servers from before
+// it, which leave it out.
 func (q *Queries) CreateUpload(ctx context.Context, arg CreateUploadParams) error {
 	_, err := q.db.Exec(ctx, createUpload,
 		arg.SessionID,
@@ -112,6 +117,20 @@ WHERE session_id = $1
 
 func (q *Queries) DeleteUploadParts(ctx context.Context, sessionID string) error {
 	_, err := q.db.Exec(ctx, deleteUploadParts, sessionID)
+	return err
+}
+
+const extendUploadIdleDeadline = `-- name: ExtendUploadIdleDeadline :exec
+UPDATE uploads
+SET idle_until = LEAST(expires_at, date_trunc('minute', now()) + interval '30 minutes')
+WHERE session_id = $1
+  AND state = 'uploading'
+`
+
+// A new part arrived: the upload has another half hour before it counts as
+// idle, to the minute, but never past its own expiry.
+func (q *Queries) ExtendUploadIdleDeadline(ctx context.Context, sessionID string) error {
+	_, err := q.db.Exec(ctx, extendUploadIdleDeadline, sessionID)
 	return err
 }
 
@@ -254,7 +273,7 @@ const listExpiredUploadsForUpdate = `-- name: ListExpiredUploadsForUpdate :many
 SELECT session_id
 FROM uploads
 WHERE state = 'uploading'
-  AND expires_at < $1
+  AND (expires_at < $1 OR idle_until < $1)
 ORDER BY expires_at
 LIMIT $2
 FOR UPDATE SKIP LOCKED
@@ -265,6 +284,8 @@ type ListExpiredUploadsForUpdateParams struct {
 	BatchSize int32
 }
 
+// Uploads under way past their expiry, or that sent nothing new for half an
+// hour (idle_until).
 func (q *Queries) ListExpiredUploadsForUpdate(ctx context.Context, arg ListExpiredUploadsForUpdateParams) ([]string, error) {
 	rows, err := q.db.Query(ctx, listExpiredUploadsForUpdate, arg.NowAt, arg.BatchSize)
 	if err != nil {
@@ -323,7 +344,8 @@ const markUploadCompleted = `-- name: MarkUploadCompleted :exec
 UPDATE uploads
 SET state = 'completed',
     finished_at = $1,
-    lifetime = NULL
+    lifetime = NULL,
+    idle_until = NULL
 WHERE session_id = $2
   AND state = 'uploading'
 `
@@ -333,7 +355,8 @@ type MarkUploadCompletedParams struct {
 	SessionID  string
 }
 
-// The secret has its expiry now, so the lifetime goes.
+// The secret has its expiry now, so the lifetime goes, and with nothing more
+// to wait for, the idle deadline.
 func (q *Queries) MarkUploadCompleted(ctx context.Context, arg MarkUploadCompletedParams) error {
 	_, err := q.db.Exec(ctx, markUploadCompleted, arg.FinishedAt, arg.SessionID)
 	return err
@@ -343,7 +366,8 @@ const markUploadsAbandoned = `-- name: MarkUploadsAbandoned :many
 UPDATE uploads
 SET state = 'abandoned',
     finished_at = $1,
-    lifetime = NULL
+    lifetime = NULL,
+    idle_until = NULL
 WHERE session_id = ANY($2::text[])
   AND state = 'uploading'
 RETURNING public_id
