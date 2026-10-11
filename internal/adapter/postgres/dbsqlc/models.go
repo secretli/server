@@ -65,6 +65,7 @@ type Upload struct {
 	ExpiresAt       pgtype.Timestamptz
 	FinishedAt      pgtype.Timestamptz
 	Lifetime        pgtype.Interval
+	IdleUntil       pgtype.Timestamptz
 }
 
 type UploadPart struct {

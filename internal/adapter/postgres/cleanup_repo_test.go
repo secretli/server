@@ -779,3 +779,30 @@ func TestCleanupRepo_NothingOutlivesASecret(t *testing.T) {
 		})
 	}
 }
+
+func TestCleanupRepo_AbandonsAnUploadThatSentNothingForHalfAnHour(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	ctx := context.Background()
+	now := time.Now()
+
+	// Its 24 hours are far off; only the idle deadline can end it.
+	mustStartUpload(t, repo, "up-idle", newTestSecret("idle", now.Add(time.Hour)), now.Add(24*time.Hour))
+
+	if n, err := repo.AbandonExpiredUploads(ctx, now.Add(29*time.Minute), testBatchSize); err != nil || n != 0 {
+		t.Fatalf("after 29 minutes: abandoned %d (err %v), want 0", n, err)
+	}
+	n, err := repo.AbandonExpiredUploads(ctx, now.Add(31*time.Minute), testBatchSize)
+	if err != nil {
+		t.Fatalf("abandon idle uploads: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("after 31 minutes: abandoned %d, want 1", n)
+	}
+	if left := countRows(t, pool, "SELECT count(*) FROM secrets WHERE public_id = $1", newTestSecret("idle", now).PublicID); left != 0 {
+		t.Error("the idle upload's secret is still there")
+	}
+	if left := countRows(t, pool, "SELECT count(*) FROM public_ids WHERE public_id = $1", newTestSecret("idle", now).PublicID); left != 0 {
+		t.Error("the idle upload's public id is still reserved")
+	}
+}

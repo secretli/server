@@ -40,6 +40,11 @@ type Config struct {
 	// would. It is read once at startup and never from a request; production
 	// leaves it at 1.
 	RateLimitMultiplier int `env:"RATE_LIMIT_MULTIPLIER" default:"1"`
+	// UploadBudgetBytesPerHour is how many bytes one client address may
+	// declare for new uploads per hour and server instance, raised by
+	// RateLimitMultiplier like the rate limits. It must be at least
+	// MaxFileSize, or the largest upload could never start; 0 turns it off.
+	UploadBudgetBytesPerHour int64 `env:"UPLOAD_BUDGET_BYTES_PER_HOUR" default:"4294967296"`
 }
 
 func Load() (Config, error) {
@@ -50,6 +55,9 @@ func Load() (Config, error) {
 	}
 	if cfg.RateLimitMultiplier < 1 {
 		return Config{}, fmt.Errorf("RATE_LIMIT_MULTIPLIER must be a whole number of at least 1, got %d", cfg.RateLimitMultiplier)
+	}
+	if cfg.UploadBudgetBytesPerHour < 0 || (cfg.UploadBudgetBytesPerHour > 0 && cfg.UploadBudgetBytesPerHour < cfg.MaxFileSize) {
+		return Config{}, fmt.Errorf("UPLOAD_BUDGET_BYTES_PER_HOUR must be 0 or at least MAX_FILE_SIZE (%d), got %d", cfg.MaxFileSize, cfg.UploadBudgetBytesPerHour)
 	}
 	if u, err := url.Parse(cfg.S3.Endpoint); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return Config{}, fmt.Errorf("S3_ENDPOINT must be a URL starting with http:// or https://, got %q", cfg.S3.Endpoint)

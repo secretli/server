@@ -82,7 +82,7 @@ func TestMigration_AppliesRollsBackAndAppliesAgain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current version: %v", err)
 	}
-	if version != 5 {
+	if version != 6 {
 		t.Errorf("version = %d, want every migration", version)
 	}
 	assertSchema(true, "migrating up")
@@ -450,3 +450,81 @@ func deref[T any](p *T) any {
 	}
 	return *p
 }
+
+func TestMigration_006GivesUploadsUnderWayAnIdleDeadline(t *testing.T) {
+	conn, migrator := migrationDatabase(t)
+	ctx := context.Background()
+	if err := migrator.MigrateTo(ctx, 5); err != nil {
+		t.Fatalf("migrate to 5: %v", err)
+	}
+	now := time.Now()
+	// Two uploads under way, one with a day left and one about to run out,
+	// and a finished one, as a server of schema version 5 left them.
+	for _, u := range []struct {
+		id      string
+		expires time.Time
+	}{{"running", now.Add(24 * time.Hour)}, {"nearly-out", now.Add(10 * time.Minute).Truncate(time.Minute)}} {
+		if _, err := conn.Exec(ctx, "INSERT INTO public_ids (public_id, expires_at) VALUES ($1, $2)", u.id, u.expires); err != nil {
+			t.Fatalf("insert public id: %v", err)
+		}
+		if _, err := conn.Exec(ctx, "INSERT INTO objects (storage_key, state) VALUES ($1, 'writing')", "blobs/"+u.id); err != nil {
+			t.Fatalf("insert object: %v", err)
+		}
+		if _, err := conn.Exec(ctx, `INSERT INTO secrets (public_id, state, storage_key, metadata_token_hash, blob_token_hash,
+				deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at)
+			VALUES ($1, 'uploading', $2, 'h', 'h', 'h', 'v2$meta', 1, false, $3)`, u.id, "blobs/"+u.id, u.expires); err != nil {
+			t.Fatalf("insert secret %s: %v", u.id, err)
+		}
+		if _, err := conn.Exec(ctx, `INSERT INTO uploads (session_id, public_id, upload_token_hash, state, expires_at, lifetime)
+			VALUES ($1, $1, 'h', 'uploading', $2, interval '1 hour')`, u.id, u.expires); err != nil {
+			t.Fatalf("insert upload %s: %v", u.id, err)
+		}
+	}
+	if _, err := conn.Exec(ctx, `INSERT INTO uploads (session_id, upload_token_hash, state, expires_at, finished_at)
+		VALUES ('done', 'h', 'completed', $1, $2)`, now.Add(24*time.Hour), now.Truncate(time.Minute)); err != nil {
+		t.Fatalf("insert finished upload: %v", err)
+	}
+
+	if err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	idleUntil := func(session string) *time.Time {
+		t.Helper()
+		var deadline *time.Time
+		if err := conn.QueryRow(ctx, "SELECT idle_until FROM uploads WHERE session_id = $1", session).Scan(&deadline); err != nil {
+			t.Fatalf("read idle_until of %s: %v", session, err)
+		}
+		return deadline
+	}
+	if d := idleUntil("running"); d == nil || d.Before(now.Add(29*time.Minute)) || d.After(now.Add(30*time.Minute)) || d.Second() != 0 {
+		t.Errorf("an upload under way got idle_until %v, want this minute plus half an hour (now %v)", d, now)
+	}
+	if d := idleUntil("nearly-out"); d == nil || !d.Equal(now.Add(10*time.Minute).Truncate(time.Minute)) {
+		t.Errorf("an upload about to run out got idle_until %v, want its own expiry", d)
+	}
+	if d := idleUntil("done"); d != nil {
+		t.Errorf("a finished upload got idle_until %v, want none", d)
+	}
+
+	// A server from before the migration leaves the column out; the default
+	// gives its uploads a deadline all the same.
+	if _, err := conn.Exec(ctx, `INSERT INTO uploads (session_id, upload_token_hash, state, expires_at, finished_at)
+		VALUES ('older-server-done', 'h', 'completed', $1, $2)`, now.Add(24*time.Hour), now); err != nil {
+		t.Fatalf("an older server finishing an upload: %v", err)
+	}
+	if _, err := conn.Exec(ctx, `UPDATE uploads SET state = 'completed', finished_at = $1, lifetime = NULL WHERE session_id = 'running'`, now); err != nil {
+		t.Errorf("an older server completing an upload, leaving idle_until: %v", err)
+	}
+
+	if err := migrator.MigrateTo(ctx, 5); err != nil {
+		t.Fatalf("migrate down to 5: %v", err)
+	}
+	var column bool
+	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'uploads' AND column_name = 'idle_until')").Scan(&column); err != nil {
+		t.Fatalf("query columns: %v", err)
+	}
+	if column {
+		t.Error("rolling back left idle_until in place")
+	}
+}
+

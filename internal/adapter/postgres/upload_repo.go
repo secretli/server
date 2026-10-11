@@ -153,6 +153,11 @@ func (r *SecretRepo) RecordUploadPart(ctx context.Context, part *domain.UploadPa
 	if err != nil {
 		return nil, fmt.Errorf("insert upload part: %w", err)
 	}
+	// A new part is progress: the upload gets another half hour before it
+	// counts as idle. A part sent again is not, and leaves the deadline.
+	if err := qtx.ExtendUploadIdleDeadline(ctx, part.SessionID); err != nil {
+		return nil, fmt.Errorf("extend upload idle deadline: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit upload part: %w", err)
 	}

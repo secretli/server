@@ -153,3 +153,32 @@ func TestLoadRequiresBucket(t *testing.T) {
 		t.Error("Load() succeeded without S3_BUCKET, want an error")
 	}
 }
+
+func TestLoadUploadBudget(t *testing.T) {
+	setRequiredEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error: %v", err)
+	}
+	if cfg.UploadBudgetBytesPerHour != 4*1024*1024*1024 {
+		t.Errorf("UploadBudgetBytesPerHour = %d, want 4 GiB", cfg.UploadBudgetBytesPerHour)
+	}
+
+	t.Setenv("UPLOAD_BUDGET_BYTES_PER_HOUR", "0")
+	if cfg, err := Load(); err != nil || cfg.UploadBudgetBytesPerHour != 0 {
+		t.Errorf("a budget of 0 (off): %d, %v", cfg.UploadBudgetBytesPerHour, err)
+	}
+}
+
+func TestLoadRejectsAnUploadBudgetBelowTheLargestUpload(t *testing.T) {
+	for _, value := range []string{"-1", "1073741823"} {
+		t.Run(value, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("MAX_FILE_SIZE", "1073741824")
+			t.Setenv("UPLOAD_BUDGET_BYTES_PER_HOUR", value)
+			if _, err := Load(); err == nil {
+				t.Errorf("Load() accepted UPLOAD_BUDGET_BYTES_PER_HOUR=%s", value)
+			}
+		})
+	}
+}

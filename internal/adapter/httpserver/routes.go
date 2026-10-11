@@ -106,6 +106,7 @@ func (a *App) registerRoutes() (*metrics.SecretMetrics, error) {
 	transferCloseGroup.DELETE("/:transferID", th.CloseTransfer)
 
 	uh := NewUploadHandler(a.secretRepo, a.fileStore, a.cfg.MaxFileSize, secretMetrics)
+	uh.budget = newUploadBudget(a.cfg.UploadBudgetBytesPerHour * int64(max(a.cfg.RateLimitMultiplier, 1)))
 	uploads := e.Group("/api/v1/secrets/uploads")
 
 	// Starting a session is what creates a secret, so it carries the create

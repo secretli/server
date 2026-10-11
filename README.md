@@ -6,7 +6,7 @@ The server cannot read what it stores. Keys are derived and used only by the cli
 
 ## What it does
 
-- **Uploads:** a secret arrives as a multipart upload session. Parts of up to 32 MiB are streamed into S3-compatible storage and assembled when the session completes, so no request ever carries the whole secret. The secret's lifetime counts from the completed upload. Its times are kept to the minute, with one minute added so that it never lives shorter than chosen, and none of them tells how long the upload took.
+- **Uploads:** a secret arrives as a multipart upload session. Its parts are streamed into S3-compatible storage and assembled when the session completes, so no request ever carries the whole secret. Part n starts at (n−1) × 32 MiB and is exactly 32 MiB long, but for the last, which holds the rest; any other part is refused, so a session never stores more than it declared. A session that sends no new part for 30 minutes is abandoned, its reservation and its public id freed; the absolute limit stays 24 hours. Each client address may declare up to `UPLOAD_BUDGET_BYTES_PER_HOUR` for new uploads per hour, counted in memory only; past it, a start gets 429 with `Retry-After`. The secret's lifetime counts from the completed upload. Its times are kept to the minute, with one minute added so that it never lives shorter than chosen, and none of them tells how long the upload took.
 - **Retrieval:** the link's metadata token unlocks the encrypted metadata. Its blob token opens a 15-minute retrieval session that reads the bundle by byte range. Opening a one-time secret closes it: nobody can open it again, and only the download that opened it can still read it, until that session ends.
 - **Owner status:** a link can tell whether a recipient has opened a reusable secret. Never when. Once a secret is deleted, expires or, being one-time, has been opened, nothing about it is told: its link gets the same 404 as one that never existed.
 - **Deletion:** the owner link's deletion token removes a secret at once; its object leaves storage within a minute.
@@ -69,6 +69,7 @@ Environment variables; see [`.env.example`](.env.example).
 | `METRICS_TOKEN` | bearer token required for `/metrics` | — |
 | `TRUSTED_PROXIES` | IPs or CIDRs of reverse proxies whose `X-Forwarded-For` is trusted for rate limiting | — |
 | `RATE_LIMIT_MULTIPLIER` | raises every rate limit by this whole factor, for test environments only | `1` |
+| `UPLOAD_BUDGET_BYTES_PER_HOUR` | bytes one client address may declare for new uploads per hour and instance, raised by `RATE_LIMIT_MULTIPLIER`; at least `MAX_FILE_SIZE` (0: off) | `4294967296` |
 
 Behind a reverse proxy, set `TRUSTED_PROXIES` to the proxy's address so rate limits key on the real client; otherwise forwarded headers are ignored.
 
