@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
+	"regexp"
 	"strings"
 	"time"
 
@@ -63,6 +65,26 @@ func parseOrigins(origins string) []string {
 	}
 
 	return result
+}
+
+// requestIDPattern is what a client's X-Request-ID may be: a UUID, as the
+// CLI and Envoy send, or another short token.
+var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// dropUnfitRequestID removes a client's X-Request-ID that isn't a short
+// token, so that the RequestID middleware after it makes one up. The id
+// goes into every log line of the request; a client could otherwise make
+// those lines as long as it likes, or write into them what it likes.
+func dropUnfitRequestID() echo.MiddlewareFunc {
+	return func(next echo.HandlerFunc) echo.HandlerFunc {
+		return func(c *echo.Context) error {
+			header := c.Request().Header
+			if id := header.Get(echo.HeaderXRequestID); id != "" && !requestIDPattern.MatchString(id) {
+				header.Del(echo.HeaderXRequestID)
+			}
+			return next(c)
+		}
+	}
 }
 
 func correlationMiddleware() echo.MiddlewareFunc {
@@ -241,11 +263,32 @@ func rateLimiter(limit int, window time.Duration) echo.MiddlewareFunc {
 			},
 		)},
 		IdentifierExtractor: func(c *echo.Context) (string, error) {
-			return c.RealIP(), nil
+			return clientKey(c.RealIP()), nil
 		},
 		DenyHandler: func(c *echo.Context, identifier string, err error) error {
 			c.Response().Header().Set("Retry-After", "60")
 			return c.JSON(http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
 		},
 	})
+}
+
+// clientKey is who a request counts against, for the rate limits and the
+// upload budget: its address, and of an IPv6 address the /64 it is in. A
+// device's IPv6 address changes within its /64 (privacy extensions), and
+// each new one would start with a full allowance. An IPv4 address is the
+// key as it is.
+func clientKey(ip string) string {
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
+	}
+	addr = addr.Unmap().WithZone("")
+	if addr.Is4() {
+		return addr.String()
+	}
+	prefix, err := addr.Prefix(64)
+	if err != nil {
+		return ip
+	}
+	return prefix.String()
 }

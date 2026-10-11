@@ -98,7 +98,7 @@ func (h *UploadHandler) CreateUploadSession(c *echo.Context) error {
 
 	// The declared size comes out of this address's budget before anything
 	// is filed, and goes back unless the session is created.
-	release, wait, ok := h.budget.reserve(c.RealIP(), req.BlobSize)
+	release, wait, ok := h.budget.reserve(clientKey(c.RealIP()), req.BlobSize)
 	if !ok {
 		c.Response().Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds(wait)))
 		return c.JSON(http.StatusTooManyRequests, map[string]string{
