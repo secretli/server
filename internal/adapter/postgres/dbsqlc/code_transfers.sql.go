@@ -244,7 +244,7 @@ SELECT pg_advisory_xact_lock(7302101)
 `
 
 // Serializes nameplate allocation across replicas for one transaction, so
-// concurrent creates take consecutive numbers instead of racing for one.
+// concurrent creates never race for the same number.
 func (q *Queries) LockTransferNameplates(ctx context.Context) error {
 	_, err := q.db.Exec(ctx, lockTransferNameplates)
 	return err
@@ -259,10 +259,13 @@ WHERE NOT EXISTS (
     WHERE t.nameplate = n
       AND t.closed_at IS NULL
 )
-ORDER BY n
+ORDER BY random()
 LIMIT 1
 `
 
+// A free nameplate at random, not the smallest: a claim needs no proof of
+// the code, so with predictable numbers anyone could claim a transfer the
+// moment it opens, before its receiver does.
 func (q *Queries) NextFreeNameplate(ctx context.Context, maxNameplate int32) (int32, error) {
 	row := q.db.QueryRow(ctx, nextFreeNameplate, maxNameplate)
 	var nameplate int32

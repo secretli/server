@@ -1,6 +1,6 @@
 -- name: LockTransferNameplates :exec
 -- Serializes nameplate allocation across replicas for one transaction, so
--- concurrent creates take consecutive numbers instead of racing for one.
+-- concurrent creates never race for the same number.
 SELECT pg_advisory_xact_lock(7302101);
 
 -- name: CloseExpiredActiveTransfers :exec
@@ -12,6 +12,9 @@ WHERE closed_at IS NULL
   AND expires_at <= sqlc.arg(now_at);
 
 -- name: NextFreeNameplate :one
+-- A free nameplate at random, not the smallest: a claim needs no proof of
+-- the code, so with predictable numbers anyone could claim a transfer the
+-- moment it opens, before its receiver does.
 SELECT n::INTEGER AS nameplate
 FROM generate_series(1, sqlc.arg(max_nameplate)::INTEGER) AS n
 WHERE NOT EXISTS (
@@ -20,7 +23,7 @@ WHERE NOT EXISTS (
     WHERE t.nameplate = n
       AND t.closed_at IS NULL
 )
-ORDER BY n
+ORDER BY random()
 LIMIT 1;
 
 -- name: CreateTransfer :exec

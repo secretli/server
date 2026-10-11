@@ -82,9 +82,27 @@ func TestTransferConcurrentCreatesNeverShareANameplate(t *testing.T) {
 
 	sort.Ints(nameplates)
 	for i, got := range nameplates {
-		if got != i+1 {
-			t.Fatalf("nameplates = %v, want 1..%d, each once", nameplates, n)
+		if got < 1 || got > 999 || (i > 0 && got == nameplates[i-1]) {
+			t.Fatalf("nameplates = %v, want %d different ones in 1..999", nameplates, n)
 		}
+	}
+}
+
+// Nameplates are drawn at random, so that nobody can tell which number the
+// next transfer gets and claim it first.
+func TestTransferNameplatesAreDrawnAtRandom(t *testing.T) {
+	repo := pgadapter.NewSecretRepo(setupTestDB(t))
+	now := time.Now()
+
+	const n = 30
+	highest := 0
+	for i := range n {
+		highest = max(highest, createTestTransfer(t, repo, fmt.Sprintf("random-%02d", i), now).Nameplate)
+	}
+	// Smallest-first would give exactly 1..30; 30 draws from 999 all landing
+	// there has a chance of one in about 10^57.
+	if highest <= n {
+		t.Errorf("the highest of %d nameplates is %d: they look handed out in order", n, highest)
 	}
 }
 
@@ -93,24 +111,38 @@ func TestTransferNameplatesFreeUpWhenATransferEndsOrExpires(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
 
-	closed := createTestTransfer(t, repo, "closed", now)
-	expiring := createTestTransfer(t, repo, "expiring", now)
-	if closed.Nameplate != 1 || expiring.Nameplate != 2 {
-		t.Fatalf("nameplates = %d, %d, want 1, 2", closed.Nameplate, expiring.Nameplate)
+	// Two nameplates, both taken: the only free one is the one that freed up.
+	create := func(id string, at time.Time) (*domain.Transfer, error) {
+		transfer := newTestTransfer(id, at)
+		return transfer, repo.CreateTransfer(ctx, transfer, 2, at)
+	}
+	closed, err := create("closed", now)
+	if err != nil {
+		t.Fatalf("CreateTransfer: %v", err)
+	}
+	expiring, err := create("expiring", now)
+	if err != nil {
+		t.Fatalf("CreateTransfer: %v", err)
+	}
+	if _, err := create("no-room", now); !errors.Is(err, domain.ErrConflict) {
+		t.Fatalf("a third transfer with two nameplates: err = %v, want ErrConflict", err)
 	}
 	if err := repo.CloseTransfer(ctx, closed.TransferID, domain.TransferCloseCancelled, now); err != nil {
 		t.Fatalf("CloseTransfer: %v", err)
 	}
 
-	if next := createTestTransfer(t, repo, "after-close", now); next.Nameplate != 1 {
-		t.Errorf("nameplate = %d, want 1 after the first transfer closed", next.Nameplate)
+	next, err := create("after-close", now)
+	if err != nil || next.Nameplate != closed.Nameplate {
+		t.Errorf("after the first transfer closed: nameplate %d, %v; want %d", next.Nameplate, err, closed.Nameplate)
 	}
 
 	// Past every transfer's expiry, before cleanup has run: their numbers
 	// are free again.
 	later := now.Add(11 * time.Minute)
-	if next := createTestTransfer(t, repo, "after-expiry", later); next.Nameplate != 1 {
-		t.Errorf("nameplate = %d, want 1 once the old transfers expired", next.Nameplate)
+	for _, id := range []string{"after-expiry-1", "after-expiry-2"} {
+		if _, err := create(id, later); err != nil {
+			t.Errorf("once the old transfers expired: %v", err)
+		}
 	}
 	got, err := repo.GetTransfer(ctx, expiring.TransferID)
 	if err != nil {

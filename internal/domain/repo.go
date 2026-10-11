@@ -89,8 +89,8 @@ type UploadRepo interface {
 
 type TransferRepo interface {
 	// CreateTransfer stores an open transfer, with the sender's offer, under
-	// the smallest free nameplate up to maxNameplate, first closing transfers
-	// that ran out. It returns ErrConflict when no nameplate is free and
+	// a free nameplate up to maxNameplate, drawn at random, first closing
+	// transfers that ran out. It returns ErrConflict when no nameplate is free and
 	// ErrDuplicate when the transfer id is taken.
 	CreateTransfer(ctx context.Context, t *Transfer, maxNameplate int, now time.Time) error
 	// ClaimTransfer hands the active, unclaimed transfer under nameplate to a
