@@ -719,6 +719,52 @@ func TestCompleteUploadSession_CreatesSecret(t *testing.T) {
 	}
 }
 
+// Completes hold a database connection while storage assembles the object,
+// so only completesAtOnce run at once; another waits, then is told to come
+// back, and storage being slow leaves the rest of the pool alone.
+func TestCompleteUploadSession_RunsABoundedNumberAtOnce(t *testing.T) {
+	repo := newUploadMockRepo()
+	h := NewUploadHandler(repo, newUploadMockStore(), 100*1024*1024, testMetrics())
+	h.completeWait = 50 * time.Millisecond
+	complete := func(label string) *httptest.ResponseRecorder {
+		token := testToken(label)
+		session := seedUploadSession(repo, token, 3)
+		repo.parts[session.SessionID] = map[int]domain.UploadPart{
+			1: {SessionID: session.SessionID, PartNumber: 1, Offset: 0, Size: 3, SHA256: sha256HexTest([]byte("abc")), ETag: "etag-1"},
+		}
+		rec := httptest.NewRecorder()
+		c := newEchoContext(completeUploadRequest(session.SessionID, token), rec)
+		c.SetPathValues(echo.PathValues{{Name: "sessionID", Value: session.SessionID}})
+		callHandler(c, h.CompleteUploadSession)
+		return rec
+	}
+
+	// As many completes under way as run at once, waiting on storage.
+	for range completesAtOnce {
+		h.completes <- struct{}{}
+	}
+	started := time.Now()
+	rec := complete("one too many")
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Errorf("a complete beyond the bound: %d, Retry-After %q; want 503 with Retry-After", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	if waited := time.Since(started); waited < h.completeWait {
+		t.Errorf("turned away after %v, before waiting its turn", waited)
+	}
+	if got := repo.uploads[testToken("session "+testToken("one too many"))]; got != nil && got.State != domain.UploadUploading {
+		t.Errorf("the turned-away upload is %q, want it still uploading, to be completed again", got.State)
+	}
+
+	// One of them ends: the next complete runs.
+	<-h.completes
+	if rec := complete("its turn"); rec.Code != http.StatusCreated {
+		t.Errorf("a complete with a turn free: %d, want 201", rec.Code)
+	}
+	if len(h.completes) != completesAtOnce-1 {
+		t.Errorf("%d turns taken after the complete ended, want %d", len(h.completes), completesAtOnce-1)
+	}
+}
+
 func TestUploadPart_RejectsPartsOutsideDeclaredBlob(t *testing.T) {
 	payload := []byte("abcdef")
 	hash := sha256HexTest(payload)

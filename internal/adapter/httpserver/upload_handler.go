@@ -34,7 +34,18 @@ const (
 	// last part, which holds what is left (FORMAT.md section 9).
 	multipartUploadPartSize = 32 * 1024 * 1024
 	s3MinimumPartSize       = 5 * 1024 * 1024
-	maxMultipartPartNumber  = 10000
+
+	// completesAtOnce is how many completes one instance runs at once.
+	// Each holds a database connection, and a row lock, while storage
+	// assembles the object, which takes as long as storage takes; the pool
+	// has max(4, CPUs) connections. Bounded, slow storage slows completes,
+	// not every request that needs the database.
+	completesAtOnce = 2
+	// completeWait is how long a complete waits for its turn before it is
+	// told to come back; clients retry a 503 after Retry-After, and a
+	// complete is safe to repeat.
+	completeWait           = 10 * time.Second
+	maxMultipartPartNumber = 10000
 
 	// storageFullRetryAfter is the Retry-After, in seconds, when storage is
 	// at its cap.
@@ -54,6 +65,10 @@ type UploadHandler struct {
 	slots    *partSlots
 	metrics  *metrics.SecretMetrics
 	validate *validator.Validate
+	// completes holds a token for each complete under way, and a complete
+	// waits completeWait for one; tests wait less.
+	completes    chan struct{}
+	completeWait time.Duration
 }
 
 type createUploadSessionRequest struct {
@@ -69,12 +84,14 @@ type createUploadSessionRequest struct {
 
 func NewUploadHandler(repo domain.UploadRepo, fileStore domain.MultipartFileStore, maxFileSize int64, m *metrics.SecretMetrics) *UploadHandler {
 	return &UploadHandler{
-		repo:        repo,
-		fileStore:   fileStore,
-		maxFileSize: maxFileSize,
-		partSize:    multipartUploadPartSize,
-		metrics:     m,
-		validate:    newValidator(),
+		repo:         repo,
+		fileStore:    fileStore,
+		maxFileSize:  maxFileSize,
+		partSize:     multipartUploadPartSize,
+		metrics:      m,
+		validate:     newValidator(),
+		completes:    make(chan struct{}, completesAtOnce),
+		completeWait: completeWait,
 	}
 }
 
@@ -291,6 +308,19 @@ func (h *UploadHandler) CompleteUploadSession(c *echo.Context) error {
 	}
 
 	ctx := c.Request().Context()
+	waiting, cancel := context.WithTimeout(ctx, h.completeWait)
+	select {
+	case h.completes <- struct{}{}:
+		cancel()
+		defer func() { <-h.completes }()
+	case <-waiting.Done():
+		cancel()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		c.Response().Header().Set("Retry-After", "5")
+		return c.JSON(http.StatusServiceUnavailable, map[string]string{"error": "the server is busy completing other uploads; try again shortly"})
+	}
 	// stored records that storage assembled the object, so a later failure
 	// leaves an object that no live secret references.
 	stored := false
