@@ -47,7 +47,7 @@ func (q *Queries) DeleteExpiredRetrievalSessions(ctx context.Context, nowAt pgty
 }
 
 const getDownloadableSecret = `-- name: GetDownloadableSecret :one
-SELECT s.public_id, s.state, s.storage_key, s.metadata_token_hash, s.blob_token_hash, s.deletion_token_hash, s.encrypted_meta, s.blob_size, s.burn_after_read, s.expires_at, s.created_at, s.opened
+SELECT s.public_id, s.state, s.storage_key, s.metadata_token_hash, s.blob_token_hash, s.deletion_token_hash, s.encrypted_meta, s.blob_size, s.burn_after_read, s.expires_at, s.created_at, s.opened, s.wrong_blob_tokens
 FROM retrieval_sessions AS rs
 JOIN secrets AS s ON s.public_id = rs.public_id
 WHERE rs.session_token_hash = $1
@@ -81,6 +81,7 @@ func (q *Queries) GetDownloadableSecret(ctx context.Context, arg GetDownloadable
 		&i.ExpiresAt,
 		&i.CreatedAt,
 		&i.Opened,
+		&i.WrongBlobTokens,
 	)
 	return i, err
 }

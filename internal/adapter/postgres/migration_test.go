@@ -82,7 +82,7 @@ func TestMigration_AppliesRollsBackAndAppliesAgain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("current version: %v", err)
 	}
-	if version != 6 {
+	if version != 7 {
 		t.Errorf("version = %d, want every migration", version)
 	}
 	assertSchema(true, "migrating up")
@@ -350,7 +350,7 @@ func TestMigration_004KeepsOnlySecretsThatCanStillBeRead(t *testing.T) {
 		t.Error("after rolling back: uploads.lifetime is still there or objects.created_at is missing")
 	}
 
-	if err := migrator.Migrate(ctx); err != nil {
+	if err := migrator.MigrateTo(ctx, 4); err != nil {
 		t.Fatalf("migrate up again: %v", err)
 	}
 	assertV4("migrating up again")
@@ -528,3 +528,56 @@ func TestMigration_006GivesUploadsUnderWayAnIdleDeadline(t *testing.T) {
 	}
 }
 
+func TestMigration_007CountsWrongBlobTokensFromZero(t *testing.T) {
+	conn, migrator := migrationDatabase(t)
+	ctx := context.Background()
+	if err := migrator.MigrateTo(ctx, 6); err != nil {
+		t.Fatalf("migrate to 6: %v", err)
+	}
+	expires := time.Now().Add(time.Hour)
+	insertSecret := func(id string) error {
+		if _, err := conn.Exec(ctx, "INSERT INTO public_ids (public_id, expires_at) VALUES ($1, $2)", id, expires); err != nil {
+			return err
+		}
+		if _, err := conn.Exec(ctx, "INSERT INTO objects (storage_key, state) VALUES ($1, 'stored')", "blobs/"+id); err != nil {
+			return err
+		}
+		_, err := conn.Exec(ctx, `INSERT INTO secrets (public_id, state, storage_key, metadata_token_hash, blob_token_hash,
+				deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at)
+			VALUES ($1, 'live', $2, 'h', 'h', 'h', 'v3$meta', 1, false, $3, now())`, id, "blobs/"+id, expires)
+		return err
+	}
+	// A secret as a server of schema version 6 left it.
+	if err := insertSecret("before"); err != nil {
+		t.Fatalf("insert secret: %v", err)
+	}
+
+	if err := migrator.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	// A server from before the migration leaves the column out while both
+	// run; its secrets start from zero as well.
+	if err := insertSecret("older-server"); err != nil {
+		t.Fatalf("an older server creating a secret: %v", err)
+	}
+	for _, id := range []string{"before", "older-server"} {
+		var wrong int
+		if err := conn.QueryRow(ctx, "SELECT wrong_blob_tokens FROM secrets WHERE public_id = $1", id).Scan(&wrong); err != nil {
+			t.Fatalf("read %s: %v", id, err)
+		}
+		if wrong != 0 {
+			t.Errorf("%s: wrong_blob_tokens = %d, want 0", id, wrong)
+		}
+	}
+
+	if err := migrator.MigrateTo(ctx, 6); err != nil {
+		t.Fatalf("migrate down to 6: %v", err)
+	}
+	var column bool
+	if err := conn.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name = 'secrets' AND column_name = 'wrong_blob_tokens')").Scan(&column); err != nil {
+		t.Fatalf("query columns: %v", err)
+	}
+	if column {
+		t.Error("rolling back left wrong_blob_tokens in place")
+	}
+}

@@ -136,6 +136,36 @@ func TestAReusableSecretTellsWhetherARecipientOpenedIt(t *testing.T) {
 	a.expectOpened(s, "after the owner opened it again", true)
 }
 
+func TestTheTenthWrongBlobTokenDeletesTheSecret(t *testing.T) {
+	a := server(t)
+	s := newSecret(t, 4096, false)
+	a.upload(s)
+
+	// Each wrong blob token says how many more the secret takes, and the
+	// right one still opens it until the last.
+	var refused gone
+	for left := 9; left > 0; left-- {
+		a.startRetrieval(s, b64(randomBytes(t, 32)), "").expect(t, "retrieval, wrong blob token", http.StatusForbidden, &refused)
+		if got := refused.Details["attempts_left"]; got != float64(left) {
+			t.Fatalf("attempts_left = %v, want %d", got, left)
+		}
+	}
+	var session retrievalSession
+	a.startRetrieval(s, s.blobToken, "").expect(t, "retrieval before the last wrong blob token", http.StatusCreated, &session)
+
+	// The tenth is refused like the others, and deletes the secret: gone for
+	// everyone, as if it never was, and the running download ends.
+	a.startRetrieval(s, b64(randomBytes(t, 32)), "").expect(t, "the tenth wrong blob token", http.StatusForbidden, &refused)
+	if got := refused.Details["attempts_left"]; got != float64(0) {
+		t.Fatalf("attempts_left = %v, want 0", got)
+	}
+	a.expectNotThere(s, "after the tenth wrong blob token")
+	header := bearer(session.SessionToken)
+	header["Range"] = "bytes=0-99"
+	a.do(http.MethodGet, "/api/v1/secrets/"+s.publicID+"/blob", header, nil).
+		expect(t, "range read after the deletion", http.StatusForbidden, nil)
+}
+
 func TestAWrongDeletionTokenDoesNotMakeARecipientTheOwner(t *testing.T) {
 	a := server(t)
 	s := newSecret(t, 256, false)

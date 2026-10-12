@@ -53,6 +53,13 @@ SET state = 'closing',
     deletion_token_hash = NULL
 WHERE public_id = $1;
 
+-- name: CountWrongBlobToken :one
+-- A wrong blob token was tried on the secret, which the caller has locked.
+UPDATE secrets
+SET wrong_blob_tokens = wrong_blob_tokens + 1
+WHERE public_id = $1
+RETURNING wrong_blob_tokens;
+
 -- name: MarkSecretOpened :exec
 -- A recipient, not the owner, opened a reusable secret.
 UPDATE secrets

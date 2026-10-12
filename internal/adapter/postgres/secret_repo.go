@@ -93,7 +93,7 @@ func (r *SecretRepo) StartRetrievalSession(ctx context.Context, publicID, blobTo
 	secret := secretFromRow(row)
 
 	if !tokencrypto.TokensEqual(blobTokenHash, secret.BlobTokenHash) {
-		return nil, domain.ErrForbidden
+		return nil, countWrongBlobToken(ctx, tx, qtx, publicID, row.StorageKey)
 	}
 	// The owner opening their own reusable secret is not a recipient getting
 	// it. A one-time secret closes whoever opens it.
@@ -125,6 +125,27 @@ func (r *SecretRepo) StartRetrievalSession(ctx context.Context, publicID, blobTo
 		return nil, fmt.Errorf("commit retrieval session: %w", err)
 	}
 	return secret, nil
+}
+
+// countWrongBlobToken counts a wrong blob token against the locked secret,
+// deletes the secret at the limit, as its owner could, and commits. A
+// guess that cost nothing could be repeated for the secret's whole
+// lifetime.
+func countWrongBlobToken(ctx context.Context, tx pgx.Tx, qtx *dbsqlc.Queries, publicID, storageKey string) error {
+	wrong, err := qtx.CountWrongBlobToken(ctx, publicID)
+	if err != nil {
+		return fmt.Errorf("count wrong blob token: %w", err)
+	}
+	left := max(0, domain.MaxWrongBlobTokens-int(wrong))
+	if left == 0 {
+		if _, err := deleteSecrets(ctx, qtx, []string{publicID}, []string{storageKey}); err != nil {
+			return fmt.Errorf("delete secret after wrong blob tokens: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit wrong blob token: %w", err)
+	}
+	return &domain.WrongBlobTokenError{AttemptsLeft: left}
 }
 
 func (r *SecretRepo) GetByRetrievalSession(ctx context.Context, publicID, sessionTokenHash string, now time.Time) (*domain.Secret, error) {

@@ -90,6 +90,15 @@ func (h *SecretHandler) StartRetrievalSession(c *echo.Context) error {
 	if errors.Is(err, domain.ErrNotFound) {
 		return apperrors.NotFoundError("secret not found")
 	}
+	// How many more wrong passwords the secret takes before it is deleted,
+	// so that a client can say so.
+	if wrong, ok := errors.AsType[*domain.WrongBlobTokenError](err); ok {
+		return &apperrors.Error{
+			Type:    apperrors.Forbidden,
+			Message: "invalid blob token",
+			Context: map[string]any{"attempts_left": wrong.AttemptsLeft},
+		}
+	}
 	if errors.Is(err, domain.ErrForbidden) {
 		return apperrors.ForbiddenError("invalid blob token")
 	}

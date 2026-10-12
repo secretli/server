@@ -490,11 +490,11 @@ func TestSecretRepo_StartRetrievalSessionRefusesAWrongBlobToken(t *testing.T) {
 	secret.BurnAfterRead = true
 	mustCreate(t, repo, secret)
 
-	_, err := repo.StartRetrievalSession(context.Background(), "wrong-blob",
-		tokencrypto.TokenHash("not-the-blob-token"), "", tokencrypto.TokenHash("session"), now.Add(15*time.Minute), now)
+	_, err := openWrong(repo, "wrong-blob", now)
 	if !errors.Is(err, domain.ErrForbidden) {
 		t.Fatalf("err = %v, want ErrForbidden", err)
 	}
+	assertAttemptsLeft(t, err, domain.MaxWrongBlobTokens-1)
 
 	// A wrong guess neither burns the secret nor opens a session.
 	if got := mustGetSecret(t, repo, "wrong-blob"); got.State != domain.SecretLive {
@@ -503,6 +503,73 @@ func TestSecretRepo_StartRetrievalSessionRefusesAWrongBlobToken(t *testing.T) {
 	if n := countRows(t, pool, "SELECT count(*) FROM retrieval_sessions"); n != 0 {
 		t.Errorf("retrieval sessions = %d, want 0", n)
 	}
+
+	// The right blob token still opens it.
+	mustOpen(t, repo, "wrong-blob", "recipient", false, now)
+}
+
+// openWrong tries a wrong blob token on a secret made by newTestSecret.
+func openWrong(repo *pgadapter.SecretRepo, publicID string, now time.Time) (*domain.Secret, error) {
+	return repo.StartRetrievalSession(context.Background(), publicID,
+		tokencrypto.TokenHash("not-the-blob-token"), "", tokencrypto.TokenHash("wrong"), now.Add(15*time.Minute), now)
+}
+
+func assertAttemptsLeft(t *testing.T, err error, want int) {
+	t.Helper()
+	wrong, ok := errors.AsType[*domain.WrongBlobTokenError](err)
+	if !ok {
+		t.Fatalf("err = %v, want a *WrongBlobTokenError", err)
+	}
+	if wrong.AttemptsLeft != want {
+		t.Errorf("attempts left = %d, want %d", wrong.AttemptsLeft, want)
+	}
+}
+
+func TestSecretRepo_StartRetrievalSessionDeletesTheSecretAtTheLastWrongBlobToken(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	now := moment(time.Now())
+	secret := newTestSecret("guessed-at", now.Add(time.Hour))
+	mustCreate(t, repo, secret)
+	// Each secret counts its own wrong blob tokens.
+	other := newTestSecret("left-alone", now.Add(time.Hour))
+	mustCreate(t, repo, other)
+	if _, err := openWrong(repo, "left-alone", now); !errors.Is(err, domain.ErrForbidden) {
+		t.Fatalf("other secret: err = %v, want ErrForbidden", err)
+	}
+
+	for left := domain.MaxWrongBlobTokens - 1; left > 0; left-- {
+		_, err := openWrong(repo, "guessed-at", now)
+		assertAttemptsLeft(t, err, left)
+	}
+	// A recipient's session from before the guesses reads on until the end.
+	mustOpen(t, repo, "guessed-at", "recipient", false, now)
+	if got := mustGetSecret(t, repo, "guessed-at"); got.State != domain.SecretLive {
+		t.Fatalf("state = %q before the last wrong blob token, want live", got.State)
+	}
+
+	// The last one is still answered as a wrong blob token, and deletes the
+	// secret the way its owner could: nothing of it is kept, its object is
+	// doomed, and its download ends.
+	_, err := openWrong(repo, "guessed-at", now)
+	assertAttemptsLeft(t, err, 0)
+	assertSecretGone(t, repo, "guessed-at")
+	assertDoomed(t, pool, secret.StorageKey)
+	if n := countRows(t, pool, "SELECT count(*) FROM retrieval_sessions WHERE public_id = 'guessed-at'"); n != 0 {
+		t.Errorf("the deleted secret left %d retrieval sessions", n)
+	}
+	if _, err := download(repo, "guessed-at", "recipient", now); !errors.Is(err, domain.ErrForbidden) {
+		t.Errorf("running download: err = %v, want ErrForbidden", err)
+	}
+
+	// From then on it is gone for everyone, the right blob token included.
+	if _, err := openWrong(repo, "guessed-at", now); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("wrong blob token after the delete: err = %v, want ErrNotFound", err)
+	}
+	if _, err := openAs(repo, "guessed-at", "late", false, now); !errors.Is(err, domain.ErrNotFound) {
+		t.Errorf("open after the delete: err = %v, want ErrNotFound", err)
+	}
+	mustOpen(t, repo, "left-alone", "recipient", false, now)
 }
 
 func TestSecretRepo_StartRetrievalSessionNeedsAReadableSecret(t *testing.T) {
