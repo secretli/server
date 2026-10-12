@@ -75,6 +75,24 @@ Behind a reverse proxy, set `TRUSTED_PROXIES` to the proxy's address so rate lim
 
 Rate limits apply per client address, and an end-to-end suite sends far more requests from one address than a visitor would. Test environments set `RATE_LIMIT_MULTIPLIER` (for example to `100`) instead of waiting out the limits. It is read once at startup and never from a request, anything but a whole number of at least 1 stops the server from starting, and a server with raised limits logs a warning. Production leaves it unset.
 
+### Storage lifecycle
+
+The cleanup deletes every object itself, so the bucket needs no lifecycle rules to stay clean. In production it carries two anyway, as a safety net for what a database restore or a bug could leave behind. They are in [`deploy/storage-lifecycle.json`](deploy/storage-lifecycle.json), both on `blobs/`, where every secret's object lives:
+- objects expire after 10 days. A secret's object lives at most about 8: an upload of up to 24 hours, then the longest lifetime of 7 days;
+- unfinished multipart uploads are aborted after 2 days, since an upload session lasts at most 24 hours.
+
+Storage counts from when an object was made and acts once a night, so it removes an object later than that, never earlier.
+
+The rules live in the bucket, not in the code, so they are applied by hand once, and again whenever the file changes:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket "$S3_BUCKET" --endpoint-url "$S3_ENDPOINT" \
+  --lifecycle-configuration file://deploy/storage-lifecycle.json
+aws s3api get-bucket-lifecycle-configuration --bucket "$S3_BUCKET" --endpoint-url "$S3_ENDPOINT"
+```
+
+`TestStorageLifecycleOutlastsEverySecret` keeps the rules in step with the server: it fails when a longer lifetime or upload session would let them take an object the server still needs.
+
 ### Metrics
 
 `GET /metrics` serves Prometheus metrics: Go runtime and process metrics, and these.

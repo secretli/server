@@ -1,0 +1,16 @@
+{
+  "Rules": [
+    {
+      "ID": "expire-blobs",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "blobs/" },
+      "Expiration": { "Days": 10 }
+    },
+    {
+      "ID": "abort-blob-uploads",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "blobs/" },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 2 }
+    }
+  ]
+}
