@@ -30,6 +30,21 @@ func (q *Queries) CloseSecret(ctx context.Context, publicID string) error {
 	return err
 }
 
+const countWrongBlobToken = `-- name: CountWrongBlobToken :one
+UPDATE secrets
+SET wrong_blob_tokens = wrong_blob_tokens + 1
+WHERE public_id = $1
+RETURNING wrong_blob_tokens
+`
+
+// A wrong blob token was tried on the secret, which the caller has locked.
+func (q *Queries) CountWrongBlobToken(ctx context.Context, publicID string) (int16, error) {
+	row := q.db.QueryRow(ctx, countWrongBlobToken, publicID)
+	var wrong_blob_tokens int16
+	err := row.Scan(&wrong_blob_tokens)
+	return wrong_blob_tokens, err
+}
+
 const createSecret = `-- name: CreateSecret :exec
 INSERT INTO secrets (
     public_id,
@@ -128,7 +143,7 @@ func (q *Queries) DeleteUploadingSecrets(ctx context.Context, publicIds []string
 }
 
 const getReadableSecretForUpdate = `-- name: GetReadableSecretForUpdate :one
-SELECT public_id, state, storage_key, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at, opened
+SELECT public_id, state, storage_key, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at, opened, wrong_blob_tokens
 FROM secrets
 WHERE public_id = $1
   AND state = 'live'
@@ -157,12 +172,13 @@ func (q *Queries) GetReadableSecretForUpdate(ctx context.Context, arg GetReadabl
 		&i.ExpiresAt,
 		&i.CreatedAt,
 		&i.Opened,
+		&i.WrongBlobTokens,
 	)
 	return i, err
 }
 
 const getSecret = `-- name: GetSecret :one
-SELECT public_id, state, storage_key, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at, opened
+SELECT public_id, state, storage_key, metadata_token_hash, blob_token_hash, deletion_token_hash, encrypted_meta, blob_size, burn_after_read, expires_at, created_at, opened, wrong_blob_tokens
 FROM secrets
 WHERE public_id = $1
 `
@@ -183,6 +199,7 @@ func (q *Queries) GetSecret(ctx context.Context, publicID string) (Secret, error
 		&i.ExpiresAt,
 		&i.CreatedAt,
 		&i.Opened,
+		&i.WrongBlobTokens,
 	)
 	return i, err
 }

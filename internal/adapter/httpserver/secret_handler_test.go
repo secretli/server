@@ -47,6 +47,8 @@ type mockSecretRepo struct {
 	// doomed lists the objects of the secrets Delete removed.
 	doomed    []string
 	deleteErr error
+	// wrongBlobTokens counts the wrong blob tokens tried on each secret.
+	wrongBlobTokens map[string]int
 }
 
 type mockRetrievalSession struct {
@@ -56,8 +58,9 @@ type mockRetrievalSession struct {
 
 func newMockRepo() *mockSecretRepo {
 	return &mockSecretRepo{
-		secrets:  make(map[string]*domain.Secret),
-		sessions: make(map[string]mockRetrievalSession),
+		secrets:         make(map[string]*domain.Secret),
+		sessions:        make(map[string]mockRetrievalSession),
+		wrongBlobTokens: make(map[string]int),
 	}
 }
 
@@ -82,7 +85,19 @@ func (m *mockSecretRepo) StartRetrievalSession(_ context.Context, publicID, blob
 		return nil, domain.ErrNotFound
 	}
 	if !tokencrypto.TokensEqual(blobTokenHash, s.BlobTokenHash) {
-		return nil, domain.ErrForbidden
+		// The last wrong blob token deletes the secret, as Delete does.
+		m.wrongBlobTokens[publicID]++
+		left := max(0, domain.MaxWrongBlobTokens-m.wrongBlobTokens[publicID])
+		if left == 0 {
+			m.doomed = append(m.doomed, s.StorageKey)
+			delete(m.secrets, publicID)
+			for token, session := range m.sessions {
+				if session.publicID == publicID {
+					delete(m.sessions, token)
+				}
+			}
+		}
+		return nil, &domain.WrongBlobTokenError{AttemptsLeft: left}
 	}
 	byOwner := deletionTokenHash != "" && tokencrypto.TokensEqual(deletionTokenHash, s.DeletionTokenHash)
 	// Like the database, the caller gets the secret as it was read, with the
@@ -312,6 +327,66 @@ func TestStartRetrievalSession_InvalidBlobToken(t *testing.T) {
 	}
 	if len(repo.sessions) != 0 {
 		t.Error("invalid blob token should not create a retrieval session")
+	}
+	if left := attemptsLeft(t, rec); left != domain.MaxWrongBlobTokens-1 {
+		t.Errorf("attempts_left = %d, want %d", left, domain.MaxWrongBlobTokens-1)
+	}
+}
+
+// attemptsLeft reads details.attempts_left from a 403 answer.
+func attemptsLeft(t *testing.T, rec *httptest.ResponseRecorder) int {
+	t.Helper()
+	var body struct {
+		Error   string `json:"error"`
+		Details struct {
+			AttemptsLeft *int `json:"attempts_left"`
+		} `json:"details"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body %s: %v", rec.Body.String(), err)
+	}
+	if body.Error != "invalid blob token" {
+		t.Errorf("error = %q, want %q", body.Error, "invalid blob token")
+	}
+	if body.Details.AttemptsLeft == nil {
+		t.Fatalf("body = %s, want details.attempts_left", rec.Body.String())
+	}
+	return *body.Details.AttemptsLeft
+}
+
+func TestStartRetrievalSession_LastWrongBlobTokenDeletesTheSecret(t *testing.T) {
+	repo := newMockRepo()
+	fs := newMockFileStore()
+	h := NewSecretHandler(repo, fs)
+	publicID := testPublicID("session guessed at")
+	blobToken := testToken("session guessed at blob")
+	seedSecret(repo, fs, publicID, blobToken, testToken("session guessed at deletion"), false)
+
+	open := func(token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/secrets/"+publicID+"/retrieval-session", nil)
+		req.Header.Set(HeaderBlobToken, token)
+		rec := httptest.NewRecorder()
+		c := newEchoContext(req, rec)
+		c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
+		callHandler(c, h.StartRetrievalSession)
+		return rec
+	}
+
+	for want := domain.MaxWrongBlobTokens - 1; want >= 0; want-- {
+		rec := open(testToken("wrong guess"))
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusForbidden, rec.Body.String())
+		}
+		if left := attemptsLeft(t, rec); left != want {
+			t.Errorf("attempts_left = %d, want %d", left, want)
+		}
+	}
+	if len(repo.doomed) != 1 {
+		t.Errorf("doomed objects = %v, want the secret's", repo.doomed)
+	}
+	// Gone: the right blob token finds nothing either.
+	if rec := open(blobToken); rec.Code != http.StatusNotFound {
+		t.Errorf("status after the last wrong blob token = %d, want %d", rec.Code, http.StatusNotFound)
 	}
 }
 

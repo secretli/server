@@ -18,3 +18,19 @@ var (
 	// no longer knows the multipart upload (already completed or aborted).
 	ErrUploadNotFound = errors.New("multipart upload not found")
 )
+
+// MaxWrongBlobTokens is how many wrong blob tokens a secret takes: at the
+// last one it is deleted, so that a password can't be guessed at for the
+// secret's whole lifetime. A wrong blob token is a wrong password as a
+// rule, otherwise a damaged link.
+const MaxWrongBlobTokens = 10
+
+// WrongBlobTokenError is a wrong blob token. It is ErrForbidden, and says
+// how many more the secret takes; 0 when this one deleted it.
+type WrongBlobTokenError struct {
+	AttemptsLeft int
+}
+
+func (e *WrongBlobTokenError) Error() string { return "wrong blob token" }
+
+func (e *WrongBlobTokenError) Is(target error) bool { return target == ErrForbidden }

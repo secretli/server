@@ -55,6 +55,7 @@ type Secret struct {
 	ExpiresAt         pgtype.Timestamptz
 	CreatedAt         pgtype.Timestamptz
 	Opened            bool
+	WrongBlobTokens   int16
 }
 
 type Upload struct {
