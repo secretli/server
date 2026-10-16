@@ -10,6 +10,8 @@ import (
 // is deliberately no whole-object put or get.
 type FileStore interface {
 	GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, error)
+	// Head returns nil if storage holds the object under key.
+	Head(ctx context.Context, key string) error
 	Delete(ctx context.Context, key string) error
 }
 

@@ -769,3 +769,92 @@ func TestS3Client_RetriesAfterAnOutage(t *testing.T) {
 		}
 	}
 }
+
+// fakeStorage answers every call but HeadBucket with status.
+func fakeStorage(t *testing.T, status int) (*s3.Client, *httptest.Server) {
+	t.Helper()
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			w.WriteHeader(status)
+		}
+	}))
+	t.Cleanup(storage.Close)
+	client, err := s3.NewClient(config.S3Config{
+		Endpoint:  storage.URL,
+		Bucket:    testBucket,
+		AccessKey: "admin",
+		SecretKey: "admin",
+		Region:    "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	return client, storage
+}
+
+// Storage that fails or can't be reached is unavailable, so the server tells
+// clients to come back; storage refusing a call is not.
+func TestS3Client_TellsAnOutageFromARefusal(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		status      int
+		unreachable bool
+		unavailable bool
+	}{
+		{name: "server error", status: http.StatusServiceUnavailable, unavailable: true},
+		{name: "internal error", status: http.StatusInternalServerError, unavailable: true},
+		{name: "throttled", status: http.StatusTooManyRequests, unavailable: true},
+		{name: "unreachable", status: http.StatusOK, unreachable: true, unavailable: true},
+		{name: "refused", status: http.StatusForbidden},
+		{name: "missing", status: http.StatusNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			client, storage := fakeStorage(t, tc.status)
+			if tc.unreachable {
+				storage.Close()
+			}
+
+			_, err := client.GetRange(context.Background(), "some-key", 0, 1)
+			if err == nil {
+				t.Fatal("get range succeeded")
+			}
+			if got := errors.Is(err, domain.ErrStorageUnavailable); got != tc.unavailable {
+				t.Errorf("unavailable = %v, want %v: %v", got, tc.unavailable, err)
+			}
+		})
+	}
+}
+
+func TestS3Client_ACanceledCallIsNotAnOutage(t *testing.T) {
+	t.Parallel()
+	client, _ := fakeStorage(t, http.StatusServiceUnavailable)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := client.GetRange(ctx, "some-key", 0, 1)
+	if err == nil {
+		t.Fatal("get range succeeded")
+	}
+	if errors.Is(err, domain.ErrStorageUnavailable) {
+		t.Errorf("a canceled call counts as an outage: %v", err)
+	}
+}
+
+func TestS3Client_Head(t *testing.T) {
+	t.Parallel()
+	client := setupSeaweedFS(t)
+	ctx := context.Background()
+	putTestObject(t, client, "head-key", []byte("here"))
+
+	if err := client.Head(ctx, "head-key"); err != nil {
+		t.Errorf("Head of a stored object: %v", err)
+	}
+	// A missing object is storage answering, not an outage.
+	err := client.Head(ctx, "head-missing-key")
+	if err == nil || errors.Is(err, domain.ErrStorageUnavailable) {
+		t.Errorf("Head of a missing object: err = %v, want an error other than ErrStorageUnavailable", err)
+	}
+}

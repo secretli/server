@@ -17,6 +17,10 @@ var (
 	// ErrUploadNotFound is returned by a MultipartFileStore when the backend
 	// no longer knows the multipart upload (already completed or aborted).
 	ErrUploadNotFound = errors.New("multipart upload not found")
+	// ErrStorageUnavailable is returned by a FileStore when storage could not
+	// be reached or answered with a server error or throttling: the same call
+	// is worth repeating later.
+	ErrStorageUnavailable = errors.New("storage unavailable")
 )
 
 // MaxWrongBlobTokens is how many wrong blob tokens a secret takes: at the

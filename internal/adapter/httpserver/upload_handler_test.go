@@ -249,6 +249,7 @@ type uploadMockStore struct {
 	calls          []string
 	uploadID       string
 	createErr      error
+	partErr        error
 	uploadedParts  map[int][]byte
 	completedParts []domain.CompletedPart
 	completeCalls  int
@@ -276,6 +277,10 @@ func (m *uploadMockStore) GetRange(_ context.Context, _ string, _, _ int64) (io.
 	m.record("GetRange")
 	return io.NopCloser(bytes.NewReader(nil)), nil
 }
+func (m *uploadMockStore) Head(_ context.Context, _ string) error {
+	m.record("Head")
+	return nil
+}
 func (m *uploadMockStore) Delete(_ context.Context, key string) error {
 	m.record("Delete")
 	m.mu.Lock()
@@ -292,6 +297,9 @@ func (m *uploadMockStore) CreateMultipartUpload(_ context.Context, _ string) (st
 }
 func (m *uploadMockStore) UploadPart(_ context.Context, _ string, _ string, partNumber int, reader io.Reader, _ int64) (string, error) {
 	m.record("UploadPart")
+	if m.partErr != nil {
+		return "", m.partErr
+	}
 	data, err := io.ReadAll(reader)
 	if err != nil {
 		return "", err
@@ -1347,5 +1355,64 @@ func TestUploadSession_CreateGivesTheBudgetBackWhenItFails(t *testing.T) {
 	// Had the failed start kept its 10 MiB, this one would not fit.
 	if rec := callCreate(t, h, createUploadBody("budget-retry")); rec.Code != http.StatusCreated {
 		t.Fatalf("create after a failed one: status = %d, want %d. body: %s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+}
+
+// While storage is unavailable, every storage step of an upload answers 503
+// with Retry-After, which clients wait out and repeat.
+func assertStorageUnavailable(t *testing.T, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != storageUnavailableRetryAfter {
+		t.Errorf("Retry-After = %q, want %q", got, storageUnavailableRetryAfter)
+	}
+}
+
+func TestUploadSession_CreateWhileStorageIsUnavailable(t *testing.T) {
+	repo := newUploadMockRepo()
+	store := newUploadMockStore()
+	store.createErr = fmt.Errorf("create multipart upload: %w", domain.ErrStorageUnavailable)
+	h := NewUploadHandler(repo, store, 100*1024*1024, testMetrics())
+
+	assertStorageUnavailable(t, callCreate(t, h, createUploadBody("multipart-create-unavailable")))
+	assertAbandoned(t, repo, onlyUpload(t, repo, testPublicID("multipart-create-unavailable")))
+}
+
+func TestUploadPart_WhileStorageIsUnavailable(t *testing.T) {
+	repo := newUploadMockRepo()
+	store := newUploadMockStore()
+	store.partErr = fmt.Errorf("upload part: %w", domain.ErrStorageUnavailable)
+	uploadToken := testToken("part unavailable token")
+	upload := seedUploadSession(repo, uploadToken, 6)
+	h := NewUploadHandler(repo, store, 100*1024*1024, testMetrics())
+
+	assertStorageUnavailable(t, callUploadPart(h, upload.SessionID, uploadToken, []byte("abcdef")))
+
+	// The part is not recorded, so the client uploads it again.
+	store.partErr = nil
+	if rec := callUploadPart(h, upload.SessionID, uploadToken, []byte("abcdef")); rec.Code != http.StatusOK {
+		t.Errorf("retry status = %d, want %d. body: %s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
+func TestCompleteUploadSession_WhileStorageIsUnavailable(t *testing.T) {
+	repo := newUploadMockRepo()
+	store := newUploadMockStore()
+	store.completeErr = fmt.Errorf("complete multipart upload: %w", domain.ErrStorageUnavailable)
+	uploadToken := testToken("complete unavailable token")
+	upload := seedSinglePartUploadSession(repo, uploadToken)
+	h := NewUploadHandler(repo, store, 100*1024*1024, testMetrics())
+
+	assertStorageUnavailable(t, callComplete(h, upload.SessionID, uploadToken))
+
+	// The upload stays under way with its parts, so a repeated complete works.
+	if got := repo.uploads[upload.SessionID].State; got != domain.UploadUploading || repo.abortCalls != 0 {
+		t.Fatalf("upload state = %q, aborts = %d; want it still uploading", got, repo.abortCalls)
+	}
+	store.completeErr = nil
+	if rec := callComplete(h, upload.SessionID, uploadToken); rec.Code != http.StatusCreated {
+		t.Errorf("retry status = %d, want %d. body: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
 }

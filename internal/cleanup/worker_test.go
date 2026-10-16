@@ -202,6 +202,11 @@ func (m *mockFileStore) AbortMultipartUploads(ctx context.Context, key string) e
 	return m.abortErr
 }
 
+func (m *mockFileStore) Head(ctx context.Context, key string) error {
+	m.record(ctx, "head "+key)
+	return nil
+}
+
 func (m *mockFileStore) GetRange(ctx context.Context, key string, _, _ int64) (io.ReadCloser, error) {
 	m.record(ctx, "get-range "+key)
 	return nil, nil

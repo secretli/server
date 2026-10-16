@@ -45,8 +45,10 @@ type SecretRepo interface {
 	// secret does not count. It returns ErrNotFound unless the secret is
 	// readable, and for a wrong blob token a *WrongBlobTokenError, which is
 	// ErrForbidden: the wrong token is counted, and at MaxWrongBlobTokens
-	// the secret is deleted.
-	StartRetrievalSession(ctx context.Context, publicID, blobTokenHash, deletionTokenHash, sessionTokenHash string, expiresAt, now time.Time) (*Secret, error)
+	// the secret is deleted. Before a one-time secret closes, checkObject must
+	// find its object in storage; if it fails, the secret stays as it was and
+	// its error is returned.
+	StartRetrievalSession(ctx context.Context, publicID, blobTokenHash, deletionTokenHash, sessionTokenHash string, expiresAt, now time.Time, checkObject func(storageKey string) error) (*Secret, error)
 	// GetByRetrievalSession returns the secret a valid session may still
 	// download, live or closing, or ErrForbidden.
 	GetByRetrievalSession(ctx context.Context, publicID, sessionTokenHash string, now time.Time) (*Secret, error)

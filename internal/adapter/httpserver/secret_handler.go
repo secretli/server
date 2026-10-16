@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"context"
 	cryptorand "crypto/rand"
 	"encoding/base64"
 	"errors"
@@ -26,6 +27,9 @@ const (
 	HeaderDeletionToken = "X-Deletion-Token" //nolint:gosec
 
 	retrievalSessionTTL = 15 * time.Minute
+	// objectCheckTimeout bounds the storage check before a one-time secret
+	// closes, which runs while the secret's row is locked.
+	objectCheckTimeout = 10 * time.Second
 	// maxRangeBytes caps a single range request. The client coalesces at most
 	// 64 MiB of plaintext per request; without a cap one session could pull
 	// the full blob hundreds of times per minute.
@@ -86,6 +90,7 @@ func (h *SecretHandler) StartRetrievalSession(c *echo.Context) error {
 		crypto.TokenHash(sessionToken),
 		sessionExpiresAt,
 		now,
+		h.checkObject(c.Request().Context()),
 	)
 	if errors.Is(err, domain.ErrNotFound) {
 		return apperrors.NotFoundError("secret not found")
@@ -103,7 +108,7 @@ func (h *SecretHandler) StartRetrievalSession(c *echo.Context) error {
 		return apperrors.ForbiddenError("invalid blob token")
 	}
 	if err != nil {
-		return apperrors.InternalError("failed to start retrieval session", err)
+		return storageFailed(c, "failed to start retrieval session", err)
 	}
 
 	return c.JSON(http.StatusCreated, map[string]any{
@@ -156,7 +161,7 @@ func (h *SecretHandler) RetrieveSecretRange(c *echo.Context) error {
 	ctx := c.Request().Context()
 	obj, err := h.fileStore.GetRange(ctx, secret.StorageKey, start, end)
 	if err != nil {
-		return apperrors.InternalError("failed to get blob range from S3", err)
+		return storageFailed(c, "failed to get blob range from S3", err)
 	}
 	defer func() { _ = obj.Close() }()
 
@@ -332,4 +337,13 @@ func parseBoundedRange(header string, size int64) (int64, int64, error) {
 		return 0, 0, errRangeOutOfBounds
 	}
 	return start, end, nil
+}
+
+// checkObject checks that storage holds an object, within objectCheckTimeout.
+func (h *SecretHandler) checkObject(ctx context.Context) func(storageKey string) error {
+	return func(storageKey string) error {
+		ctx, cancel := context.WithTimeout(ctx, objectCheckTimeout)
+		defer cancel()
+		return h.fileStore.Head(ctx, storageKey)
+	}
 }
