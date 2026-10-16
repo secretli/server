@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -30,6 +32,7 @@ func NewClient(cfg platformconfig.S3Config) (*Client, error) {
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(cfg.Endpoint)
 		o.UsePathStyle = true
+		o.Retryer = newRetryer()
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -42,6 +45,17 @@ func NewClient(cfg platformconfig.S3Config) (*Client, error) {
 	}
 
 	return &Client{client: client, bucket: cfg.Bucket}, nil
+}
+
+// newRetryer is the SDK's standard retryer without its retry budget. The budget
+// (500 tokens per client, 5 per retry, 1 back per first-try success) is spent
+// within half an hour of storage answering 503, mostly by the cleanup's retries,
+// and comes back only with traffic, so storage blips hours apart fail requests
+// on their first attempt. The attempts per call stay bounded.
+func newRetryer() aws.Retryer {
+	return retry.NewStandard(func(o *retry.StandardOptions) {
+		o.RateLimiter = ratelimit.None
+	})
 }
 
 func (s *Client) GetRange(ctx context.Context, key string, start, end int64) (io.ReadCloser, error) {

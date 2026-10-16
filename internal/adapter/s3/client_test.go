@@ -709,3 +709,63 @@ func TestS3Client_MultipartSinglePart(t *testing.T) {
 		t.Fatalf("object = %q, want %q", got, payload)
 	}
 }
+
+// A storage outage must not use up the client's retries: after many calls that
+// failed every attempt, a call that meets a single 503 is still retried.
+func TestS3Client_RetriesAfterAnOutage(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	attempts := map[string]int{}
+	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			return
+		}
+		mu.Lock()
+		attempts[r.URL.Path]++
+		n := attempts[r.URL.Path]
+		mu.Unlock()
+		if r.URL.Path != "/"+testBucket+"/after-the-outage" || n == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(storage.Close)
+
+	client, err := s3.NewClient(config.S3Config{
+		Endpoint:  storage.URL,
+		Bucket:    testBucket,
+		AccessKey: "admin",
+		SecretKey: "admin",
+		Region:    "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	// 60 calls with two retries each would cost the SDK's default budget of
+	// 500 tokens 600; concurrently, the backoff takes seconds, not minutes.
+	const outageCalls = 60
+	var wg sync.WaitGroup
+	for i := range outageCalls {
+		wg.Go(func() {
+			if err := client.Delete(context.Background(), "during-the-outage-"+strconv.Itoa(i)); err == nil {
+				t.Error("delete during the outage succeeded")
+			}
+		})
+	}
+	wg.Wait()
+
+	if err := client.Delete(context.Background(), "after-the-outage"); err != nil {
+		t.Fatalf("delete after the outage: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i := range outageCalls {
+		if got := attempts["/"+testBucket+"/during-the-outage-"+strconv.Itoa(i)]; got != 3 {
+			t.Errorf("call %d during the outage made %d attempts, want 3", i, got)
+		}
+	}
+}
