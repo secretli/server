@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -110,6 +111,7 @@ func openAs(repo *pgadapter.SecretRepo, publicID, session string, asOwner bool, 
 		tokencrypto.TokenHash(session),
 		now.Add(15*time.Minute),
 		now,
+		objectStored,
 	)
 }
 
@@ -456,7 +458,7 @@ func TestSecretRepo_RecipientOpeningAReusableSecretMarksItOpened(t *testing.T) {
 	// A wrong deletion token is just a recipient.
 	got, err := repo.StartRetrievalSession(ctx, "reusable",
 		tokencrypto.TokenHash("blob-token-reusable"), tokencrypto.TokenHash("not-the-deletion-token"),
-		tokencrypto.TokenHash("recipient"), now.Add(15*time.Minute), now)
+		tokencrypto.TokenHash("recipient"), now.Add(15*time.Minute), now, objectStored)
 	if err != nil {
 		t.Fatalf("recipient's open: %v", err)
 	}
@@ -511,7 +513,7 @@ func TestSecretRepo_StartRetrievalSessionRefusesAWrongBlobToken(t *testing.T) {
 // openWrong tries a wrong blob token on a secret made by newTestSecret.
 func openWrong(repo *pgadapter.SecretRepo, publicID string, now time.Time) (*domain.Secret, error) {
 	return repo.StartRetrievalSession(context.Background(), publicID,
-		tokencrypto.TokenHash("not-the-blob-token"), "", tokencrypto.TokenHash("wrong"), now.Add(15*time.Minute), now)
+		tokencrypto.TokenHash("not-the-blob-token"), "", tokencrypto.TokenHash("wrong"), now.Add(15*time.Minute), now, objectStored)
 }
 
 func assertAttemptsLeft(t *testing.T, err error, want int) {
@@ -672,7 +674,7 @@ func TestSecretRepo_GetByRetrievalSession(t *testing.T) {
 	// A session longer than the secret ends with the secret.
 	mustCreate(t, repo, newTestSecret("dl-short", now.Add(time.Minute)))
 	if _, err := repo.StartRetrievalSession(ctx, "dl-short", tokencrypto.TokenHash("blob-token-dl-short"), "",
-		tokencrypto.TokenHash("long-session"), now.Add(time.Hour), now); err != nil {
+		tokencrypto.TokenHash("long-session"), now.Add(time.Hour), now, objectStored); err != nil {
 		t.Fatalf("open dl-short: %v", err)
 	}
 	if _, err := download(repo, "dl-short", "long-session", now.Add(time.Minute)); !errors.Is(err, domain.ErrForbidden) {
@@ -744,5 +746,60 @@ func TestSecretRepo_DeleteNeedsAReadableSecret(t *testing.T) {
 	}
 	if _, err := download(repo, "burned", "opener", now); err != nil {
 		t.Errorf("opener's download after a refused delete: %v", err)
+	}
+}
+
+// objectStored is a storage check that finds every object.
+func objectStored(string) error { return nil }
+
+// A one-time secret closes only once storage shows it has the object: while
+// storage is down it stays live, and the link opens it once storage is back.
+func TestSecretRepo_AOneTimeSecretStaysLiveWhileStorageIsDown(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	now := moment(time.Now())
+	secret := newTestSecret("one-time-outage", now.Add(time.Hour))
+	secret.BurnAfterRead = true
+	mustCreate(t, repo, secret)
+
+	var checked []string
+	storageDown := func(storageKey string) error {
+		checked = append(checked, storageKey)
+		return domain.ErrStorageUnavailable
+	}
+	_, err := repo.StartRetrievalSession(context.Background(), "one-time-outage",
+		tokencrypto.TokenHash("blob-token-one-time-outage"), "", tokencrypto.TokenHash("during-the-outage"),
+		now.Add(15*time.Minute), now, storageDown)
+	if !errors.Is(err, domain.ErrStorageUnavailable) {
+		t.Fatalf("open while storage is down: err = %v, want ErrStorageUnavailable", err)
+	}
+	if !slices.Equal(checked, []string{secret.StorageKey}) {
+		t.Errorf("checked = %v, want the secret's object", checked)
+	}
+	if got := mustGetSecret(t, repo, "one-time-outage"); !got.Readable(now) || got.BlobTokenHash != secret.BlobTokenHash {
+		t.Fatalf("state = %q, want the secret live with its tokens", got.State)
+	}
+	if _, err := download(repo, "one-time-outage", "during-the-outage", now); !errors.Is(err, domain.ErrForbidden) {
+		t.Errorf("download with the refused session: err = %v, want ErrForbidden", err)
+	}
+
+	mustOpen(t, repo, "one-time-outage", "after-the-outage", false, now)
+	assertClosing(t, repo, secret)
+}
+
+// Only a one-time secret is checked: opening a reusable one closes nothing.
+func TestSecretRepo_AReusableSecretOpensWithoutAStorageCheck(t *testing.T) {
+	pool := setupTestDB(t)
+	repo := pgadapter.NewSecretRepo(pool)
+	now := moment(time.Now())
+	mustCreate(t, repo, newTestSecret("reusable-outage", now.Add(time.Hour)))
+
+	if _, err := repo.StartRetrievalSession(context.Background(), "reusable-outage",
+		tokencrypto.TokenHash("blob-token-reusable-outage"), "", tokencrypto.TokenHash("recipient"),
+		now.Add(15*time.Minute), now, func(string) error {
+			t.Error("a reusable secret was checked in storage")
+			return nil
+		}); err != nil {
+		t.Fatalf("open: %v", err)
 	}
 }

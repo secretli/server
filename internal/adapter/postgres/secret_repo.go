@@ -72,7 +72,7 @@ func (r *SecretRepo) GetSecret(ctx context.Context, publicID string) (*domain.Se
 	return secretFromRow(row), nil
 }
 
-func (r *SecretRepo) StartRetrievalSession(ctx context.Context, publicID, blobTokenHash, deletionTokenHash, sessionTokenHash string, expiresAt, now time.Time) (*domain.Secret, error) {
+func (r *SecretRepo) StartRetrievalSession(ctx context.Context, publicID, blobTokenHash, deletionTokenHash, sessionTokenHash string, expiresAt, now time.Time, checkObject func(storageKey string) error) (*domain.Secret, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
@@ -101,6 +101,12 @@ func (r *SecretRepo) StartRetrievalSession(ctx context.Context, publicID, blobTo
 
 	switch {
 	case secret.BurnAfterRead:
+		// Closing ends every other way to the object, so storage must have it
+		// first: while storage is down the secret stays live, and the link
+		// works again once it is back.
+		if err := checkObject(secret.StorageKey); err != nil {
+			return nil, err
+		}
 		// The answer still carries what the opener needs to read it.
 		if err := qtx.CloseSecret(ctx, publicID); err != nil {
 			return nil, fmt.Errorf("close opened one-time secret: %w", err)

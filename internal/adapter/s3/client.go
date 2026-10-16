@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -68,9 +69,19 @@ func (s *Client) GetRange(ctx context.Context, key string, start, end int64) (io
 		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", start, end)),
 	})
 	if err != nil {
-		return nil, fmt.Errorf("get object range %q %d-%d: %w", key, start, end, err)
+		return nil, fmt.Errorf("get object range %q %d-%d: %w", key, start, end, unavailable(err))
 	}
 	return obj.Body, nil
+}
+
+func (s *Client) Head(ctx context.Context, key string) error {
+	if _, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(key),
+	}); err != nil {
+		return fmt.Errorf("head object %q: %w", key, unavailable(err))
+	}
+	return nil
 }
 
 func (s *Client) Delete(ctx context.Context, key string) error {
@@ -78,7 +89,7 @@ func (s *Client) Delete(ctx context.Context, key string) error {
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(key),
 	}); err != nil {
-		return fmt.Errorf("delete object %q: %w", key, err)
+		return fmt.Errorf("delete object %q: %w", key, unavailable(err))
 	}
 	return nil
 }
@@ -89,7 +100,7 @@ func (s *Client) CreateMultipartUpload(ctx context.Context, key string) (string,
 		Key:    aws.String(key),
 	})
 	if err != nil {
-		return "", fmt.Errorf("create multipart upload %q: %w", key, err)
+		return "", fmt.Errorf("create multipart upload %q: %w", key, unavailable(err))
 	}
 	if out.UploadId == nil || *out.UploadId == "" {
 		return "", fmt.Errorf("create multipart upload %q: missing upload id", key)
@@ -107,7 +118,7 @@ func (s *Client) UploadPart(ctx context.Context, key, uploadID string, partNumbe
 		ContentLength: aws.Int64(size),
 	})
 	if err != nil {
-		return "", fmt.Errorf("upload part %q #%d: %w", key, partNumber, err)
+		return "", fmt.Errorf("upload part %q #%d: %w", key, partNumber, unavailable(err))
 	}
 	if out.ETag == nil || *out.ETag == "" {
 		return "", fmt.Errorf("upload part %q #%d: missing etag", key, partNumber)
@@ -138,7 +149,7 @@ func (s *Client) CompleteMultipartUpload(ctx context.Context, key, uploadID stri
 		case "NoSuchUpload":
 			return fmt.Errorf("complete multipart upload %q: %w: %w", key, domain.ErrUploadNotFound, err)
 		}
-		return fmt.Errorf("complete multipart upload %q: %w", key, err)
+		return fmt.Errorf("complete multipart upload %q: %w", key, unavailable(err))
 	}
 	return nil
 }
@@ -155,7 +166,7 @@ func (s *Client) AbortMultipartUpload(ctx context.Context, key, uploadID string)
 		if errorCode(err) == "NoSuchUpload" {
 			return nil
 		}
-		return fmt.Errorf("abort multipart upload %q: %w", key, err)
+		return fmt.Errorf("abort multipart upload %q: %w", key, unavailable(err))
 	}
 	return nil
 }
@@ -174,7 +185,7 @@ func (s *Client) AbortMultipartUploads(ctx context.Context, key string) error {
 			UploadIdMarker: uploadIDMarker,
 		})
 		if err != nil {
-			return fmt.Errorf("list multipart uploads %q: %w", key, err)
+			return fmt.Errorf("list multipart uploads %q: %w", key, unavailable(err))
 		}
 		for _, upload := range out.Uploads {
 			if aws.ToString(upload.Key) != key {
@@ -201,4 +212,22 @@ func errorCode(err error) string {
 		return "NoSuchUpload"
 	}
 	return ""
+}
+
+// unavailable marks err as ErrStorageUnavailable unless storage answered and
+// refused the call: a server error, throttling, or no answer at all is worth
+// repeating later, a 4xx is not. A call its caller gave up on stays as it is.
+func unavailable(err error) error {
+	if errors.Is(err, context.Canceled) {
+		return err
+	}
+	var answered interface{ HTTPStatusCode() int }
+	if errors.As(err, &answered) {
+		status := answered.HTTPStatusCode()
+		// 0: the request never got an answer.
+		if status != 0 && status < http.StatusInternalServerError && status != http.StatusTooManyRequests {
+			return err
+		}
+	}
+	return fmt.Errorf("%w: %w", domain.ErrStorageUnavailable, err)
 }

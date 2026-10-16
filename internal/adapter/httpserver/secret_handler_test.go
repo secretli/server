@@ -76,7 +76,7 @@ func (m *mockSecretRepo) GetSecret(_ context.Context, publicID string) (*domain.
 	return &secret, nil
 }
 
-func (m *mockSecretRepo) StartRetrievalSession(_ context.Context, publicID, blobTokenHash, deletionTokenHash, sessionTokenHash string, expiresAt, now time.Time) (*domain.Secret, error) {
+func (m *mockSecretRepo) StartRetrievalSession(_ context.Context, publicID, blobTokenHash, deletionTokenHash, sessionTokenHash string, expiresAt, now time.Time, checkObject func(storageKey string) error) (*domain.Secret, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -105,6 +105,9 @@ func (m *mockSecretRepo) StartRetrievalSession(_ context.Context, publicID, blob
 	read := *s
 	switch {
 	case s.BurnAfterRead:
+		if err := checkObject(s.StorageKey); err != nil {
+			return nil, err
+		}
 		// A one-time secret closes whoever opens it: it keeps only its
 		// object, for the download that opened it.
 		s.State = domain.SecretClosing
@@ -165,6 +168,7 @@ func (m *mockSecretRepo) Delete(_ context.Context, publicID string, now time.Tim
 // mockFileStore implements domain.FileStore for testing
 type mockFileStore struct {
 	objects   map[string][]byte
+	headErr   error
 	getErr    error
 	deleteErr error
 }
@@ -185,6 +189,16 @@ func (m *mockFileStore) GetRange(_ context.Context, key string, start, end int64
 		return nil, fmt.Errorf("range %d-%d out of bounds", start, end)
 	}
 	return io.NopCloser(bytes.NewReader(data[start : end+1])), nil
+}
+
+func (m *mockFileStore) Head(_ context.Context, key string) error {
+	if m.headErr != nil {
+		return m.headErr
+	}
+	if _, ok := m.objects[key]; !ok {
+		return fmt.Errorf("object %q not found", key)
+	}
+	return nil
 }
 
 func (m *mockFileStore) Delete(_ context.Context, key string) error {
@@ -1198,5 +1212,116 @@ func TestParseExpiration(t *testing.T) {
 		if d != tt.expected {
 			t.Errorf("parseExpiration(%q) = %v, want %v", tt.input, d, tt.expected)
 		}
+	}
+}
+
+func TestRetrieveSecretRange_WhileStorageIsUnavailable(t *testing.T) {
+	repo := newMockRepo()
+	fs := newMockFileStore()
+	h := NewSecretHandler(repo, fs)
+	publicID := testPublicID("range unavailable")
+	blobToken := testToken("range unavailable blob")
+	seedSecret(repo, fs, publicID, blobToken, testToken("range unavailable deletion"), false)
+	sessionToken := startTestRetrievalSession(t, h, publicID, blobToken)
+	fs.getErr = fmt.Errorf("get object range: %w", domain.ErrStorageUnavailable)
+
+	rec := rangeRequest(h, publicID, sessionToken)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != storageUnavailableRetryAfter {
+		t.Errorf("Retry-After = %q, want %q", got, storageUnavailableRetryAfter)
+	}
+
+	fs.getErr = nil
+	if rec := rangeRequest(h, publicID, sessionToken); rec.Code != http.StatusPartialContent {
+		t.Errorf("retry status = %d, want %d. body: %s", rec.Code, http.StatusPartialContent, rec.Body.String())
+	}
+}
+
+func TestRetrieveSecretRange_OtherStorageErrorsAreInternal(t *testing.T) {
+	repo := newMockRepo()
+	fs := newMockFileStore()
+	h := NewSecretHandler(repo, fs)
+	publicID := testPublicID("range storage refused")
+	blobToken := testToken("range storage refused blob")
+	seedSecret(repo, fs, publicID, blobToken, testToken("range storage refused deletion"), false)
+	sessionToken := startTestRetrievalSession(t, h, publicID, blobToken)
+	fs.getErr = errors.New("access denied")
+
+	if rec := rangeRequest(h, publicID, sessionToken); rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d. body: %s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+}
+
+func postRetrievalSession(h *SecretHandler, publicID, blobToken string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/secrets/"+publicID+"/retrieval-session", nil)
+	req.Header.Set(HeaderBlobToken, blobToken)
+	rec := httptest.NewRecorder()
+	c := newEchoContext(req, rec)
+	c.SetPathValues(echo.PathValues{{Name: "publicID", Value: publicID}})
+	callHandler(c, h.StartRetrievalSession)
+	return rec
+}
+
+// Opening a one-time secret while storage is down tells the client to come
+// back and leaves the secret live, so the same link opens it later.
+func TestStartRetrievalSession_OneTimeSecretWhileStorageIsUnavailable(t *testing.T) {
+	repo := newMockRepo()
+	fs := newMockFileStore()
+	h := NewSecretHandler(repo, fs)
+	publicID := testPublicID("open one-time unavailable")
+	blobToken := testToken("open one-time unavailable blob")
+	seedSecret(repo, fs, publicID, blobToken, testToken("open one-time unavailable deletion"), true)
+	fs.headErr = fmt.Errorf("head object: %w", domain.ErrStorageUnavailable)
+
+	rec := postRetrievalSession(h, publicID, blobToken)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != storageUnavailableRetryAfter {
+		t.Errorf("Retry-After = %q, want %q", got, storageUnavailableRetryAfter)
+	}
+	if !repo.secrets[publicID].Readable(time.Now()) {
+		t.Fatalf("state = %q, want the secret still live", repo.secrets[publicID].State)
+	}
+
+	fs.headErr = nil
+	sessionToken := startTestRetrievalSession(t, h, publicID, blobToken)
+	if rec := rangeRequest(h, publicID, sessionToken); rec.Code != http.StatusPartialContent {
+		t.Errorf("download status = %d, want %d. body: %s", rec.Code, http.StatusPartialContent, rec.Body.String())
+	}
+}
+
+// Storage refusing the check is a server fault, but the secret stays live too.
+func TestStartRetrievalSession_OneTimeSecretWhoseObjectIsMissing(t *testing.T) {
+	repo := newMockRepo()
+	fs := newMockFileStore()
+	h := NewSecretHandler(repo, fs)
+	publicID := testPublicID("open one-time missing")
+	blobToken := testToken("open one-time missing blob")
+	seedSecret(repo, fs, publicID, blobToken, testToken("open one-time missing deletion"), true)
+	fs.headErr = errors.New("not found")
+
+	if rec := postRetrievalSession(h, publicID, blobToken); rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d. body: %s", rec.Code, http.StatusInternalServerError, rec.Body.String())
+	}
+	if !repo.secrets[publicID].Readable(time.Now()) {
+		t.Errorf("state = %q, want the secret still live", repo.secrets[publicID].State)
+	}
+}
+
+// A reusable secret doesn't close, so opening it needs no storage check.
+func TestStartRetrievalSession_ReusableSecretWhileStorageIsUnavailable(t *testing.T) {
+	repo := newMockRepo()
+	fs := newMockFileStore()
+	h := NewSecretHandler(repo, fs)
+	publicID := testPublicID("open reusable unavailable")
+	blobToken := testToken("open reusable unavailable blob")
+	seedSecret(repo, fs, publicID, blobToken, testToken("open reusable unavailable deletion"), false)
+	fs.headErr = fmt.Errorf("head object: %w", domain.ErrStorageUnavailable)
+
+	if rec := postRetrievalSession(h, publicID, blobToken); rec.Code != http.StatusCreated {
+		t.Errorf("status = %d, want %d. body: %s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
 }

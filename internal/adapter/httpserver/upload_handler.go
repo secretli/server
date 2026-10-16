@@ -189,7 +189,7 @@ func (h *UploadHandler) CreateUploadSession(c *echo.Context) error {
 	uploadID, err := h.fileStore.CreateMultipartUpload(ctx, storageKey)
 	if err != nil {
 		h.abandon(ctx, sessionID)
-		return apperrors.InternalError("failed to create multipart upload", err)
+		return storageFailed(c, "failed to create multipart upload", err)
 	}
 	if err := h.repo.RecordS3UploadID(ctx, storageKey, uploadID); err != nil {
 		// The cleanup finds the multipart upload by its key.
@@ -280,7 +280,7 @@ func (h *UploadHandler) UploadPart(c *echo.Context) error {
 		size,
 	)
 	if err != nil {
-		return apperrors.InternalError("failed to upload part to S3", err)
+		return storageFailed(c, "failed to upload part to S3", err)
 	}
 
 	recorded, err := h.repo.RecordUploadPart(c.Request().Context(), &domain.UploadPart{
@@ -341,7 +341,7 @@ func (h *UploadHandler) CompleteUploadSession(c *echo.Context) error {
 		return nil
 	})
 	if err != nil {
-		return h.completeUploadFailed(ctx, upload, stored, err)
+		return h.completeUploadFailed(c, upload, stored, err)
 	}
 
 	// A repeated complete finds the upload already completed and answers the
@@ -360,7 +360,8 @@ func (h *UploadHandler) CompleteUploadSession(c *echo.Context) error {
 	})
 }
 
-func (h *UploadHandler) completeUploadFailed(ctx context.Context, upload *domain.Upload, stored bool, err error) error {
+func (h *UploadHandler) completeUploadFailed(c *echo.Context, upload *domain.Upload, stored bool, err error) error {
+	ctx := c.Request().Context()
 	if stored {
 		// Storage assembled the object, but the secret did not go live.
 		h.abandon(ctx, upload.SessionID)
@@ -387,7 +388,7 @@ func (h *UploadHandler) completeUploadFailed(ctx context.Context, upload *domain
 	if appErr, ok := errors.AsType[*apperrors.Error](err); ok {
 		return appErr
 	}
-	return apperrors.InternalError("failed to complete multipart upload", err)
+	return storageFailed(c, "failed to complete multipart upload", err)
 }
 
 // abandon ends an upload that can no longer become a secret. Its object is
