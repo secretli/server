@@ -41,7 +41,7 @@ services:
       retries: 30
 
   seaweedfs:
-    image: chrislusf/seaweedfs:4.48
+    image: chrislusf/seaweedfs:4.51
     ports:
       - "8333:8333"
     environment:
@@ -54,7 +54,7 @@ services:
   # The SeaweedFS image has curl too, so the bucket is made with the image
   # pulled anyway.
   createbucket:
-    image: chrislusf/seaweedfs:4.48
+    image: chrislusf/seaweedfs:4.51
     depends_on:
       - seaweedfs
     entrypoint: >
