@@ -1,7 +1,7 @@
 package httpserver
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -22,7 +22,7 @@ func TestVersionHandlerReportsTheBuildVersion(t *testing.T) {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusOK)
 	}
 	var resp versionResponse
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+	if err := json.UnmarshalRead(rec.Body, &resp); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 	if resp.Version != "860030f3e948ed3644c2498022d613e122796147" {

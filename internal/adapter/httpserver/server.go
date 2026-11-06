@@ -45,6 +45,8 @@ func New(cfg config.Config, version string, pool *pgxpool.Pool, secretRepo domai
 		// Never trust client-supplied X-Forwarded-For unless a proxy is
 		// configured; the rate limiters key on the client IP.
 		IPExtractor: ipExtractor,
+		// encoding/json/v2: exact names, no duplicates, valid UTF-8.
+		JSONSerializer: jsonSerializer{},
 	})
 
 	a := &App{

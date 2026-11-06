@@ -5,7 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -724,7 +724,7 @@ func TestSecretMetadata_Success(t *testing.T) {
 	}
 
 	var resp domain.SecretMetadataResponse
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+	if err := json.UnmarshalRead(rec.Body, &resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
 	if resp.EncryptedMeta != testEncryptedMeta() {

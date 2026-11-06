@@ -2,7 +2,7 @@ package httpserver
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -27,7 +27,7 @@ func TestLiveness(t *testing.T) {
 	}
 
 	var resp healthResponse
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+	if err := json.UnmarshalRead(rec.Body, &resp); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 	if resp.Status != "ok" {
@@ -64,7 +64,7 @@ func TestReadinessWithDB_Healthy(t *testing.T) {
 	}
 
 	var resp healthResponse
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+	if err := json.UnmarshalRead(rec.Body, &resp); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 	if resp.Status != "ok" {
@@ -88,7 +88,7 @@ func TestReadinessWithDB_Unhealthy(t *testing.T) {
 	}
 
 	var resp healthResponse
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+	if err := json.UnmarshalRead(rec.Body, &resp); err != nil {
 		t.Fatalf("failed to decode response: %v", err)
 	}
 	if resp.Status != "unavailable" {
