@@ -2,7 +2,7 @@ package httpserver
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -32,7 +32,7 @@ func TestHTTPErrorHandler(t *testing.T) {
 		}
 
 		var resp apperrors.ErrorResponse
-		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		if err := json.UnmarshalRead(rec.Body, &resp); err != nil {
 			t.Fatalf("failed to decode response: %v", err)
 		}
 		if resp.Error != "test error" {
@@ -67,7 +67,7 @@ func TestHTTPErrorHandler(t *testing.T) {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
 		}
 		var resp apperrors.ErrorResponse
-		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		if err := json.UnmarshalRead(rec.Body, &resp); err != nil {
 			t.Fatalf("failed to decode response: %v", err)
 		}
 		if resp.Error != "Request Entity Too Large" {
@@ -88,7 +88,7 @@ func TestHTTPErrorHandler(t *testing.T) {
 			t.Errorf("status = %d, want %d", rec.Code, http.StatusBadGateway)
 		}
 		var resp apperrors.ErrorResponse
-		if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		if err := json.UnmarshalRead(rec.Body, &resp); err != nil {
 			t.Fatalf("failed to decode response: %v", err)
 		}
 		if resp.Error != "internal server error" {
