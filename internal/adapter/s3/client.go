@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -24,10 +26,25 @@ type Client struct {
 	bucket string
 }
 
+// attemptTimeout bounds how long one attempt of a call waits for storage to
+// connect and to start its answer. Storage now and then takes a request and
+// never answers; without a bound the call waits until its caller gives up, so
+// the retryer never gets to try again. Three attempts fit well inside the
+// minute a client waits for our answer. It does not bound sending a part or
+// reading an object, whose time grows with their size.
+const attemptTimeout = 10 * time.Second
+
 func NewClient(cfg platformconfig.S3Config) (*Client, error) {
+	return newClient(cfg, attemptTimeout)
+}
+
+func newClient(cfg platformconfig.S3Config, attemptTimeout time.Duration) (*Client, error) {
 	awsCfg := aws.Config{
 		Region:      cfg.Region,
 		Credentials: credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, ""),
+		HTTPClient: awshttp.NewBuildableClient().
+			WithDialerOptions(func(d *net.Dialer) { d.Timeout = attemptTimeout }).
+			WithTransportOptions(func(t *http.Transport) { t.ResponseHeaderTimeout = attemptTimeout }),
 	}
 
 	client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {

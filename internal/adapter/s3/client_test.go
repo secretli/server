@@ -858,3 +858,64 @@ func TestS3Client_Head(t *testing.T) {
 		t.Errorf("Head of a missing object: err = %v, want an error other than ErrStorageUnavailable", err)
 	}
 }
+
+// A part whose first attempt storage takes and never answers is sent again
+// once the attempt times out, instead of waiting for the caller to give up.
+func TestS3Client_UploadPartRetriesAnAttemptStorageDoesNotAnswer(t *testing.T) {
+	t.Parallel()
+	env := setupSeaweedFSEnv(t)
+	target, err := url.Parse(env.endpoint)
+	if err != nil {
+		t.Fatalf("parse endpoint: %v", err)
+	}
+
+	// Long enough for a slow test storage to answer the attempts after the
+	// first.
+	const timeout = 5 * time.Second
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var mu sync.Mutex
+	partAttempts := 0
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut && r.URL.Query().Has("partNumber") {
+			mu.Lock()
+			partAttempts++
+			first := partAttempts == 1
+			mu.Unlock()
+			if first {
+				_, _ = io.Copy(io.Discard, r.Body)
+				select {
+				case <-r.Context().Done():
+				case <-release:
+				}
+				return
+			}
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := s3.NewClientWithAttemptTimeout(config.S3Config{
+		Endpoint:  server.URL,
+		Bucket:    testBucket,
+		AccessKey: "admin",
+		SecretKey: "admin",
+		Region:    "us-east-1",
+	}, timeout)
+	if err != nil {
+		t.Fatalf("client through the stalling relay: %v", err)
+	}
+
+	key := "blobs/stalled-part"
+	part := []byte("a part storage does not answer at first")
+	uploadID, etag := openUpload(t, client, key, part)
+
+	mu.Lock()
+	attempts := partAttempts
+	mu.Unlock()
+	if attempts < 2 {
+		t.Errorf("part attempts = %d, want the stalled one and another", attempts)
+	}
+	requireUploadOpen(t, client, key, uploadID, etag, part)
+}
