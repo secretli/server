@@ -208,7 +208,7 @@ func TestPoolFollowsARotatedDatabaseCA(t *testing.T) {
 	install := "mkdir -p /etc/pgtls && install -o postgres -g postgres -m 600 /pgtls-in/server.key /etc/pgtls/server.key && install -o postgres -g postgres -m 644 /pgtls-in/server.crt /etc/pgtls/server.crt"
 	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "postgres:18-alpine",
+			Image:        "postgres:19-alpine",
 			ExposedPorts: []string{"5432/tcp"},
 			Env:          map[string]string{"POSTGRES_USER": "test", "POSTGRES_PASSWORD": "test", "POSTGRES_DB": "secretli_test"},
 			Files: []testcontainers.ContainerFile{
